@@ -256,3 +256,4 @@ VERSION.txt
 # FP3D: local run output
 /fp3d_user/
 fp3d_stderr.txt
+fp3d_stdout.txt

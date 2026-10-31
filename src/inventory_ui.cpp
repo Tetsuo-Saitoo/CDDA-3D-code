@@ -62,6 +62,7 @@
 #include "vehicle.h"
 #include "vehicle_selector.h"
 #include "vpart_position.h"
+#include "fp3d/bridge.h" // FP3D:
 
 #if defined(__ANDROID__)
 #include <SDL_keyboard.h>
@@ -3361,8 +3362,78 @@ std::string inventory_selector::action_bound_to_key( char key ) const
     return ctxt.input_to_action( input_event( key, input_event_t::keyboard_char ) );
 }
 
+// FP3D: headless item requests. Selectable entries of all columns become a flat list.
+static std::vector<inventory_entry *> fp3d_selectable_entries( const std::vector<inventory_column *> &cols )
+{
+    std::vector<inventory_entry *> out;
+    for( const inventory_column *col : cols ) {
+        for( inventory_entry *e : col->get_entries( []( const inventory_entry & e ) {
+        return e.is_selectable();
+        }, true ) ) {
+            out.push_back( e );
+        }
+    }
+    return out;
+}
+
+static fp3d::ui_request fp3d_item_request( const std::vector<inventory_entry *> &picks,
+        fp3d::request_kind kind )
+{
+    fp3d::ui_request req;
+    req.kind = kind;
+    req.context = "INVENTORY";
+    for( size_t i = 0; i < picks.size(); i++ ) {
+        const item_location &loc = picks[i]->any_item();
+        req.entries.push_back( { static_cast<int>( i ),
+                                 loc->display_name( static_cast<unsigned int>( picks[i]->get_stack_size() ) ), true, "" } );
+    }
+    return req;
+}
+
+static drop_locations fp3d_multi_execute( const std::vector<inventory_column *> &cols )
+{
+    const std::vector<inventory_entry *> picks = fp3d_selectable_entries( cols );
+    const fp3d::ui_answer a = fp3d::ask( fp3d_item_request( picks, fp3d::request_kind::item_multi ) );
+    drop_locations out;
+    if( a.cancel ) {
+        return out;
+    }
+    std::set<int> seen;
+    for( const auto &[idx, count] : a.picks ) {
+        if( idx < 0 || static_cast<size_t>( idx ) >= picks.size() || !seen.insert( idx ).second ) {
+            continue;
+        }
+        const std::vector<item_location> &locs = picks[idx]->locations;
+        if( locs.size() == 1 ) {
+            const item &it = *locs.front();
+            const int max = it.count_by_charges() ? it.charges : 1;
+            out.emplace_back( locs.front(), count > 0 ? std::min( count, max ) : max );
+        } else {
+            const size_t n = count > 0 ? std::min<size_t>( count, locs.size() ) : locs.size();
+            for( size_t i = 0; i < n; i++ ) {
+                out.emplace_back( locs[i], 1 );
+            }
+        }
+    }
+    return out;
+}
+
 item_location inventory_pick_selector::execute()
 {
+    // FP3D: headless clients pick from a flat list of selectable entries
+    if( fp3d::active() ) {
+        const std::vector<inventory_entry *> picks = fp3d_selectable_entries( get_all_columns() );
+        const fp3d::ui_request req = fp3d_item_request( picks, fp3d::request_kind::item_select );
+        while( true ) {
+            const fp3d::ui_answer a = fp3d::ask( req );
+            if( a.cancel ) {
+                return item_location();
+            }
+            if( a.entry >= 0 && static_cast<size_t>( a.entry ) < picks.size() ) {
+                return picks[a.entry]->any_item();
+            }
+        }
+    }
     shared_ptr_fast<ui_adaptor> ui = create_or_get_ui_adaptor();
     debug_print_timer( tp_start );
     item_location startDragItem;
@@ -3791,6 +3862,10 @@ void inventory_multiselector::toggle_entries( int &count, const toggle_mode mode
 
 drop_locations inventory_multiselector::execute( bool allow_empty )
 {
+    // FP3D: headless clients choose entries and counts
+    if( fp3d::active() ) {
+        return fp3d_multi_execute( get_all_columns() );
+    }
     shared_ptr_fast<ui_adaptor> ui = create_or_get_ui_adaptor();
     debug_print_timer( tp_start );
     while( true ) {
@@ -4078,6 +4153,10 @@ std::string haul_selector_preset::get_denial( const item_location &item ) const
 
 drop_locations inventory_drop_selector::execute()
 {
+    // FP3D: headless clients choose entries and counts
+    if( fp3d::active() ) {
+        return fp3d_multi_execute( get_all_columns() );
+    }
     shared_ptr_fast<ui_adaptor> ui = create_or_get_ui_adaptor();
     debug_print_timer( tp_start );
     while( true ) {
@@ -4277,6 +4356,10 @@ void pickup_selector::apply_selection( std::vector<drop_location> selection )
 
 drop_locations pickup_selector::execute()
 {
+    // FP3D: headless clients choose entries and counts
+    if( fp3d::active() ) {
+        return fp3d_multi_execute( get_all_columns() );
+    }
     shared_ptr_fast<ui_adaptor> ui = create_or_get_ui_adaptor();
     debug_print_timer( tp_start );
 

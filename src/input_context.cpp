@@ -35,6 +35,7 @@
 #include "string_input_popup.h"
 #include "translations.h"
 #include "ui_manager.h"
+#include "fp3d/bridge.h" // FP3D:
 
 enum class kb_menu_status {
     remove, reset, add, add_global, execute, show, filter
@@ -433,6 +434,26 @@ const std::string &input_context::handle_input()
 
 const std::string &input_context::handle_input( const int timeout )
 {
+    // FP3D: headless clients answer instead of the keyboard. Polling loops (a timeout is set) must never
+    // block on the client, so they always time out; the main game loop blocks (see get_player_input).
+    if( fp3d::active() ) {
+        if( timeout >= 0 ) {
+            fp3d::note_poll( category );
+            return TIMEOUT;
+        }
+        fp3d::ui_request req;
+        req.kind = fp3d::request_kind::key;
+        req.context = category;
+        req.actions = registered_actions;
+        while( true ) {
+            const fp3d::ui_answer a = fp3d::ask( req );
+            const std::string wanted = a.cancel ? "QUIT" : a.action;
+            const auto it = std::find( registered_actions.begin(), registered_actions.end(), wanted );
+            if( it != registered_actions.end() ) {
+                return *it;
+            }
+        }
+    }
     const int old_timeout = inp_mngr.get_timeout();
     if( timeout >= 0 ) {
         inp_mngr.set_timeout( timeout );

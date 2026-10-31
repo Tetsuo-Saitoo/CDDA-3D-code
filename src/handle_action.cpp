@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "action.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "activity_actor_definitions.h"
 #include "advanced_inv.h"
 #include "auto_note.h"
@@ -285,6 +286,13 @@ input_context game::get_player_input( std::string &action )
 #endif
 
     user_turn current_turn;
+
+    // FP3D: headless clients block on one request here instead of polling every 125 ms
+    if( fp3d::active() ) {
+        ctxt.reset_timeout();
+        action = ctxt.handle_input();
+        return ctxt;
+    }
 
     if( get_option<bool>( "ANIMATIONS" ) ) {
         const int TOTAL_VIEW = MAX_VIEW_DISTANCE * 2 + 1;

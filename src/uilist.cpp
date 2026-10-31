@@ -9,6 +9,7 @@
 #include <set>
 
 #include "avatar.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "cached_options.h" // IWYU pragma: keep
 #include "cata_assert.h"
 #include "cata_utility.h"
@@ -875,6 +876,36 @@ shared_ptr_fast<uilist_impl> uilist::create_or_get_ui()
 shared_ptr_fast<uilist_impl> uilist::query( bool loop, int timeout,
         bool allow_unfiltered_hotkeys )
 {
+    // FP3D: headless clients get the entries as a menu request
+    if( fp3d::active() ) {
+        fp3d::ui_request req;
+        req.kind = fp3d::request_kind::menu;
+        req.context = "UILIST";
+        req.title = title;
+        req.text = text;
+        req.allow_cancel = allow_cancel;
+        for( size_t i = 0; i < entries.size(); i++ ) {
+            // retval -1 means "use the index" (uilist::setup assigns it; we skip setup)
+            const int rv = entries[i].retval == -1 ? static_cast<int>( i ) : entries[i].retval;
+            req.entries.push_back( { rv, entries[i].txt, entries[i].enabled, entries[i].desc } );
+        }
+        while( true ) {
+            const fp3d::ui_answer a = fp3d::ask( req );
+            if( a.cancel && allow_cancel ) {
+                ret = UILIST_CANCEL;
+                ret_act = "QUIT";
+                return nullptr;
+            }
+            for( size_t i = 0; i < req.entries.size(); i++ ) {
+                if( req.entries[i].id == a.entry && req.entries[i].enabled ) {
+                    selected = static_cast<int>( i );
+                    ret = a.entry;
+                    ret_act = "CONFIRM";
+                    return nullptr;
+                }
+            }
+        }
+    }
 #if defined(__ANDROID__)
     if( get_option<bool>( "ANDROID_NATIVE_UI" ) && !entries.empty() && !desired_bounds ) {
         if( !started ) {

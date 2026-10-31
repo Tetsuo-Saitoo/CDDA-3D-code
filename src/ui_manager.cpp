@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "cached_options.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "cata_assert.h"
 #include "cata_imgui.h"
 #include "cata_scope_helpers.h"
@@ -515,11 +516,19 @@ void invalidate( const rectangle<point> &rect, const bool reenable_uis_below )
 
 void redraw()
 {
+    // FP3D: headless: nothing to draw
+    if( fp3d::active() ) {
+        return;
+    }
     ui_adaptor::redraw();
 }
 
 void redraw_invalidated()
 {
+    // FP3D: headless: nothing to draw
+    if( fp3d::active() ) {
+        return;
+    }
     ui_adaptor::redraw_invalidated();
 }
 

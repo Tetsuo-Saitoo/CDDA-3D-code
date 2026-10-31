@@ -19,7 +19,7 @@
 #include "color.h"
 #include "coordinates.h"
 #include "debug.h"
-#include "filesystem.h"
+#include "fp3d/boot.h"
 #include "game.h"
 #include "json.h"
 #include "map.h"
@@ -32,65 +32,6 @@
 #include "type_id.h"
 #include "weather.h"
 #include "worldfactory.h"
-
-static const std::string fp3d_world_name = "fp3d-smoke";
-
-static void boot()
-{
-    PATH_INFO::init_base_path( "" );
-    PATH_INFO::init_user_dir( "./fp3d_user" );
-    PATH_INFO::set_standard_filenames();
-    for( const std::string &dir : { PATH_INFO::config_dir(), PATH_INFO::savedir(), PATH_INFO::templatedir() } ) {
-        if( !assure_dir_exist( dir ) ) {
-            throw std::runtime_error( "cannot create " + dir );
-        }
-    }
-    get_options().init();
-    get_options().load();
-    init_colors();
-
-    g = std::make_unique<game>();
-    g->new_game = true;
-    g->load_static_data();
-
-    world_generator->set_active_world( nullptr );
-    world_generator->init();
-    if( world_generator->has_world( fp3d_world_name ) ) {
-        world_generator->delete_world( fp3d_world_name, true );
-    }
-    WORLD *world = world_generator->make_new_world( fp3d_world_name, { mod_id( "dda" ) } );
-    if( world == nullptr ) {
-        throw std::runtime_error( "make_new_world failed" );
-    }
-    world_generator->set_active_world( world );
-    calendar::set_eternal_season( get_option<bool>( "ETERNAL_SEASON" ) );
-    calendar::set_season_length( get_option<int>( "SEASON_LENGTH" ) );
-
-    g->load_core_data();
-    g->load_world_modfiles();
-
-    get_avatar() = avatar();
-    get_avatar().create( character_type::NOW );
-    get_avatar().setID( g->assign_npc_id(), false );
-    get_map() = map();
-}
-
-// Loads the bubble centred on the nearest city and puts the avatar there. Returns the bubble origin.
-static tripoint_abs_sm place_in_town()
-{
-    // closest_city only searches overmaps that exist, so generate the one at the origin first.
-    overmap_buffer.get( point_abs_om() );
-    const city_reference city = overmap_buffer.closest_city( tripoint_abs_sm::zero );
-    const tripoint_abs_sm centre = city ? city.abs_sm_pos : tripoint_abs_sm::zero;
-    const tripoint_abs_sm origin = centre - point_rel_sm( MAPSIZE / 2, MAPSIZE / 2 );
-    map &here = get_map();
-    here.load( origin, false );
-    get_avatar().move_to( project_to<coords::ms>( centre ) );
-    get_weather().update_weather();
-    std::printf( "city: %s at submap %s\n", city ? "found" : "none (using origin)",
-                 centre.to_string().c_str() );
-    return origin;
-}
 
 static void dump_bubble( const std::string &path, const tripoint_abs_sm &origin, int z_below, int z_above )
 {
@@ -179,8 +120,8 @@ int main( int argc, char *argv[] )
     setupDebug( DebugOutput::std_err );
     rng_set_engine_seed( 42 );
     try {
-        boot();
-        const tripoint_abs_sm origin = place_in_town();
+        fp3d::boot_world( "fp3d-smoke", false );
+        const tripoint_abs_sm origin = fp3d::load_bubble_in_town();
         dump_bubble( out_path, origin, z_below, z_above );
     } catch( const std::exception &e ) {
         std::fprintf( stderr, "fp3d-headless failed: %s\n", e.what() );

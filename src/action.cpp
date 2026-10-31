@@ -10,6 +10,7 @@
 #include <utility>
 
 #include "avatar.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "cached_options.h" // IWYU pragma: keep
 #include "cata_utility.h"
 #include "character.h"
@@ -1091,6 +1092,11 @@ std::optional<tripoint_rel_ms> choose_direction( const std::string &message,
     input_context ctxt( "DEFAULTMODE", keyboard_mode::keycode );
     if( timeout >= 0 ) {
         ctxt.set_timeout( timeout );
+    }
+    // FP3D: headless clients block on the prompt (no highlight blinking) and get its text
+    if( fp3d::active() ) {
+        ctxt.reset_timeout();
+        fp3d::set_next_prompt( message );
     }
     ctxt.set_iso( true );
     ctxt.register_directions();

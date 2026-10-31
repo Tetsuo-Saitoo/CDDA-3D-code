@@ -13,6 +13,7 @@
 #include "output.h"
 #include "string_formatter.h"
 #include "ui_manager.h"
+#include "fp3d/bridge.h" // FP3D:
 
 class query_popup_impl : public cataimgui::window
 {
@@ -398,6 +399,29 @@ std::shared_ptr<query_popup_impl> query_popup::create_or_get_impl()
 }
 query_popup::result query_popup::query()
 {
+    // FP3D: headless clients choose one of the options
+    if( fp3d::active() ) {
+        fp3d::ui_request req;
+        req.kind = fp3d::request_kind::popup;
+        req.context = category;
+        req.text = text;
+        for( const query_option &opt : options ) {
+            req.actions.push_back( opt.action );
+        }
+        if( req.actions.empty() ) {
+            req.actions.emplace_back( "CONFIRM" );
+        }
+        req.allow_cancel = cancel;
+        while( true ) {
+            const fp3d::ui_answer a = fp3d::ask( req );
+            if( a.cancel && cancel ) {
+                return result( false, "QUIT", input_event() );
+            }
+            if( std::find( req.actions.begin(), req.actions.end(), a.action ) != req.actions.end() ) {
+                return result( false, a.action, input_event() );
+            }
+        }
+    }
     std::shared_ptr<query_popup_impl> ui = create_or_get_impl();
 
     result res;

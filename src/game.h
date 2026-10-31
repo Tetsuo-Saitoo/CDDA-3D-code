@@ -190,6 +190,7 @@ class game
         friend timed_event_manager &get_timed_events();
         friend memorial_logger &get_memorial();
         friend bool do_turn();
+        friend class fp3d_game_access; // FP3D: the headless bridge starts games (fp3d/game_access.h)
         friend bool turn_handler::cleanup_at_end();
         friend global_variables &get_globals();
     public:

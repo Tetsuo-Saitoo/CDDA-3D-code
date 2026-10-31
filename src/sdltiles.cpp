@@ -1,5 +1,6 @@
 #include "cursesdef.h" // IWYU pragma: associated
 #include "sdltiles.h" // IWYU pragma: associated
+#include "fp3d/bridge.h" // FP3D:
 
 #include "cuboid_rectangle.h"
 #include "point.h"
@@ -314,6 +315,11 @@ static void WinCreate()
 #endif
 #endif
 
+    // FP3D: headless runs keep CDDA's window (game code calls its tile renderer) but never show it
+    if( fp3d::active() ) {
+        window_flags = SDL_WINDOW_HIDDEN;
+    }
+
     ::window.reset( SDL_CreateWindow( "",
                                       SDL_WINDOWPOS_CENTERED_DISPLAY( display ),
                                       SDL_WINDOWPOS_CENTERED_DISPLAY( display ),
@@ -538,6 +544,10 @@ SDL_Rect get_android_render_rect( float DisplayBufferWidth, float DisplayBufferH
 
 void refresh_display()
 {
+    // FP3D: headless: nothing to draw
+    if( fp3d::active() ) {
+        return;
+    }
     needupdate = false;
     lastupdate = SDL_GetTicks();
 
@@ -1359,6 +1369,10 @@ static bool draw_window( Font_Ptr &font, const catacurses::window &w )
 
 void cata_cursesport::curses_drawwindow( const catacurses::window &w )
 {
+    // FP3D: headless: nothing to draw
+    if( fp3d::active() ) {
+        return;
+    }
     if( scaling_factor > 1 ) {
         SDL_RenderSetLogicalSize( renderer.get(), WindowWidth / scaling_factor,
                                   WindowHeight / scaling_factor );
@@ -3925,6 +3939,22 @@ void input_manager::pump_events()
 // is simply a wrapper around this.
 input_event input_manager::get_input_event( const keyboard_mode preferred_keyboard_mode )
 {
+    // FP3D: headless: raw key reads become key requests; polling reads time out
+    if( fp3d::active() ) {
+        input_event e;
+        if( get_timeout() >= 0 ) {
+            fp3d::note_poll( "RAW_KEY" );
+            e.type = input_event_t::timeout;
+            return e;
+        }
+        fp3d::ui_request req;
+        req.kind = fp3d::request_kind::key;
+        req.context = "RAW_KEY";
+        const fp3d::ui_answer a = fp3d::ask( req );
+        e.type = input_event_t::keyboard_char;
+        e.add_input( a.cancel || a.action.empty() ? KEY_ESCAPE : static_cast<unsigned char>( a.action[0] ) );
+        return e;
+    }
     if( test_mode ) {
         // input should be skipped in caller's code
         throw std::runtime_error( "input_manager::get_input_event called in test mode" );

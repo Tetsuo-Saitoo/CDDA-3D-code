@@ -4,6 +4,7 @@
 #include <climits>
 
 #include "cata_scope_helpers.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "catacharset.h"
 #include "condition.h"
 #include "flexbuffer_json.h"
@@ -381,6 +382,24 @@ std::optional<int64_t> string_input_popup::query_int64_t( const bool loop, const
 
 const std::string &string_input_popup::query_string( const bool loop, const bool draw_only )
 {
+    // FP3D: headless clients send the whole string at once; nothing to draw
+    if( fp3d::active() ) {
+        if( draw_only ) {
+            return _text;
+        }
+        fp3d::ui_request req;
+        req.kind = fp3d::request_kind::string;
+        req.title = _title;
+        req.text = _description;
+        req.max_len = _max_length > 0 ? _max_length : static_cast<int>( fp3d::max_answer_text );
+        req.entries.push_back( { 0, _text, true, "default" } );
+        const fp3d::ui_answer a = fp3d::ask( req );
+        _canceled = a.cancel;
+        if( !a.cancel ) {
+            _text = fp3d::sanitize_text( a.text, static_cast<size_t>( req.max_len ) );
+        }
+        return _text;
+    }
     if( !custom_window && !w_full ) {
         create_window();
         _position = -1;
