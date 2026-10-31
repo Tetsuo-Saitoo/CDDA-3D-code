@@ -325,3 +325,8 @@ if (MINGW AND NOT RELEASE)
             ${RuntimeLib_SDL_SOUND}
             TYPE BIN)
 endif ()
+
+# FP3D: libcdda smoke test (and later the bridge library)
+if (TILES)
+    add_subdirectory(fp3d)
+endif ()
