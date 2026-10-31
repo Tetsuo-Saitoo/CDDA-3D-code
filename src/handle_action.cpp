@@ -287,9 +287,11 @@ input_context game::get_player_input( std::string &action )
 
     user_turn current_turn;
 
-    // FP3D: headless clients block on one request here instead of polling every 125 ms
+    // FP3D: headless clients block on one request here instead of polling every 125 ms; in real time
+    // it expires at the end of the turn (fp3d clock)
     if( fp3d::active() ) {
         ctxt.reset_timeout();
+        fp3d::set_next_timed();
         action = ctxt.handle_input();
         return ctxt;
     }

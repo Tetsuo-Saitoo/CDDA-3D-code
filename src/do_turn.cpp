@@ -18,6 +18,7 @@
 #include <vector>
 
 #include "action.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "activity_type.h"
 #include "avatar.h"
 #include "bionics.h"
@@ -228,6 +229,14 @@ bool cleanup_at_end()
 
 void handle_key_blocking_activity()
 {
+    // FP3D: no keyboard to poll; the client stops an activity with fp3d::interrupt()
+    if( fp3d::active() ) {
+        const avatar &u = get_avatar();
+        if( fp3d::take_interrupt() && u.activity && u.activity.is_interruptible_with_kb() ) {
+            g->cancel_activity_query( _( "Confirm:" ) );
+        }
+        return;
+    }
     if( test_mode ) {
         return;
     }
@@ -471,6 +480,11 @@ bool do_turn()
             weather.set_nextweather( calendar::turn );
         }
     } else {
+        // FP3D: pause and real-time pacing; activities and sleep fast-forward
+        if( fp3d::active() ) {
+            const avatar &u = get_avatar();
+            fp3d::pace_turn( static_cast<bool>( u.activity ) || u.has_effect( effect_sleep ) );
+        }
         g->gamemode->per_turn();
         calendar::turn += 1_turns;
     }

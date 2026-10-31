@@ -447,7 +447,8 @@ const std::string &input_context::handle_input( const int timeout )
         req.actions = registered_actions;
         while( true ) {
             const fp3d::ui_answer a = fp3d::ask( req );
-            const std::string wanted = a.cancel ? "QUIT" : a.action;
+            // A timed (main loop) request expired in real time: the player waits out the turn.
+            const std::string wanted = a.timed_out ? "pause" : a.cancel ? "QUIT" : a.action;
             const auto it = std::find( registered_actions.begin(), registered_actions.end(), wanted );
             if( it != registered_actions.end() ) {
                 return *it;

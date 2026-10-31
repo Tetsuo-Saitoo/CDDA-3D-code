@@ -13,6 +13,10 @@ class fp3d_game_access
         static bool start_game( game &g ) {
             return g.start_game();
         }
+        // Loads a saved character into the active world; call g.setup() first (as the main menu does).
+        static bool load_game( game &g, const save_t &save ) {
+            return g.load( save );
+        }
 };
 
 #endif // CATA_SRC_FP3D_GAME_ACCESS_H

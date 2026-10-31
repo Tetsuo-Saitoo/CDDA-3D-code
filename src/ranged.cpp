@@ -15,6 +15,8 @@
 #include <vector>
 
 #include "activity_actor_definitions.h"
+#include "fp3d/bridge.h" // FP3D:
+#include "fp3d/points.h" // FP3D:
 #include "avatar.h"
 #include "ballistics.h"
 #include "bionics.h"
@@ -264,6 +266,8 @@ class target_ui
 
         // Initialize UI and run the event loop
         target_handler::trajectory run();
+        // FP3D: one `target` request in place of reading a key; may move the cursor; "" = ask again
+        std::string fp3d_ask();
 
         // returns the currently selected aim type (immediate/careful/precise etc)
         aim_type get_selected_aim_type() const;
@@ -2804,7 +2808,9 @@ target_handler::trajectory target_ui::run()
         skip_redraw = false;
 
         // Wait for user input (or use value retrieved from activity)
-        if( action.empty() ) {
+        if( action.empty() && fp3d::active() ) { // FP3D:
+            action = fp3d_ask();
+        } else if( action.empty() ) {
             int timeout = get_option<int>( "EDGE_SCROLL" );
             action = ctxt.handle_input( timeout );
         }
@@ -2945,6 +2951,65 @@ target_handler::trajectory target_ui::run()
     }
 
     return traj;
+}
+
+// FP3D: the client gets the aim state (mode, cursor, range, hostile targets, status) and answers with a
+// square and/or one of the offered actions. Cancel = QUIT. The square goes through set_cursor_pos(), which
+// clamps it to what CDDA's cursor could reach.
+std::string target_ui::fp3d_ask()
+{
+    static const char *const mode_names[] = {
+        "fire", "throw", "throw_blind", "turrets", "turret_manual", "reach", "spell", "select"
+    };
+    static const char *const status_names[] = { "", "bad_target", "out_of_ammo", "out_of_range" };
+    map &here = get_map();
+    fp3d::ui_request req;
+    req.kind = fp3d::request_kind::target;
+    req.mode = mode_names[static_cast<int>( mode )];
+    req.status = status_names[static_cast<int>( status )];
+    req.origin = fp3d::to_ui_point( here.get_abs( src ) );
+    req.cursor = fp3d::to_ui_point( here.get_abs( dst ) );
+    req.range = range;
+    for( const tripoint_bub_ms &t : targets ) {
+        if( req.candidates.size() < fp3d::max_candidates ) {
+            req.candidates.push_back( fp3d::to_ui_point( here.get_abs( t ) ) );
+        }
+    }
+    // Same actions init_window_and_input() registers (input_context can't list them outside Android).
+    req.actions = { "FIRE", "QUIT" };
+    if( mode == TargetMode::Fire || mode == TargetMode::TurretManual || ( mode == TargetMode::Reach &&
+            ( relevant && relevant->is_gun() ) && you->get_aim_types( *relevant ).size() > 1 ) ) {
+        req.actions.emplace_back( "SWITCH_MODE" );
+        if( mode == TargetMode::Fire || mode == TargetMode::TurretManual ) {
+            req.actions.emplace_back( "SWITCH_AMMO" );
+        }
+    }
+    if( mode == TargetMode::Fire ) {
+        req.actions.emplace_back( "AIM" );
+        req.actions.emplace_back( "STOPAIM" );
+        for( const aim_type &type : aim_types ) {
+            if( type.has_threshold ) {
+                req.actions.push_back( type.action );
+            }
+        }
+        if( relevant->has_flag( flag_RELOAD_AND_SHOOT ) ) {
+            req.actions.emplace_back( "TOGGLE_UNLOAD_RAS_WEAPON" );
+        }
+    }
+    const fp3d::ui_answer a = fp3d::ask( req );
+    if( a.cancel ) {
+        return "QUIT";
+    }
+    if( a.pos ) {
+        const tripoint_bub_ms picked = here.get_bub( fp3d::to_abs_ms( *a.pos ) );
+        if( here.inbounds( picked ) ) {
+            set_cursor_pos( picked );
+        }
+    }
+    if( std::find( req.actions.begin(), req.actions.end(), a.action ) != req.actions.end() ) {
+        return a.action;
+    }
+    return "";
 }
 
 void target_ui::init_window_and_input()

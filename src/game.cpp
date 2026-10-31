@@ -37,6 +37,8 @@
 #endif
 
 #include "achievement.h"
+#include "fp3d/bridge.h" // FP3D:
+#include "fp3d/points.h" // FP3D:
 #include "action.h"
 #include "activity_actor_definitions.h"
 #include "activity_handlers.h"
@@ -4853,6 +4855,7 @@ void game::mon_info_update( )
         turnssincelastmon = 0_turns;
         if( safe_mode == SAFE_MODE_ON ) {
             set_safe_mode( SAFE_MODE_STOP );
+            fp3d::auto_pause( "hostile spotted" ); // FP3D: real time stops like safe mode does
         }
     } else if( calendar::turn > previous_turn && get_option<bool>( "AUTOSAFEMODE" ) &&
                newseen == 0 ) { // Auto safe mode, but only if it's a new turn
@@ -7929,6 +7932,35 @@ std::optional<std::vector<tripoint_bub_ms>> game::safe_route_to( Character &who,
     return shortest_route;
 }
 
+// FP3D: look_around for the bridge. Peeking's blind throw/fire (peek_action) isn't offered yet.
+static look_around_result fp3d_look_around( tripoint_bub_ms &center, const tripoint_bub_ms &start_point,
+        bool select_zone, bool peeking )
+{
+    map &here = get_map();
+    const avatar &u = get_avatar();
+    fp3d::ui_request req;
+    req.kind = fp3d::request_kind::target;
+    req.mode = select_zone ? "zone" : peeking ? "peek" : "look";
+    req.origin = fp3d::to_ui_point( u.pos_abs() );
+    req.cursor = fp3d::to_ui_point( here.get_abs( start_point ) );
+    for( const Creature *critter : u.get_visible_creatures( MAX_VIEW_DISTANCE ) ) {
+        if( req.candidates.size() < fp3d::max_candidates ) {
+            req.candidates.push_back( fp3d::to_ui_point( critter->pos_abs() ) );
+        }
+    }
+    look_around_result result;
+    const fp3d::ui_answer a = fp3d::ask( req );
+    if( a.cancel || !a.pos ) {
+        return result;
+    }
+    const tripoint_bub_ms picked = here.get_bub( fp3d::to_abs_ms( *a.pos ) );
+    if( here.inbounds( picked ) ) {
+        center = picked;
+        result.position = picked;
+    }
+    return result;
+}
+
 std::optional<tripoint_bub_ms> game::look_around()
 {
     tripoint_bub_ms center = u.pos_bub() + u.view_offset;
@@ -7943,6 +7975,10 @@ look_around_result game::look_around(
     bool select_zone, bool peeking, bool is_moving_zone, const tripoint_bub_ms &end_point,
     bool change_lv )
 {
+    // FP3D: headless clients pick the square in one `target` request instead of the cursor loop
+    if( fp3d::active() ) {
+        return fp3d_look_around( center, start_point, select_zone, peeking );
+    }
     map &here = get_map();
 
     bVMonsterLookFire = false;

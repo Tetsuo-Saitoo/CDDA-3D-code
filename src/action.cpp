@@ -11,6 +11,7 @@
 
 #include "avatar.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/points.h" // FP3D:
 #include "cached_options.h" // IWYU pragma: keep
 #include "cata_utility.h"
 #include "character.h"
@@ -1084,19 +1085,49 @@ action_id handle_main_menu()
     }
 }
 
+// FP3D: square the next direction prompt is centred on, when it isn't the player's (choose_adjacent)
+static thread_local std::optional<tripoint_abs_ms> fp3d_direction_origin;
+
+// FP3D: one `direction` request replaces the key loop. An answer outside the allowed 3x3(x3) cancels.
+static std::optional<tripoint_rel_ms> fp3d_choose_direction( const std::string &message,
+        const bool allow_vertical )
+{
+    Character &player_character = get_player_character();
+    fp3d::ui_request req;
+    req.kind = fp3d::request_kind::direction;
+    req.text = message;
+    req.allow_vertical = allow_vertical;
+    req.origin = fp3d::to_ui_point( fp3d_direction_origin.value_or( player_character.pos_abs() ) );
+    fp3d_direction_origin.reset();
+    const fp3d::ui_answer a = fp3d::ask( req );
+    if( !a.cancel && a.pos ) {
+        const tripoint_rel_ms vec( a.pos->x, a.pos->y, a.pos->z );
+        if( std::abs( vec.x() ) <= 1 && std::abs( vec.y() ) <= 1 &&
+            ( allow_vertical ? std::abs( vec.z() ) <= 1 : vec.z() == 0 ) ) {
+            if( vec.x() > 0 ) {
+                player_character.facing = FacingDirection::RIGHT;
+            } else if( vec.x() < 0 ) {
+                player_character.facing = FacingDirection::LEFT;
+            }
+            return vec;
+        }
+    }
+    add_msg( _( "Never mind." ) );
+    return std::nullopt;
+}
+
 std::optional<tripoint_rel_ms> choose_direction( const std::string &message,
         const bool allow_vertical, const bool allow_mouse, const int timeout,
         const std::function<std::pair<bool, std::optional<tripoint_rel_ms>>(
             const input_context &ctxt, const std::string &action )> &action_cb )
 {
+    // FP3D: headless clients answer a `direction` request instead
+    if( fp3d::active() ) {
+        return fp3d_choose_direction( message, allow_vertical );
+    }
     input_context ctxt( "DEFAULTMODE", keyboard_mode::keycode );
     if( timeout >= 0 ) {
         ctxt.set_timeout( timeout );
-    }
-    // FP3D: headless clients block on the prompt (no highlight blinking) and get its text
-    if( fp3d::active() ) {
-        ctxt.reset_timeout();
-        fp3d::set_next_prompt( message );
     }
     ctxt.set_iso( true );
     ctxt.register_directions();
@@ -1171,6 +1202,9 @@ std::optional<tripoint_bub_ms> choose_adjacent( const tripoint_bub_ms &pos,
         const std::function<std::pair<bool, std::optional<tripoint_bub_ms>>(
             const input_context &ctxt, const std::string &action )> &action_cb )
 {
+    if( fp3d::active() ) { // FP3D:
+        fp3d_direction_origin = get_map().get_abs( pos );
+    }
     const std::optional<tripoint_rel_ms> dir = choose_direction(
                 message, allow_vertical, /*allow_mouse=*/true, timeout,
     [&]( const input_context & ctxt, const std::string & action ) {
