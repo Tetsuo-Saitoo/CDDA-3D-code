@@ -90,6 +90,10 @@ tripoint_abs_sm load_bubble_in_town()
     get_map().load( origin, false );
     get_avatar().move_to( project_to<coords::ms>( centre ) );
     get_weather().update_weather();
+    // Vehicle and vision/light caches, as a map shift and do_turn build them (snapshots read them;
+    // without the vehicle rebuild, vehicle roofs are missing from the outside cache).
+    get_map().rebuild_vehicle_level_caches();
+    get_map().build_map_cache( get_avatar().posz() );
     std::printf( "city: %s at submap %s\n", city ? "found" : "none (using origin)",
                  centre.to_string().c_str() );
     return origin;

@@ -14,6 +14,11 @@ inline ui_point to_ui_point( const tripoint_abs_ms &p )
     return ui_point{ p.x(), p.y(), p.z() };
 }
 
+inline ui_point to_ui_point( const tripoint_abs_sm &p )
+{
+    return ui_point{ p.x(), p.y(), p.z() };
+}
+
 inline tripoint_abs_ms to_abs_ms( const ui_point &p )
 {
     return tripoint_abs_ms( p.x, p.y, p.z );

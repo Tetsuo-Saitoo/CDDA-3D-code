@@ -30,6 +30,7 @@
 #include "fp3d/bridge.h"
 #include "fp3d/game_access.h"
 #include "fp3d/points.h"
+#include "fp3d/snapshot.h"
 #include "game.h"
 #include "item.h"
 #include "map.h"
@@ -105,6 +106,8 @@ void observe()
     for( const auto &m : Messages::recent_messages( 6 ) ) {
         o.messages.push_back( m.second );
     }
+    // Block B3: the client reads this snapshot while the sim waits for the answer.
+    fp3d::publish_snapshot( fp3d::capture_snapshot() );
     std::lock_guard<std::mutex> lk( observed_mutex );
     last_observed = o;
 }
@@ -169,6 +172,7 @@ void sim_main()
             throw std::runtime_error( "load failed" );
         }
         loads++;
+        fp3d::reset_snapshots();
         while( !do_turn() ) {
         }
         sim_error = "game ended";
@@ -480,5 +484,13 @@ int main()
         std::printf( "sim error: %s\n", sim_error.c_str() );
     }
     std::printf( "%d/%zu goals passed, %d requests\n", passed, n_goals, requests );
-    return passed == static_cast<int>( n_goals ) ? EXIT_SUCCESS : EXIT_FAILURE;
+    // The newest published snapshot is the one taken before the last request.
+    const std::shared_ptr<const fp3d::snapshot> last = fp3d::latest_snapshot();
+    const observed o = snapshot();
+    const bool snap_ok = last && last->turn == o.turn && last->submaps.size() == 2541 &&
+                         !last->creatures.empty() && last->creatures[0].kind == 0;
+    std::printf( "snapshots: %s (seq %llu, turn %lld)\n", snap_ok ? "ok" : "BAD",
+                 last ? static_cast<unsigned long long>( last->seq ) : 0ULL,
+                 last ? static_cast<long long>( last->turn ) : -1LL );
+    return passed == static_cast<int>( n_goals ) && snap_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
