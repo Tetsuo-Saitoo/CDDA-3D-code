@@ -409,6 +409,71 @@ void print_request( const fp3d::ui_request &req, const std::string &note )
 }
 } // namespace
 
+// Block B5: actions queued instead of answered. Starts with the main loop waiting on a timed request.
+bool run_queue_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  queue: %-36s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+    if( !r0 || !r0->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    std::vector<fp3d::event> evs;
+    fp3d::drain_events( evs );
+
+    // One bad action, safe mode off (the real-time goal's zombie is still in view and safe mode refuses to
+    // pass time near it), then three turns of waiting, all without answering a request.
+    fp3d::queue_action( "no_such_action" );
+    fp3d::queue_action( "safemode" );
+    for( int i = 0; i < 3; i++ ) {
+        fp3d::queue_action( "pause" );
+    }
+    const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 20000, r0->id );
+    evs.clear();
+    fp3d::drain_events( evs );
+    bool told = false;
+    std::string msgs;
+    for( const fp3d::event &e : evs ) {
+        if( e.kind == fp3d::event_kind::message ) {
+            told = told || e.text.find( "no_such_action" ) != std::string::npos;
+            msgs += " | " + e.text;
+        }
+    }
+    const bool ran = r1 && r1->timed && r1->id >= r0->id + 5 && r1->turn >= r0->turn + 2 &&
+                     fp3d::queued_actions() == 0;
+    check( ran, "5 queued actions, no answers", r1 ? "turns +" + std::to_string( r1->turn - r0->turn ) +
+           ", requests +" + std::to_string( r1->id - r0->id ) + ( ran ? "" : msgs ) : "no request" );
+    check( told, "bad action dropped with a message", "" );
+    if( !r1 ) {
+        return false;
+    }
+
+    // Paused: the queue waits; resuming lets the sim take it.
+    fp3d::set_paused( true );
+    fp3d::queue_action( "pause" );
+    const std::optional<fp3d::ui_request> during = fp3d::wait_request( 1000, r1->id );
+    const bool held = !during && fp3d::queued_actions() == 1;
+    fp3d::set_paused( false );
+    const std::optional<fp3d::ui_request> r2 = fp3d::wait_request( 20000, r1->id );
+    check( held && r2 && r2->timed && fp3d::queued_actions() == 0, "held while paused, taken on resume", "" );
+
+    // Bounded: the 33rd action is refused.
+    fp3d::set_paused( true );
+    int accepted = 0;
+    for( size_t i = 0; i <= fp3d::max_queued_actions; i++ ) {
+        accepted += fp3d::queue_action( "pause" ) ? 1 : 0;
+    }
+    fp3d::clear_actions();
+    check( accepted == static_cast<int>( fp3d::max_queued_actions ) && fp3d::queued_actions() == 0,
+           "full queue refuses, clear empties", std::to_string( accepted ) + " accepted" );
+    fp3d::set_paused( false );
+    return failed == 0;
+}
+
 int main()
 {
     std::setvbuf( stdout, nullptr, _IONBF, 0 );
@@ -494,6 +559,8 @@ int main()
         print_request( *req, note );
         fp3d::answer( a );
     }
+    drain();
+    const bool queue_ok = g_idx == n_goals && run_queue_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -522,5 +589,6 @@ int main()
                  "dropped %zu)\n", events_ok ? "ok" : "BAD", count( event_kind::turn_end ),
                  count( event_kind::message ), count( event_kind::sound ), count( event_kind::projectile ),
                  count( event_kind::anim ), count( event_kind::attack ), events_dropped );
-    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    std::printf( "queue: %s\n", queue_ok ? "ok" : "BAD" );
+    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

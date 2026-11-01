@@ -4,6 +4,7 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <deque>
 #include <map>
 #include <mutex>
 
@@ -21,6 +22,7 @@ struct channel {
     uint64_t next_id = 1;
     bool shut_down = false;
     std::function<void()> before_ask;
+    std::deque<std::string> actions;     // queued main-loop actions (block B5)
     clock_state clock;
     // Wall time the current game turn started; real time ends it turn_length() later.
     std::chrono::steady_clock::time_point turn_start = std::chrono::steady_clock::now();
@@ -115,6 +117,11 @@ void set_next_timed()
     next_timed = true;
 }
 
+bool next_is_timed()
+{
+    return next_timed;
+}
+
 ui_answer ask( ui_request req )
 {
     channel &c = chan();
@@ -150,6 +157,17 @@ ui_answer ask( ui_request req )
             throw shutdown_signal();
         }
         if( c.reply && c.reply->id == id ) {
+            break;
+        }
+        // Checked under the same lock that posted the request, so a client never sees it as waiting while
+        // a queued action is about to answer it.
+        if( timed && !c.actions.empty() && !c.clock.paused ) {
+            ui_answer queued;
+            queued.id = id;
+            queued.action = std::move( c.actions.front() );
+            queued.queued = true;
+            c.actions.pop_front();
+            c.reply = std::move( queued );
             break;
         }
         // Re-evaluated on every wake-up: the client may switch mode, timescale or pause meanwhile.
@@ -249,7 +267,32 @@ void auto_pause( const std::string &reason )
     }
     c.clock.paused = true;
     c.clock.pause_reason = sanitize_text( reason, 128 );
+    c.actions.clear();   // don't walk on into what made us stop
     c.cv.notify_all();
+}
+
+bool queue_action( const std::string &action )
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.actions.size() >= max_queued_actions ) {
+        return false;
+    }
+    c.actions.push_back( sanitize_text( action, 128 ) );
+    c.cv.notify_all();
+    return true;
+}
+
+void clear_actions()
+{
+    std::lock_guard<std::mutex> lk( chan().m );
+    chan().actions.clear();
+}
+
+size_t queued_actions()
+{
+    std::lock_guard<std::mutex> lk( chan().m );
+    return chan().actions.size();
 }
 
 void pace_turn( bool fast_forward )
@@ -304,6 +347,7 @@ void answer( ui_answer a )
     if( !c.pending || c.pending->id != a.id || c.reply ) {
         return;
     }
+    a.queued = false;   // the bridge's flag, not the client's
     c.reply = std::move( a );
     c.cv.notify_all();
 }

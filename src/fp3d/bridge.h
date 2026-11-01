@@ -76,6 +76,7 @@ struct ui_answer {
     std::vector<std::pair<int, int>> picks;  // item_multi: (entry id, count; 0 = all)
     std::optional<ui_point> pos;         // direction: relative (-1..1); target: absolute square
     bool timed_out = false;              // set by the bridge only: a timed request expired
+    bool queued = false;                 // set by the bridge only: taken from the action queue
 };
 
 // Thrown on the sim thread by ask() when the client shuts the bridge down. Deliberately not a
@@ -99,6 +100,7 @@ void set_before_ask_hook( std::function<void()> hook );
 // Sim side. Makes the next request timed (the main game loop's): in real time it expires at the end of
 // the current turn and comes back with `timed_out` set.
 void set_next_timed();
+bool next_is_timed();
 
 // Client side. Returns the pending request with an id above `newer_than`, waiting up to timeout_ms;
 // nullopt on timeout or shutdown.
@@ -129,6 +131,15 @@ void set_paused( bool paused );          // client side; clears the reason
 void auto_pause( const std::string &reason );
 // Sim side, at every turn advance: blocks while paused and paces real time. Throws shutdown_signal.
 void pace_turn( bool fast_forward );
+
+// Action queue (block B5). The client can send main-loop actions (names from a timed request's `actions`) at
+// any time instead of catching each timed request: the sim takes one per timed request, before waiting for an
+// answer, and none while paused. An action that isn't valid there is dropped with a `message` event. Auto-pause
+// clears the queue, like CDDA's safe mode stopping you. Client side; queue_action returns false when full.
+constexpr size_t max_queued_actions = 32;
+bool queue_action( const std::string &action );
+void clear_actions();
+size_t queued_actions();
 
 // Client side. Asks the sim to stop the current activity (it confirms with a popup first, like CDDA).
 void interrupt();

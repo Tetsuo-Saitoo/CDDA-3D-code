@@ -36,6 +36,7 @@
 #include "translations.h"
 #include "ui_manager.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/events.h" // FP3D:
 
 enum class kb_menu_status {
     remove, reset, add, add_global, execute, show, filter
@@ -445,13 +446,21 @@ const std::string &input_context::handle_input( const int timeout )
         req.kind = fp3d::request_kind::key;
         req.context = category;
         req.actions = registered_actions;
+        const bool timed = fp3d::next_is_timed();
         while( true ) {
+            if( timed ) {
+                fp3d::set_next_timed();   // asking again after a bad answer is still the main loop
+            }
             const fp3d::ui_answer a = fp3d::ask( req );
             // A timed (main loop) request expired in real time: the player waits out the turn.
             const std::string wanted = a.timed_out ? "pause" : a.cancel ? "QUIT" : a.action;
             const auto it = std::find( registered_actions.begin(), registered_actions.end(), wanted );
             if( it != registered_actions.end() ) {
                 return *it;
+            }
+            // A queued action that isn't valid here is dropped; tell the client why.
+            if( a.queued && fp3d::events_enabled() ) {
+                fp3d::on_message( "Can't do that here: " + wanted, static_cast<int>( m_warning ) );
             }
         }
     }
