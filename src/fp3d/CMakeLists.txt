@@ -2,7 +2,8 @@
 target_sources(cataclysm-tiles-common PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/bridge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/boot.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/snapshot.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/snapshot.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/events.cpp)
 
 # Block B1: headless smoke test. Links the same object library as the game, opens no window.
 add_executable(fp3d-headless headless_smoke.cpp ${MESSAGES_CPP})
@@ -18,3 +19,8 @@ target_compile_definitions(fp3d-sim-test PUBLIC SDL_MAIN_HANDLED)
 add_executable(fp3d-snapshot-test snapshot_test.cpp ${MESSAGES_CPP})
 target_link_libraries(fp3d-snapshot-test PRIVATE cataclysm-tiles-common)
 target_compile_definitions(fp3d-snapshot-test PUBLIC SDL_MAIN_HANDLED)
+
+# Block B4: events emitted for things that happen next to the player, perception filter, overflow rule.
+add_executable(fp3d-events-test events_test.cpp ${MESSAGES_CPP})
+target_link_libraries(fp3d-events-test PRIVATE cataclysm-tiles-common)
+target_compile_definitions(fp3d-events-test PUBLIC SDL_MAIN_HANDLED)

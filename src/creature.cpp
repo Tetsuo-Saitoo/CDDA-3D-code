@@ -20,6 +20,7 @@
 #include "cata_utility.h"
 #include "cata_variant.h"
 #include "character.h"
+#include "fp3d/events.h" // FP3D:
 #include "character_attire.h"
 #include "character_id.h"
 #include "color.h"
@@ -1450,6 +1451,10 @@ dealt_damage_instance Creature::deal_damage( Creature *source, bodypart_id bp,
     }
 
     apply_damage( source, bp, total_damage );
+    // FP3D: hit reaction for the client
+    if( fp3d::events_enabled() && total_damage > 0 ) {
+        fp3d::on_damage( *this, bp.id().str(), total_damage, dealt_dams );
+    }
 
     if( wkpt != nullptr ) {
         wkpt->apply_effects( *this, total_damage, attack );

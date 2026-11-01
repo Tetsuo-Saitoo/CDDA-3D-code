@@ -30,6 +30,7 @@
 #include "fp3d/bridge.h"
 #include "fp3d/game_access.h"
 #include "fp3d/points.h"
+#include "fp3d/events.h"
 #include "fp3d/snapshot.h"
 #include "game.h"
 #include "item.h"
@@ -419,7 +420,22 @@ int main()
     setupDebug( DebugOutput::std_err );
     rng_set_engine_seed( 42 );
     fp3d::set_active( true );
+    fp3d::set_events_enabled( true );
     std::thread sim( sim_main );
+    // Drained at every request like a client would; counted per kind and checked at the end.
+    size_t event_counts[static_cast<size_t>( fp3d::event_kind::turn_end ) + 1] = {};
+    size_t events_dropped = 0;
+    uint64_t last_event_seq = 0;
+    bool seq_ordered = true;
+    const auto drain = [&]() {
+        std::vector<fp3d::event> evs;
+        events_dropped += fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            event_counts[static_cast<size_t>( e.kind )]++;
+            seq_ordered = seq_ordered && e.seq >= last_event_seq;
+            last_event_seq = e.seq;
+        }
+    };
 
     const size_t n_goals = std::size( goals );
     size_t g_idx = 0;
@@ -439,6 +455,7 @@ int main()
             break;
         }
         requests++;
+        drain();
         if( req->timed && issued ) {
             // Back in the main loop after issuing the goal's action: check the result.
             const goal &gl = goals[g_idx];
@@ -492,5 +509,18 @@ int main()
     std::printf( "snapshots: %s (seq %llu, turn %lld)\n", snap_ok ? "ok" : "BAD",
                  last ? static_cast<unsigned long long>( last->seq ) : 0ULL,
                  last ? static_cast<long long>( last->turn ) : -1LL );
-    return passed == static_cast<int>( n_goals ) && snap_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    drain();
+    using fp3d::event_kind;
+    const auto count = [&]( event_kind k ) {
+        return event_counts[static_cast<size_t>( k )];
+    };
+    // The goals end turns, print messages, throw a rock and start activities (eat, wait).
+    const bool events_ok = count( event_kind::turn_end ) > 0 && count( event_kind::message ) > 0 &&
+                           count( event_kind::projectile ) > 0 && count( event_kind::anim ) > 0 &&
+                           events_dropped == 0 && seq_ordered;
+    std::printf( "events: %s (turn_end %zu, message %zu, sound %zu, projectile %zu, anim %zu, attack %zu, "
+                 "dropped %zu)\n", events_ok ? "ok" : "BAD", count( event_kind::turn_end ),
+                 count( event_kind::message ), count( event_kind::sound ), count( event_kind::projectile ),
+                 count( event_kind::anim ), count( event_kind::attack ), events_dropped );
+    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }

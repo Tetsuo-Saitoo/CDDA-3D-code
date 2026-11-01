@@ -20,6 +20,7 @@
 #include "calendar.h"
 #include "cata_utility.h"
 #include "character.h"
+#include "fp3d/events.h" // FP3D:
 #include "color.h"
 #include "coordinates.h"
 #include "creature.h"
@@ -321,6 +322,15 @@ static void do_blast( map *m, const Creature *source, const tripoint_bub_ms &p, 
         }
 
         draw_custom_explosion( explosion_colors );
+        // FP3D: the blast area for the client
+        if( fp3d::events_enabled() ) {
+            std::vector<tripoint_bub_ms> area;
+            area.reserve( explosion_colors.size() );
+            for( const auto &pr : explosion_colors ) {
+                area.push_back( pr.first );
+            }
+            fp3d::on_explosion( bubble_map.get_bub( m->get_abs( p ) ), 0, area, fire ? "fire_blast" : "blast" );
+        }
     }
 
     creature_tracker &creatures = get_creature_tracker();
@@ -607,6 +617,9 @@ void _make_explosion( map *m, const Creature *source, const tripoint_bub_ms &p,
 void flashbang( const tripoint_bub_ms &p, bool player_immune )
 {
     draw_explosion( p, 8, c_white );
+    if( fp3d::events_enabled() ) { // FP3D:
+        fp3d::on_explosion( p, 8, {}, "flashbang" );
+    }
     Character &player_character = get_player_character();
     int dist = rl_dist( player_character.pos_bub(), p );
     map &here = get_map();
@@ -660,6 +673,9 @@ void shockwave( const tripoint_bub_ms &p, int radius, int force, int stun, int d
                 bool ignore_player )
 {
     draw_explosion( p, radius, c_blue );
+    if( fp3d::events_enabled() ) { // FP3D:
+        fp3d::on_explosion( p, radius, {}, "shockwave" );
+    }
 
     sounds::sound( p, force * force * dam_mult / 2, sounds::sound_t::combat, _( "Crack!" ), false,
                    "misc", "shockwave" );

@@ -14,6 +14,7 @@
 #include "calendar.h"
 #include "catacharset.h"
 #include "character.h"
+#include "fp3d/events.h" // FP3D:
 #include "color.h"
 #include "cursesdef.h"
 #include "debug.h"
@@ -195,6 +196,11 @@ class messages_impl
 
             refresh_cooldown( m, flags );
             hide_message_in_cooldown( m );
+
+            // FP3D: the client's message feed
+            if( fp3d::events_enabled() && !m.cooldown_hidden ) {
+                fp3d::on_message( m.message, static_cast<int>( m.type ) );
+            }
 
             if( coalesce_messages( m ) ) {
                 return;

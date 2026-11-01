@@ -12,6 +12,7 @@
 #include "cached_options.h" // IWYU pragma: keep
 #include "calendar.h"
 #include "character.h"
+#include "fp3d/events.h" // FP3D:
 #include "coordinates.h"
 #include "creature_tracker.h"
 #include "debug.h"
@@ -613,6 +614,12 @@ void sounds::process_sound_markers( Character *you )
 
         if( heard_volume <= 0 && pos != you->pos_bub() ) {
             continue;
+        }
+        // FP3D: what the player hears goes to the client
+        if( fp3d::events_enabled() && you->is_avatar() ) {
+            fp3d::on_sound( pos, raw_volume, std::max( heard_volume, 0 ), static_cast<int>( sound.category ),
+                            sound.description, sound.footstep && sound.id.empty() ? "footstep" : sound.id,
+                            sound.variant );
         }
 
         // Player volume meter includes all sounds from their tile and adjacent tiles

@@ -19,6 +19,7 @@
 
 #include "action.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/events.h" // FP3D:
 #include "activity_type.h"
 #include "avatar.h"
 #include "bionics.h"
@@ -480,6 +481,9 @@ bool do_turn()
             weather.set_nextweather( calendar::turn );
         }
     } else {
+        if( fp3d::events_enabled() ) { // FP3D:
+            fp3d::on_turn_end();
+        }
         // FP3D: pause and real-time pacing; activities and sleep fast-forward
         if( fp3d::active() ) {
             const avatar &u = get_avatar();

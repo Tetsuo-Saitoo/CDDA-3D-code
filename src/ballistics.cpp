@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "character.h"
+#include "fp3d/events.h" // FP3D:
 #include "coordinates.h"
 #include "creature.h"
 #include "creature_tracker.h"
@@ -611,6 +612,12 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                 break;
             }
             prev_point = tp;
+        }
+        // FP3D: the flight path for the client
+        if( fp3d::events_enabled() ) {
+            const item &drop = proj.get_drop();
+            fp3d::on_projectile( *here, origin, t_copy, tp, attack.last_hit_critter,
+                                 drop.is_null() ? "" : drop.typeId().str() );
         }
         // Done with the trajectory!
         if( first && do_animation && do_draw_line && traj_len > 2 ) {

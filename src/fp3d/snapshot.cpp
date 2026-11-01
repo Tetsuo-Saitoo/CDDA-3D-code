@@ -109,6 +109,7 @@ uint64_t monster_uid( const monster &m )
     state.monsters.emplace( &m, capture_state::tracked_monster{ g->shared_from( m ), uid } );
     return uid;
 }
+} // namespace
 
 uint64_t creature_uid( const Creature &c )
 {
@@ -124,6 +125,13 @@ uint64_t creature_uid( const Creature &c )
     return 0;
 }
 
+uint64_t next_snapshot_seq()
+{
+    return state.seq + 1;
+}
+
+namespace
+{
 uint64_t vehicle_uid( const vehicle *v )
 {
     auto it = state.vehicles.find( v );
@@ -495,7 +503,11 @@ std::shared_ptr<const snapshot> capture_snapshot()
 
 void reset_snapshots()
 {
-    state = capture_state();
+    // seq and uids keep counting, so nothing from before the reset is mistaken for something after it.
+    capture_state fresh;
+    fresh.seq = state.seq;
+    fresh.next_uid = state.next_uid;
+    state = std::move( fresh );
 }
 
 void publish_snapshot( std::shared_ptr<const snapshot> s )
@@ -670,7 +682,9 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     }
     const std::pair<const char *, id_kind> session_tables[] = {
         { "itype", id_kind::itype }, { "mtype", id_kind::mtype }, { "vpart", id_kind::vpart },
-        { "weather", id_kind::weather }, { "body_part", id_kind::body_part }, { "move_mode", id_kind::move_mode }
+        { "weather", id_kind::weather }, { "body_part", id_kind::body_part }, { "move_mode", id_kind::move_mode },
+        { "damage_type", id_kind::damage_type }, { "activity", id_kind::activity }, { "sound", id_kind::sound },
+        { "explosion", id_kind::explosion }
     };
     for( const auto &[name, kind] : session_tables ) {
         jo.member( name );

@@ -24,6 +24,7 @@
 #include "calendar.h"
 #include "cata_utility.h"
 #include "character.h"
+#include "fp3d/events.h" // FP3D:
 #include "character_attire.h"
 #include "character_martial_arts.h"
 #include "color.h"
@@ -655,6 +656,10 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
     }
 
     const bool hits = hit_spread >= 0;
+    // FP3D: swing animation for the client
+    if( fp3d::events_enabled() ) {
+        fp3d::on_attack( *this, t, cur_weap.typeId().str(), hits );
+    }
 
     if( monster *m = t.as_monster() ) {
         cata::event e = cata::event::make<event_type::character_melee_attacks_monster>( getID(),

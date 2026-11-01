@@ -19,6 +19,7 @@
 #include "cata_imgui.h"
 #include "catacharset.h"
 #include "character.h"
+#include "fp3d/events.h" // FP3D:
 #include "coordinates.h"
 #include "creature_tracker.h"
 #include "cursesdef.h"
@@ -2120,6 +2121,10 @@ bool monster::melee_attack( Creature &target, float accuracy )
 
     const int monster_hit_roll = melee::melee_hit_range( accuracy );
     int hitspread = target.deal_melee_attack( this, monster_hit_roll );
+    // FP3D: attack animation for the client
+    if( fp3d::events_enabled() ) {
+        fp3d::on_attack( *this, target, "", hitspread >= 0 );
+    }
     if( type->melee_dice == 0 ) {
         // We don't hit, so just return
         return true;
@@ -2985,6 +2990,10 @@ void monster::die( map *here, Creature *nkiller )
     }
     g->set_critter_died();
     dead = true;
+    // FP3D: death animation for the client
+    if( fp3d::events_enabled() ) {
+        fp3d::on_death( *this );
+    }
     set_killer( nkiller );
     if( get_killer() != nullptr ) {
         Character *ch = get_killer()->as_character();

@@ -16,6 +16,8 @@
 
 #include "fp3d/bridge.h"
 
+class Creature;
+
 namespace fp3d
 {
 
@@ -141,7 +143,10 @@ struct snapshot {
 
 // Session id tables for kinds CDDA has no int ids for. Index 0 is "none"; indices are handed out on first use
 // and never change during the session. ter, furn, trap and field use CDDA's own int ids (0 = null).
-enum class id_kind : int { itype, mtype, vpart, weather, body_part, move_mode, count };
+// damage_type, activity, sound ("id/variant") and explosion are used by events (block B4).
+enum class id_kind : int {
+    itype, mtype, vpart, weather, body_part, move_mode, damage_type, activity, sound, explosion, count
+};
 uint32_t intern_id( id_kind kind, const std::string &id );
 std::vector<std::string> id_names( id_kind kind );
 // Name for an index of ter/furn/trap/field ("ter", "furn", "trap", "field"); "" if out of range.
@@ -151,6 +156,9 @@ std::string cdda_id_name( const std::string &table, uint32_t index );
 std::shared_ptr<const snapshot> capture_snapshot();
 // Sim side. Forgets revisions and creature uids (call after loading a different game).
 void reset_snapshots();
+// Sim side. The uid a creature has (or gets) in snapshots, and the seq the next capture will have.
+uint64_t creature_uid( const Creature &c );
+uint64_t next_snapshot_seq();
 // Sim side: makes `s` the newest snapshot. Client side: reads it (nullptr before the first publish).
 void publish_snapshot( std::shared_ptr<const snapshot> s );
 std::shared_ptr<const snapshot> latest_snapshot();

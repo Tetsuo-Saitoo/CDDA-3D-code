@@ -21,6 +21,7 @@
 #include "addiction.h"
 #include "anatomy.h"
 #include "avatar.h"
+#include "fp3d/events.h" // FP3D:
 #include "avatar_action.h"
 #include "bionics.h"
 #include "cached_options.h"
@@ -3727,6 +3728,10 @@ void Character::normalize()
 // Actual player death is mostly handled in game::is_game_over
 void Character::die( map *, Creature *nkiller )
 {
+    // FP3D: death animation for the client
+    if( fp3d::events_enabled() ) {
+        fp3d::on_death( *this );
+    }
     g->set_critter_died();
     set_all_parts_hp_cur( 0 );
     set_killer( nkiller );
@@ -9065,6 +9070,10 @@ void Character::assign_activity( const player_activity &act )
     }
 
     activity.start_or_resume( *this, resuming );
+    // FP3D: activity animation for the client (the activity may have finished at once)
+    if( fp3d::events_enabled() && activity ) {
+        fp3d::on_activity( *this, activity.id().str() );
+    }
 
     if( is_npc() ) {
         cancel_stashed_activity();
