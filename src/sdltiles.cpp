@@ -354,6 +354,11 @@ static void WinCreate()
     } else {
         renderer_name = get_option<std::string>( "RENDERER" );
     }
+    // FP3D: headless: the hidden window never draws, so no GPU device (and no driver threads in the client)
+    if( fp3d::active() ) {
+        software_renderer = true;
+        renderer_name = "software";
+    }
 
     if( renderer_name == "direct3d" ) {
         direct3d_mode = true;
@@ -394,7 +399,7 @@ static void WinCreate()
     }
 
     if( software_renderer ) {
-        if( get_option<bool>( "FRAMEBUFFER_ACCEL" ) ) {
+        if( get_option<bool>( "FRAMEBUFFER_ACCEL" ) && !fp3d::active() ) { // FP3D: no GPU when headless
             SDL_SetHint( SDL_HINT_FRAMEBUFFER_ACCELERATION, "1" );
         }
         renderer.reset( SDL_CreateRenderer( ::window.get(), -1,

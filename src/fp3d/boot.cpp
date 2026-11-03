@@ -5,9 +5,11 @@
 #include <stdexcept>
 
 #include "avatar.h"
+#include "cached_options.h"
 #include "calendar.h"
 #include "color.h"
 #include "cursesdef.h"
+#include "debug.h"
 #include "filesystem.h"
 #include "fp3d/id_tables.h"
 #include "game.h"
@@ -22,18 +24,34 @@
 #include "weather.h"
 #include "worldfactory.h"
 
+#if defined(TILES)
+#include "sdl_wrappers.h"
+#endif
+
 namespace fp3d
 {
 
-void boot_world( const std::string &world_name, bool headless )
+static bool paths_set = false;
+
+void init_paths( const std::string &base_path, const std::string &user_dir )
 {
-    PATH_INFO::init_base_path( "" );
-    PATH_INFO::init_user_dir( "./fp3d_user" );
+    PATH_INFO::init_base_path( base_path );
+    PATH_INFO::init_user_dir( user_dir );
     PATH_INFO::set_standard_filenames();
-    for( const std::string &dir : { PATH_INFO::config_dir(), PATH_INFO::savedir(), PATH_INFO::templatedir() } ) {
+    for( const std::string &dir : { PATH_INFO::user_dir(), PATH_INFO::config_dir(), PATH_INFO::savedir(),
+                                    PATH_INFO::templatedir()
+                                  } ) {
         if( !assure_dir_exist( dir ) ) {
             throw std::runtime_error( "cannot create " + dir );
         }
+    }
+    paths_set = true;
+}
+
+void boot_world( const std::string &world_name, bool headless )
+{
+    if( !paths_set ) {
+        init_paths( "", "./fp3d_user" );
     }
     if( headless ) {
         // Game code calls the tile renderer directly, so create CDDA's window as usual (with the bridge
@@ -78,6 +96,17 @@ void boot_world( const std::string &world_name, bool headless )
     get_avatar() = avatar();
     get_avatar().create( character_type::NOW );
     get_map() = map();
+}
+
+void shutdown_world()
+{
+    test_mode = true;
+    deinitDebug();
+    g.reset();
+    catacurses::endwin();
+#if defined(TILES)
+    SDL_Quit();
+#endif
 }
 
 tripoint_abs_sm load_bubble_in_town()

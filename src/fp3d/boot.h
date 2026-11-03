@@ -8,12 +8,23 @@
 
 namespace fp3d
 {
-// Loads game data and creates a fresh world `world_name` (replacing one of that name) under ./fp3d_user,
+// Sets CDDA's data directory (`base_path`, "" = the current directory) and user directory (config, saves,
+// debug.log) and creates the user subfolders. boot_world() calls it with "" and "./fp3d_user" unless it
+// already ran. Throws std::runtime_error on failure.
+void init_paths( const std::string &base_path, const std::string &user_dir );
+
+// Loads game data and creates a fresh world `world_name` (replacing one of that name) under the user directory,
 // with a random avatar. Follow with g->start_game() to play, or load_bubble_in_town() to just look.
 // Run it on the thread that will own the game. Throws std::runtime_error on failure.
 // `headless` also turns off options that make input poll on a timer (animations) and creates CDDA's window,
 // which stays hidden as long as the bridge is active: call fp3d::set_active( true ) first.
 void boot_world( const std::string &world_name, bool headless );
+
+// CDDA's own exit path (exit_handler in main.cpp) plus SDL_Quit, on the thread that ran boot_world. Call it before
+// the process or DLL exits after a headless boot: CDDA's atexit( SDL_Quit ) otherwise runs before its static tile
+// caches free their textures (a crash), and inside DllMain it deadlocks on SDL's timer thread. Debug messages
+// afterwards only go to the log.
+void shutdown_world();
 
 // Loads the reality bubble centred on the nearest city and puts the avatar in its middle.
 // Returns the bubble origin (absolute submap).

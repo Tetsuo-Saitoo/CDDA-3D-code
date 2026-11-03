@@ -4,6 +4,8 @@
 #include <bitset>
 #include <mutex>
 #include <ostream>
+#include <string>
+#include <unordered_map>
 #include <utility>
 
 #include "bodypart.h"
@@ -44,9 +46,24 @@ std::string symbol_text( int sym )
     return utf32_to_utf8( static_cast<uint32_t>( sym ) );
 }
 
+// nc_color value -> CDDA colour name. color_manager::get_name() raises a debug message for colours it can't
+// invert (a popup outside tests), so the tables use this map and send "" for those.
+std::unordered_map<int, std::string> color_names;
+
+void fill_color_names()
+{
+    color_names.clear();
+    const color_manager &cm = get_all_colors();
+    for( int i = 0; i < static_cast<int>( num_colors ); i++ ) {
+        const color_id id = static_cast<color_id>( i );
+        color_names.emplace( cm.get( id ).to_int(), cm.id_to_name( id ) );
+    }
+}
+
 std::string color_name( const nc_color &c )
 {
-    return get_all_colors().get_name( c );
+    const auto it = color_names.find( c.to_int() );
+    return it == color_names.end() ? "" : it->second;
 }
 
 std::vector<std::string> group_names( const std::bitset<NUM_TERCONN> &bits, const std::vector<std::string> &names )
@@ -134,6 +151,7 @@ void build_id_tables()
     // Old indices die here, and with them anything the snapshot state still holds.
     reset_id_names();
     reset_snapshots();
+    fill_color_names();
 
     std::vector<std::string> ids;
     for( const itype *t : item_controller->all() ) {

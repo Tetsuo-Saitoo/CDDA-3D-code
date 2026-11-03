@@ -183,6 +183,7 @@ void sim_main()
         sim_error = e.what();
     }
     fp3d::shutdown();
+    fp3d::shutdown_world();
 }
 
 #if defined(_WIN32)

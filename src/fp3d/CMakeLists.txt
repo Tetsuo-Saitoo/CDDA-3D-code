@@ -30,3 +30,9 @@ target_compile_definitions(fp3d-events-test PUBLIC SDL_MAIN_HANDLED)
 add_executable(fp3d-ids-test ids_test.cpp ${MESSAGES_CPP})
 target_link_libraries(fp3d-ids-test PRIVATE cataclysm-tiles-common)
 target_compile_definitions(fp3d-ids-test PUBLIC SDL_MAIN_HANDLED)
+
+# The Godot GDExtension (repo root bridge/), built when it and bridge/godot-cpp are there. See docs/BUILD.md.
+set(FP3D_BRIDGE_DIR "${CMAKE_SOURCE_DIR}/../bridge" CACHE PATH "Folder of the Godot bridge (GDExtension)")
+if(EXISTS "${FP3D_BRIDGE_DIR}/CMakeLists.txt" AND EXISTS "${FP3D_BRIDGE_DIR}/godot-cpp/CMakeLists.txt")
+    add_subdirectory("${FP3D_BRIDGE_DIR}" "${CMAKE_BINARY_DIR}/fp3d-bridge")
+endif()
