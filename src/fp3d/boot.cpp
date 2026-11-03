@@ -9,6 +9,7 @@
 #include "color.h"
 #include "cursesdef.h"
 #include "filesystem.h"
+#include "fp3d/id_tables.h"
 #include "game.h"
 #include "game_constants.h"
 #include "map.h"
@@ -72,6 +73,7 @@ void boot_world( const std::string &world_name, bool headless )
 
     g->load_core_data();
     g->load_world_modfiles();
+    build_id_tables();
 
     get_avatar() = avatar();
     get_avatar().create( character_type::NOW );

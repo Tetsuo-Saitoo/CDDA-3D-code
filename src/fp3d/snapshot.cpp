@@ -16,6 +16,7 @@
 #include "coordinates.h"
 #include "creature.h"
 #include "field.h"
+#include "fp3d/id_tables.h"
 #include "fp3d/points.h"
 #include "game.h"
 #include "item.h"
@@ -54,7 +55,7 @@ struct id_table {
     std::unordered_map<std::string, uint32_t> index;
 };
 std::mutex ids_mutex;
-std::array<id_table, static_cast<size_t>( id_kind::count )> id_tables;
+std::array<id_table, static_cast<size_t>( id_kind::count )> session_tables;
 
 // ---- capture state (sim thread only) ----
 using sm_key = std::tuple<int, int, int>;
@@ -414,7 +415,7 @@ uint32_t intern_id( id_kind kind, const std::string &id )
         return 0;
     }
     std::lock_guard<std::mutex> lk( ids_mutex );
-    id_table &t = id_tables[static_cast<size_t>( kind )];
+    id_table &t = session_tables[static_cast<size_t>( kind )];
     const auto it = t.index.find( id );
     if( it != t.index.end() ) {
         return it->second;
@@ -428,7 +429,15 @@ uint32_t intern_id( id_kind kind, const std::string &id )
 std::vector<std::string> id_names( id_kind kind )
 {
     std::lock_guard<std::mutex> lk( ids_mutex );
-    return id_tables[static_cast<size_t>( kind )].names;
+    return session_tables[static_cast<size_t>( kind )].names;
+}
+
+void reset_id_names()
+{
+    std::lock_guard<std::mutex> lk( ids_mutex );
+    for( id_table &t : session_tables ) {
+        t = id_table();
+    }
 }
 
 std::string cdda_id_name( const std::string &table, uint32_t index )
@@ -456,6 +465,9 @@ std::shared_ptr<const snapshot> capture_snapshot()
     auto s = std::make_shared<snapshot>();
     s->turn = to_turns<int64_t>( calendar::turn - calendar::turn_zero );
     s->seq = ++state.seq;
+    if( const std::shared_ptr<const id_tables> tables = latest_id_tables() ) {
+        s->ids_generation = tables->generation;
+    }
     const tripoint_abs_sm origin = here.get_abs_sub();
     s->bubble_origin = ui_point{ origin.x(), origin.y(), 0 };
     capture_player( u, s->player );
@@ -666,7 +678,9 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     }
     jo.end_array();
 
-    // Names of the ids used above: {"ter": {"12": "t_floor", ...}, ...}; session tables in full.
+    // Names of the CDDA ids used above: {"ter": {"12": "t_floor", ...}, ...}. The session tables and all
+    // definitions are in the id tables file (write_id_tables_json) of the same generation.
+    jo.member( "ids_generation", static_cast<int64_t>( s.ids_generation ) );
     jo.member( "ids" );
     jo.start_object();
     const std::pair<const char *, const std::set<uint32_t> *> cdda_tables[] = {
@@ -679,20 +693,6 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
             jo.member( std::to_string( i ), cdda_id_name( name, i ) );
         }
         jo.end_object();
-    }
-    const std::pair<const char *, id_kind> session_tables[] = {
-        { "itype", id_kind::itype }, { "mtype", id_kind::mtype }, { "vpart", id_kind::vpart },
-        { "weather", id_kind::weather }, { "body_part", id_kind::body_part }, { "move_mode", id_kind::move_mode },
-        { "damage_type", id_kind::damage_type }, { "activity", id_kind::activity }, { "sound", id_kind::sound },
-        { "explosion", id_kind::explosion }
-    };
-    for( const auto &[name, kind] : session_tables ) {
-        jo.member( name );
-        jo.start_array();
-        for( const std::string &n : id_names( kind ) ) {
-            jo.write( n );
-        }
-        jo.end_array();
     }
     jo.end_object();
     jo.end_object();

@@ -133,6 +133,7 @@ struct snapshot {
     uint32_t contract_version = fp3d::contract_version;
     int64_t turn = 0;
     uint64_t seq = 0;
+    uint32_t ids_generation = 0;                  // the id tables (block B6) these indices belong to
     ui_point bubble_origin;                       // absolute submap of bubble (0,0); z = 0
     player_view player;
     std::vector<std::shared_ptr<const submap_view>> submaps;  // 11 * 11 * 21
@@ -149,6 +150,8 @@ enum class id_kind : int {
 };
 uint32_t intern_id( id_kind kind, const std::string &id );
 std::vector<std::string> id_names( id_kind kind );
+// Empties every session table (block B6 refills them; see id_tables.h).
+void reset_id_names();
 // Name for an index of ter/furn/trap/field ("ter", "furn", "trap", "field"); "" if out of range.
 std::string cdda_id_name( const std::string &table, uint32_t index );
 

@@ -298,6 +298,21 @@ connect_group get_connect_group( const std::string &name )
     return ter_connects_map[name];
 }
 
+// FP3D: connect group names by index (the bit in connect_groups), for the client's id tables (block B6)
+std::vector<std::string> fp3d_connect_group_names()
+{
+    std::vector<std::string> names;
+    for( const auto &[name, group] : ter_connects_map ) {
+        if( group.index >= 0 && group.index < NUM_TERCONN ) {
+            if( names.size() <= static_cast<size_t>( group.index ) ) {
+                names.resize( group.index + 1 );
+            }
+            names[group.index] = name;
+        }
+    }
+    return names;
+}
+
 void connect_group::load( const JsonObject &jo )
 {
 

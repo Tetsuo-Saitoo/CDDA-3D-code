@@ -1,8 +1,9 @@
 // FP3D block B1: headless smoke test.
 // Boots CDDA with no window, generates a world, loads the reality bubble around the nearest city and dumps
 // a snapshot (block B3 format, contracts/snapshot.md) of a few z-levels as JSON: the contracts/mock data.
+// With a fourth argument it also writes the id tables (block B6, contracts/id_tables.md) the snapshot uses.
 //
-// usage: fp3d-headless [out.json] [z_below] [z_above]
+// usage: fp3d-headless [out.json] [z_below] [z_above] [ids.json]
 #include <algorithm>
 #include <cstdio>
 #include <cstdlib>
@@ -20,6 +21,7 @@
 #include "coordinates.h"
 #include "debug.h"
 #include "fp3d/boot.h"
+#include "fp3d/id_tables.h"
 #include "fp3d/snapshot.h"
 #include "game.h"
 #include "json.h"
@@ -69,6 +71,23 @@ static void dump_bubble( const std::string &path, int z_below, int z_above )
     }
 }
 
+static void dump_id_tables( const std::string &path )
+{
+    const std::shared_ptr<const fp3d::id_tables> tables = fp3d::latest_id_tables();
+    if( !tables ) {
+        throw std::runtime_error( "no id tables" );
+    }
+    std::ofstream out( path, std::ios::binary );
+    fp3d::write_id_tables_json( out, *tables );
+    out.close();
+    if( !out ) {
+        throw std::runtime_error( "write failed: " + path );
+    }
+    std::printf( "wrote %s: %zu ter, %zu furn, %zu items, %zu monsters, %zu vehicle parts (generation %u)\n",
+                 path.c_str(), tables->ter.size(), tables->furn.size(), tables->items.size(),
+                 tables->monsters.size(), tables->vparts.size(), tables->generation );
+}
+
 int main( int argc, char *argv[] )
 {
     const std::string out_path = argc > 1 ? argv[1] : "fp3d_bubble.json";
@@ -85,6 +104,9 @@ int main( int argc, char *argv[] )
         calendar::turn = calendar::turn_zero + 12_hours;
         fp3d::load_bubble_in_town();
         dump_bubble( out_path, z_below, z_above );
+        if( argc > 4 ) {
+            dump_id_tables( argv[4] );
+        }
     } catch( const std::exception &e ) {
         std::fprintf( stderr, "fp3d-headless failed: %s\n", e.what() );
         return EXIT_FAILURE;
