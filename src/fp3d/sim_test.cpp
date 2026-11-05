@@ -45,6 +45,7 @@
 namespace
 {
 const itype_id itype_apple( "apple" );
+const itype_id itype_backpack( "backpack" );
 const itype_id itype_rock( "rock" );
 const mtype_id mon_zombie( "mon_zombie" );
 const ter_str_id ter_t_door_c( "t_door_c" );
@@ -119,9 +120,12 @@ observed snapshot()
     return last_observed;
 }
 
-// A 9x9 floor around the avatar, a closed door to the east, an apple underfoot, a rock carried,
-// no monsters or NPCs (some starts put one next to you). The avatar sees in the dark: starts can be
-// unlit rooms, and the auto-pause check needs the zombie seen.
+// A 9x9 floor around the avatar, a closed door to the east, an apple underfoot, a rock carried in a
+// worn backpack, empty hands, no monsters or NPCs (some starts put one next to you). The avatar sees in
+// the dark: starts can be unlit rooms, and the auto-pause check needs the zombie seen. Backpack and
+// empty hands because the random start differs between standard libraries (same seed, other
+// distributions): some starts have no pockets, and in test_mode CDDA won't put away a wielded item
+// (dispose_item), so throwing the rock would fail.
 void build_scene()
 {
     map &here = get_map();
@@ -143,6 +147,8 @@ void build_scene()
     }
     here.ter_set( p + tripoint_rel_ms( 1, 0, 0 ), ter_t_door_c );
     here.add_item( p, item( itype_apple ) );
+    u.remove_weapon();
+    u.wear_item( item( itype_backpack ), false );
     u.i_add( item( itype_rock ) );
     u.set_mutation( trait_DEBUG_NIGHTVISION );
     g->clear_zombies();
@@ -411,7 +417,7 @@ void print_request( const fp3d::ui_request &req, const std::string &note )
 } // namespace
 
 // Block B5: actions queued instead of answered. Starts with the main loop waiting on a timed request.
-bool run_queue_checks()
+static bool run_queue_checks()
 {
     int failed = 0;
     const auto check = [&]( bool ok, const char *what, const std::string &detail ) {

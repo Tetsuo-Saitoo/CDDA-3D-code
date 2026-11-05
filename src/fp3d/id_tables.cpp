@@ -26,9 +26,6 @@
 #include "veh_type.h"
 #include "weather_type.h"
 
-// FP3D: defined in mapdata.cpp, where CDDA keeps its connect groups. Index = bit in connect_groups.
-std::vector<std::string> fp3d_connect_group_names();
-
 namespace fp3d
 {
 namespace

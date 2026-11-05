@@ -213,6 +213,14 @@ static void InitSDL()
     }
 #endif
 
+#if !defined(_WIN32)
+    // FP3D: headless outside Windows: CDDA's hidden window lives in SDL's offscreen driver, so the game
+    // thread never talks to the display server (Godot owns it; CI has none). SDL_VIDEODRIVER set by hand wins.
+    if( fp3d::active() ) {
+        setenv( "SDL_VIDEODRIVER", "offscreen", 0 );
+    }
+#endif
+
     ret = SDL_Init( init_flags );
     throwErrorIf( ret != 0, "SDL_Init failed" );
 
