@@ -1,5 +1,6 @@
 #include "fp3d/boot.h"
 
+#include <algorithm>
 #include <cstdio>
 #include <memory>
 #include <stdexcept>
@@ -11,6 +12,7 @@
 #include "cursesdef.h"
 #include "debug.h"
 #include "filesystem.h"
+#include "fp3d/game_access.h"
 #include "fp3d/id_tables.h"
 #include "game.h"
 #include "game_constants.h"
@@ -48,7 +50,10 @@ void init_paths( const std::string &base_path, const std::string &user_dir )
     paths_set = true;
 }
 
-void boot_world( const std::string &world_name, bool headless )
+namespace
+{
+// Options (headless: CDDA's hidden window first), colours, the game object and its static data.
+void boot_common( bool headless )
 {
     if( !paths_set ) {
         init_paths( "", "./fp3d_user" );
@@ -78,6 +83,12 @@ void boot_world( const std::string &world_name, bool headless )
 
     world_generator->set_active_world( nullptr );
     world_generator->init();
+}
+} // namespace
+
+void boot_world( const std::string &world_name, bool headless )
+{
+    boot_common( headless );
     if( world_generator->has_world( world_name ) ) {
         world_generator->delete_world( world_name, true );
     }
@@ -96,6 +107,28 @@ void boot_world( const std::string &world_name, bool headless )
     get_avatar() = avatar();
     get_avatar().create( character_type::NOW );
     get_map() = map();
+}
+
+void boot_saved_game( const std::string &world_name, const std::string &save_name, bool headless )
+{
+    boot_common( headless );
+    // world_generator->init() found the worlds and their saves; ask for nothing it didn't find.
+    if( !world_generator->has_world( world_name ) ) {
+        throw std::runtime_error( "no world " + world_name );
+    }
+    WORLD *world = world_generator->get_world( world_name );
+    const save_t save = save_t::from_save_id( save_name );
+    if( world == nullptr ||
+        std::find( world->world_saves.begin(), world->world_saves.end(), save ) == world->world_saves.end() ) {
+        throw std::runtime_error( "no save " + save_name + " in world " + world_name );
+    }
+    // As main_menu::load_game: setup() loads the core data, the world's mods and resets the game state.
+    world_generator->set_active_world( world );
+    g->setup();
+    build_id_tables();
+    if( !fp3d_game_access::load_game( *g, save ) ) {
+        throw std::runtime_error( "cannot load " + save_name + " from world " + world_name );
+    }
 }
 
 void shutdown_world()

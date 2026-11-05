@@ -20,6 +20,12 @@ void init_paths( const std::string &base_path, const std::string &user_dir );
 // which stays hidden as long as the bridge is active: call fp3d::set_active( true ) first.
 void boot_world( const std::string &world_name, bool headless );
 
+// Loads game data and the saved character `save_name` (its save id, i.e. the character name) from the existing
+// world `world_name` under the user directory, the way CDDA's main menu loads a game (g->setup(), then
+// game::load). Deletes nothing. Follow with do_turn() to play. Run it on the thread that will own the game.
+// Throws std::runtime_error if the world or the save doesn't exist or the load fails. `headless` as above.
+void boot_saved_game( const std::string &world_name, const std::string &save_name, bool headless );
+
 // CDDA's own exit path (exit_handler in main.cpp) plus SDL_Quit, on the thread that ran boot_world. Call it before
 // the process or DLL exits after a headless boot: CDDA's atexit( SDL_Quit ) otherwise runs before its static tile
 // caches free their textures (a crash), and inside DllMain it deadlocks on SDL's timer thread. Debug messages
