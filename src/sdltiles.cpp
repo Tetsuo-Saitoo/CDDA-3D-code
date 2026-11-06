@@ -3937,7 +3937,9 @@ void input_manager::set_timeout( const int delay )
 
 void input_manager::pump_events()
 {
-    if( test_mode ) {
+    // FP3D: headless: input comes from the client, and pumping the hidden window's messages on the game
+    // thread stalled the boot when the client ran in VR
+    if( test_mode || fp3d::active() ) {
         return;
     }
 
