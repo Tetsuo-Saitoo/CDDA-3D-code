@@ -11,6 +11,7 @@
 
 #include "action.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/hands.h" // FP3D:
 #include "activity_actor_definitions.h"
 #include "advanced_inv.h"
 #include "auto_note.h"
@@ -274,6 +275,10 @@ input_context game::get_player_input( std::string &action )
         ctxt.register_action( "QUIT", to_translation( "Accept your fate" ) );
     } else {
         ctxt = get_default_mode_input_context();
+        // FP3D: hand attacks from first person / VR (fp3d/hands.h)
+        if( fp3d::active() ) {
+            fp3d::register_hand_actions( ctxt );
+        }
     }
 
     here.update_visibility_cache( pos.z() );
@@ -3128,6 +3133,11 @@ bool game::handle_action()
     } else {
         // No auto-move, ask player for input
         ctxt = get_player_input( action );
+    }
+
+    // FP3D: hand attacks from first person / VR (fp3d/hands.h)
+    if( fp3d::active() && fp3d::is_hand_action( action ) ) {
+        return fp3d::hand_attack( player_character, action ) && !player_character.is_dead_state();
     }
 
     // Remove asynchronous animations if any action taken before the input timeout

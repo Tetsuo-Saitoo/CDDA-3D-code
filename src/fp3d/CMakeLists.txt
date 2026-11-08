@@ -4,7 +4,8 @@ target_sources(cataclysm-tiles-common PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/boot.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/snapshot.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/events.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/id_tables.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/id_tables.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/hands.cpp)
 
 # Block B1: headless smoke test. Links the same object library as the game, opens no window.
 add_executable(fp3d-headless headless_smoke.cpp ${MESSAGES_CPP})

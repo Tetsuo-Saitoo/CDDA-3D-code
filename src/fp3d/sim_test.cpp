@@ -48,6 +48,7 @@ const itype_id itype_apple( "apple" );
 const itype_id itype_backpack( "backpack" );
 const itype_id itype_rock( "rock" );
 const mtype_id mon_zombie( "mon_zombie" );
+const itype_id itype_2h_flail_steel( "2h_flail_steel" );
 const ter_str_id ter_t_door_c( "t_door_c" );
 const ter_str_id ter_t_floor( "t_floor" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
@@ -71,6 +72,9 @@ observed last_observed;
 std::string sim_error;
 std::atomic<int> loads{ 0 };
 std::atomic<bool> spawn_zombie{ false };
+// Hand checks: 1 = a zombie to the west and a rock in hand, 2 = a two-handed flail in hand. Done on the sim
+// thread right before its next request.
+std::atomic<int> hand_setup{ 0 };
 
 void observe()
 {
@@ -81,6 +85,18 @@ void observe()
     if( spawn_zombie.exchange( false ) &&
         g->place_critter_at( mon_zombie, p + tripoint_rel_ms( -4, -4, 0 ) ) != nullptr ) {
         zombies_placed++;
+    }
+    switch( hand_setup.exchange( 0 ) ) {
+        case 1:
+            g->clear_zombies();
+            g->place_critter_at( mon_zombie, p + tripoint_rel_ms( -1, 0, 0 ) );
+            get_avatar().set_wielded_item( item( itype_rock ) );
+            break;
+        case 2:
+            get_avatar().set_wielded_item( item( itype_2h_flail_steel ) );
+            break;
+        default:
+            break;
     }
     observed o;
     o.zombies_placed = zombies_placed;
@@ -417,6 +433,60 @@ void print_request( const fp3d::ui_request &req, const std::string &note )
 } // namespace
 
 // Block B5: actions queued instead of answered. Starts with the main loop waiting on a timed request.
+// Hand attacks (fp3d/hands.h): the off hand strikes unarmed even with a weapon wielded, the main hand uses
+// the weapon, nobody there or a two-handed weapon means no attack, and a made-up hand is refused.
+static bool run_hand_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  hands: %-36s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    // Queues one action, waits for the main loop again, returns the events in between.
+    const auto act = [&]( const std::string &a, std::vector<fp3d::event> &evs ) {
+        evs.clear();
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            return false;
+        }
+        fp3d::drain_events( evs );
+        evs.clear();
+        fp3d::queue_action( a );
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 20000, r0->id );
+        fp3d::drain_events( evs );
+        return r1 && r1->timed;
+    };
+    const auto player_attacks = []( const std::vector<fp3d::event> &evs, bool unarmed ) {
+        int n = 0;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::attack && e.uid == 1 && ( e.type == 0 ) == unarmed ) {
+                n++;
+            }
+        }
+        return n;
+    };
+    const auto told = []( const std::vector<fp3d::event> &evs, const std::string &text ) {
+        return std::any_of( evs.begin(), evs.end(), [&text]( const fp3d::event & e ) {
+            return e.kind == fp3d::event_kind::message && e.text.find( text ) != std::string::npos;
+        } );
+    };
+    std::vector<fp3d::event> evs;
+    hand_setup = 1;
+    check( act( "pause", evs ), "scene: zombie west, rock in hand", "" );
+    check( act( "fp3d_attack_off_LEFT", evs ) && player_attacks( evs, true ) == 1 &&
+           player_attacks( evs, false ) == 0, "off hand strikes unarmed", "" );
+    check( act( "fp3d_attack_main_LEFT", evs ) && player_attacks( evs, false ) == 1 &&
+           player_attacks( evs, true ) == 0, "main hand uses the rock", "" );
+    check( act( "fp3d_attack_off_UP", evs ) && player_attacks( evs, true ) + player_attacks( evs, false ) == 0 &&
+           told( evs, "Nothing there to hit" ), "nobody there: no attack", "" );
+    hand_setup = 2;
+    act( "pause", evs );
+    check( act( "fp3d_attack_off_LEFT", evs ) && player_attacks( evs, true ) + player_attacks( evs, false ) == 0 &&
+           told( evs, "Both your hands" ), "two-handed weapon: no off hand", "" );
+    check( act( "fp3d_attack_foot_LEFT", evs ) && told( evs, "Can't do that here" ), "made-up hand refused", "" );
+    return failed == 0;
+}
+
 static bool run_queue_checks()
 {
     int failed = 0;
@@ -568,6 +638,7 @@ int main()
     }
     drain();
     const bool queue_ok = g_idx == n_goals && run_queue_checks();
+    const bool hands_ok = queue_ok && run_hand_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -597,5 +668,6 @@ int main()
                  count( event_kind::message ), count( event_kind::sound ), count( event_kind::projectile ),
                  count( event_kind::anim ), count( event_kind::attack ), events_dropped );
     std::printf( "queue: %s\n", queue_ok ? "ok" : "BAD" );
-    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    std::printf( "hands: %s\n", hands_ok ? "ok" : "BAD" );
+    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && hands_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
