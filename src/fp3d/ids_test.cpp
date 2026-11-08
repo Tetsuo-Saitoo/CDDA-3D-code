@@ -82,6 +82,11 @@ int main()
                zombie < t->monsters.size() && t->monsters[zombie].hp > 0 && t->monsters[zombie].speed > 0 &&
                t->vparts.size() > 100 && !t->vparts[1].id.empty(), "apple, mon_zombie, vehicle parts defined" );
 
+        const uint32_t zdog = fp3d::intern_id( fp3d::id_kind::mtype, "mon_dog_zombie_cop" );
+        check( t->monsters[zombie].bodytype == "human" && zdog < t->monsters.size() &&
+               t->monsters[zdog].bodytype == "dog", "monster body types (zombie human, zombie dog dog)",
+               zdog < t->monsters.size() ? t->monsters[zdog].bodytype : "no mon_dog_zombie_cop" );
+
         // A rebuild (another world load) keeps the indices for the same data, with a new generation.
         fp3d::build_id_tables();
         const std::shared_ptr<const fp3d::id_tables> t2 = fp3d::latest_id_tables();

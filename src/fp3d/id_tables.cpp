@@ -260,6 +260,7 @@ void build_id_tables()
         for( const species_id &s : m.species ) {
             d.species.push_back( s.str() );
         }
+        d.bodytype = m.bodytype;
     }
     const std::vector<std::string> vp_names = id_names( id_kind::vpart );
     t->vparts.resize( vp_names.size() );
@@ -349,6 +350,7 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         jo.member( "volume_ml", d.volume_ml );
         jo.member( "weight_g", d.weight_g );
         write_strings( jo, "species", d.species );
+        jo.member( "bodytype", d.bodytype );
         jo.end_object();
     }
     jo.end_array();

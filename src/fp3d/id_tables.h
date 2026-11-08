@@ -67,12 +67,13 @@ struct monster_def {
     std::string symbol;
     std::string color;
     std::string looks_like;
-    int size = 0;                  // 0 tiny .. 4 huge
+    int size = 0;                  // creature_size: 1 tiny .. 5 huge
     int hp = 0;
     int speed = 0;                 // 100 = human
     int volume_ml = 0;
     int weight_g = 0;
     std::vector<std::string> species;
+    std::string bodytype;          // CDDA's body type: human, dog, insect, snake, bird, blob, ...; may be empty
 };
 
 struct vpart_def {
