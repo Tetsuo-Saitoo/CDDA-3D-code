@@ -4,13 +4,18 @@
 
 // FP3D: what the hands hold, and context actions that use it (client actions, only while the bridge is active).
 // CDDA has one hand slot (the wielded item). The off hand (left) holds one carried item: it is marked with an
-// item var, so it stays in its pocket for CDDA's rules (weight, volume) and saves keep it. The off hand is empty
-// while the wielded item needs both hands or the left arm is broken.
-//   fp3d_hold_off        pick a carried item to hold in the off hand (an item_select prompt)
+// item var holding a token the avatar keeps too, so it stays in its pocket for CDDA's rules (weight, volume),
+// saves keep it, and once it leaves the avatar (dropped, wielded, traded) it isn't held again on return. The off
+// hand is empty while the wielded item needs both hands or the left arm is broken; an off-hand strike (hands.h)
+// hits with the held item.
+//   fp3d_hold_off        pick a carried one-handed item to hold in the off hand (an item_select prompt; a
+//                        message, not CDDA's popup, when nothing fits)
 //   fp3d_stow_off        put it away
-//   fp3d_use_<DIR>       use what the hands hold on the square in direction DIR (as hands.h): a hose in one hand
-//                        and a container in the other siphon a vehicle's tank there straight into that
-//                        container; anything else examines the square (CDDA's examine).
+//   fp3d_use_<DIR>       use what the hands hold on the square in direction DIR (as hands.h), first that fits:
+//                        a hose + a container in the other hand + a vehicle: siphon its tank into the container;
+//                        a held container with liquid + a vehicle with a tank that takes it: pour it in (refuel);
+//                        a held container + liquid there (river, lake, keg, barrel, puddle): fill it;
+//                        else CDDA's examine of the square. No menus unless CDDA must ask (which tank).
 // A liquid fill runs one turn per second of wall time (watched_activity), so the client can show it filling.
 
 #include <cstdint>

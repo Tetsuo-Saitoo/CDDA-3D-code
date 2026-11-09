@@ -2,12 +2,15 @@
 
 #include <algorithm>
 #include <array>
+#include <optional>
+#include <utility>
 
 #include "avatar.h"
 #include "bodypart.h"
 #include "coordinates.h"
 #include "creature.h"
 #include "creature_tracker.h"
+#include "fp3d/held.h"
 #include "input_context.h"
 #include "item.h"
 #include "item_location.h"
@@ -34,14 +37,19 @@ constexpr std::array<dir_step, 8> dirs = { {
 };
 
 bool offhand_active = false;
+// What the off hand strikes with during an off-hand strike (fp3d/held.h; empty = unarmed). Optional so no
+// item_location is built during static initialisation.
+std::optional<item_location> offhand_weapon_loc;
 
 // Set for the length of one off-hand strike, also when the attack throws.
 struct offhand_guard {
-    offhand_guard() {
+    explicit offhand_guard( item_location weapon ) {
         offhand_active = true;
+        offhand_weapon_loc = std::move( weapon );
     }
     ~offhand_guard() {
         offhand_active = false;
+        offhand_weapon_loc.reset();
     }
     offhand_guard( const offhand_guard & ) = delete;
     offhand_guard &operator=( const offhand_guard & ) = delete;
@@ -118,13 +126,18 @@ bool hand_attack( avatar &u, const std::string &action )
         u.add_msg_if_player( m_bad, _( "Your left arm is broken." ) );
         return false;
     }
-    const offhand_guard guard;
+    const offhand_guard guard( offhand_item( u ) );
     return u.melee_attack( *c, true );
 }
 
 bool offhand_strike()
 {
     return offhand_active;
+}
+
+item_location offhand_weapon()
+{
+    return offhand_active && offhand_weapon_loc ? *offhand_weapon_loc : item_location();
 }
 
 std::vector<std::string> hand_dir_names()

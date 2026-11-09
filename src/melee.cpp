@@ -194,9 +194,9 @@ static std::string melee_message( const ma_technique &tec, Character &p,
 
 item_location Character::used_weapon() const
 {
-    // FP3D: an off-hand strike fights unarmed (fp3d/hands.h)
+    // FP3D: an off-hand strike fights with what the off hand holds, else unarmed (fp3d/hands.h)
     if( fp3d::offhand_strike() && is_avatar() ) {
-        return item_location();
+        return fp3d::offhand_weapon();
     }
     return martial_arts_data->selected_force_unarmed() ? item_location() : get_wielded_item();
 }
