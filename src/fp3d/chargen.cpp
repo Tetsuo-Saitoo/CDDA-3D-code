@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
+#include <filesystem>
 #include <map>
 #include <set>
 #include <sstream>
@@ -15,6 +17,7 @@
 #include "json_loader.h"
 #include "mutation.h"
 #include "options.h"
+#include "path_info.h"
 #include "player_difficulty.h"
 #include "profession.h"
 #include "scenario.h"
@@ -155,6 +158,29 @@ void reset_to_scenario( avatar &u, const scenario &scen, const profession &prof 
     u.add_traits();
 }
 
+constexpr size_t max_templates = 256;
+
+// A template name the client may save under: 1-64 of letters, digits, space, _ - and not starting with a
+// space or dot, so it stays one plain file in the templates folder.
+bool template_name_ok( const std::string &n )
+{
+    if( n.empty() || n.size() > max_name_bytes || n.front() == ' ' || n.back() == ' ' ) {
+        return false;
+    }
+    for( const char ch : n ) {
+        const unsigned char u = static_cast<unsigned char>( ch );
+        if( !( std::isalnum( u ) || ch == ' ' || ch == '_' || ch == '-' ) ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+pool_type chosen_pool()
+{
+    return multi_pool() ? pool_type::MULTI_POOL : pool_type::FREEFORM;
+}
+
 std::string checked_name( const std::string &raw )
 {
     std::string name = sanitize_text( raw, max_name_bytes );
@@ -169,6 +195,33 @@ std::string checked_name( const std::string &raw )
     return name.substr( start );
 }
 } // namespace
+
+std::vector<std::string> list_templates()
+{
+    namespace fs = std::filesystem;
+    std::vector<std::string> out;
+    std::error_code ec;
+    const fs::path dir = fs::u8path( PATH_INFO::templatedir() );
+    fs::directory_iterator it( dir, ec );
+    size_t seen = 0;
+    for( ; !ec && it != fs::directory_iterator() && seen < 4096; it.increment( ec ), ++seen ) {
+        std::error_code ec2;
+        if( it->symlink_status( ec2 ).type() != fs::file_type::regular || ec2 ) {
+            continue;
+        }
+        const std::string file = it->path().filename().u8string();
+        const std::string ext = ".template";
+        if( file.size() <= ext.size() || file.compare( file.size() - ext.size(), ext.size(), ext ) != 0 ) {
+            continue;
+        }
+        const std::string name = file.substr( 0, file.size() - ext.size() );
+        if( template_name_ok( name ) && out.size() < max_templates ) {
+            out.push_back( name );
+        }
+    }
+    std::sort( out.begin(), out.end() );
+    return out;
+}
 
 std::string chargen_catalog_json()
 {
@@ -200,6 +253,7 @@ std::string chargen_catalog_json()
 
     // Default selection: the generic scenario and its cheapest profession, as CDDA's own screen starts.
     jo.member( "default_scenario", scenario::generic()->ident().str() );
+    write_strings( jo, "templates", list_templates() );
 
     jo.member( "scenarios" );
     jo.start_array();
@@ -320,6 +374,41 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
         const JsonValue jv = json_loader::from_string( choices_json );
         const JsonObject jo = jv.get_object();
         jo.allow_omitted_members();
+
+        const std::string tmpl = jo.get_string( "template", "" );
+        if( !tmpl.empty() ) {
+            const std::vector<std::string> listed = list_templates();
+            if( std::find( listed.begin(), listed.end(), tmpl ) == listed.end() ) {
+                return "no template " + sanitize_text( tmpl, 64 );
+            }
+            u = avatar();
+            pool_type pool = pool_type::FREEFORM;
+            if( !u.load_template( tmpl, pool ) ) {
+                return "cannot load template " + tmpl;
+            }
+            if( get_scenario() == nullptr || find_scenario( get_scenario()->ident().str() ) == nullptr ) {
+                return "the template's scenario isn't available";
+            }
+            // As avatar::create( TEMPLATE ): recipes are relearnt in game.
+            u.forget_all_recipes();
+            const std::string name = checked_name( jo.get_string( "name", "" ) );
+            if( !name.empty() ) {
+                u.name = name;
+            }
+            if( u.name.empty() ) {
+                u.pick_name();
+            }
+            if( u.name.empty() || u.name.front() == '#' ) {
+                return "bad name";
+            }
+            if( world_generator->active_world != nullptr &&
+                world_generator->active_world->save_exists( save_t::from_save_id( u.name ) ) ) {
+                return "a character named " + u.name + " already exists in this world";
+            }
+            u.set_body();
+            u.initialize( character_type::CUSTOM );
+            return "";
+        }
 
         const scenario *scen = find_scenario( jo.get_string( "scenario", "" ) );
         if( scen == nullptr ) {
@@ -476,6 +565,24 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
         return std::string( "bad choices: " ) + sanitize_text( e.what(), 200 );
     }
     u.set_body();
+    {
+        // As avatar::create: the template is saved before initialize() adds the profession's items.
+        std::string save_as;
+        try {
+            const JsonValue jv = json_loader::from_string( choices_json );
+            const JsonObject jo = jv.get_object();
+            jo.allow_omitted_members();
+            save_as = jo.get_string( "save_template", "" );
+        } catch( const std::exception & ) {
+            save_as.clear();
+        }
+        if( !save_as.empty() ) {
+            if( !template_name_ok( save_as ) ) {
+                return "bad template name";
+            }
+            u.save_template( save_as, chosen_pool() );
+        }
+    }
     u.initialize( character_type::CUSTOM );
     return "";
 }

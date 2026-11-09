@@ -5,6 +5,8 @@
 #include <cstdlib>
 #include <exception>
 #include <string>
+#include <algorithm>
+#include <vector>
 
 #include "avatar.h"
 #include "cached_options.h"
@@ -118,6 +120,25 @@ int main()
                "a profession as background refused" );
         check( !fp3d::apply_chargen( u, choices( scen, prof, ",\"age\":3" ) ).empty(), "age out of range refused" );
         check( !fp3d::apply_chargen( u, choices( scen, prof, ",\"name\":\"#raw\"" ) ).empty(), "name with # refused" );
+        // Templates: saved with the choices, listed, loaded back with another name.
+        why = fp3d::apply_chargen( u, choices( scen, prof, ",\"str\":11,\"traits\":[\"" + lone +
+                                   "\"],\"name\":\"Templ Person\",\"save_template\":\"fp3d test\"" ) );
+        const std::vector<std::string> tl = fp3d::list_templates();
+        check( why.empty() && std::find( tl.begin(), tl.end(), "fp3d test" ) != tl.end(), "template saved and listed",
+               why );
+        why = fp3d::apply_chargen( u, "{\"template\":\"fp3d test\",\"name\":\"From Template\"}" );
+        check( why.empty() && u.name == "From Template" && u.str_max == 11 && u.has_trait( trait_id( lone ) ) &&
+               u.prof->ident().str() == prof, "template loads with a new name", why );
+        check( !fp3d::apply_chargen( u, "{\"template\":\"../fp3d test\"}" ).empty(), "template path refused" );
+        check( !fp3d::apply_chargen( u, "{\"template\":\"nope\"}" ).empty(), "unknown template refused" );
+        check( !fp3d::apply_chargen( u, choices( scen, prof, ",\"save_template\":\"../evil\"" ) ).empty(),
+               "bad template name refused" );
+        {
+            JsonValue r2 = json_loader::from_string( fp3d::chargen_catalog_json() );
+            JsonObject o2 = r2.get_object();
+            o2.allow_omitted_members();
+            check( o2.get_string_array( "templates" ).size() == tl.size(), "catalog lists templates" );
+        }
         check( !fp3d::apply_chargen( u, "{\"scenario\":" ).empty(), "broken JSON refused" );
         check( !fp3d::apply_chargen( u, "" ).empty(), "empty answer refused" );
         check( !fp3d::apply_chargen( u, std::string( 20000, ' ' ) ).empty(), "oversized answer refused" );

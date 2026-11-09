@@ -7,11 +7,15 @@
 // answers with the choices as JSON, and the sim checks and applies them. See contracts/ui_requests.md.
 
 #include <string>
+#include <vector>
 
 class avatar;
 
 namespace fp3d
 {
+// Character templates in CDDA's templates folder (plain names only, sorted, at most 256).
+std::vector<std::string> list_templates();
+
 // The catalog as JSON. Needs the world's game data loaded (boot_new_game_data). Run on the sim thread.
 std::string chargen_catalog_json();
 
