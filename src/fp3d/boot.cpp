@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 
 #include "avatar.h"
@@ -11,13 +12,16 @@
 #include "color.h"
 #include "cursesdef.h"
 #include "debug.h"
+#include "enums.h"
 #include "filesystem.h"
+#include "fp3d/bridge.h"
 #include "fp3d/game_access.h"
 #include "fp3d/id_tables.h"
 #include "game.h"
 #include "game_constants.h"
 #include "map.h"
 #include "map_scale_constants.h"
+#include "messages.h"
 #include "options.h"
 #include "output.h"
 #include "overmapbuffer.h"
@@ -147,6 +151,21 @@ void boot_saved_game( const std::string &world_name, const std::string &save_nam
     if( !fp3d_game_access::load_game( *g, save ) ) {
         throw std::runtime_error( "cannot load " + save_name + " from world " + world_name );
     }
+}
+
+void run_save()
+{
+    const std::optional<bool> only_if_changed = take_save_request();
+    if( !only_if_changed ) {
+        return;
+    }
+    if( *only_if_changed && g->get_moves_since_last_save() == 0 ) {
+        note_saved( true );
+        return;
+    }
+    const bool ok = fp3d_game_access::save_game( *g );
+    add_msg( ok ? m_good : m_bad, ok ? "Game saved." : "The game could not be saved." );
+    note_saved( ok );
 }
 
 void shutdown_world()

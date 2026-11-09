@@ -2,6 +2,8 @@
 #ifndef CATA_SRC_FP3D_GAME_ACCESS_H
 #define CATA_SRC_FP3D_GAME_ACCESS_H
 
+#include <ctime>
+
 #include "game.h"
 
 // FP3D: the one friend of `game` (declared in game.h). Keep this the only way fp3d code reaches game
@@ -16,6 +18,19 @@ class fp3d_game_access
         // Loads a saved character into the active world; call g.setup() first (as the main menu does).
         static bool load_game( game &g, const save_t &save ) {
             return g.load( save );
+        }
+        // CDDA's examine of one square (doors, furniture, vehicles, items), as the examine action does it.
+        static void examine( game &g, const tripoint_bub_ms &p ) {
+            g.examine( p );
+        }
+        // game::save() plus the counters quicksave() resets. Run it at the main loop, like quicksave.
+        static bool save_game( game &g ) {
+            if( !g.save() ) {
+                return false;
+            }
+            g.moves_since_last_save = 0;
+            g.last_save_timestamp = std::time( nullptr );
+            return true;
         }
 };
 

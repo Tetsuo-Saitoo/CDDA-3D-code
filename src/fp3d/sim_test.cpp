@@ -29,6 +29,7 @@
 #include "fp3d/boot.h"
 #include "fp3d/bridge.h"
 #include "fp3d/game_access.h"
+#include "fp3d/held.h"
 #include "fp3d/points.h"
 #include "fp3d/events.h"
 #include "fp3d/snapshot.h"
@@ -37,9 +38,13 @@
 #include "map.h"
 #include "mapdata.h"
 #include "messages.h"
+#include "monster.h"
 #include "npc.h"
 #include "rng.h"
 #include "type_id.h"
+#include "units.h"
+#include "vehicle.h"
+#include "vpart_position.h"
 #include "worldfactory.h"
 
 namespace
@@ -49,6 +54,16 @@ const itype_id itype_backpack( "backpack" );
 const itype_id itype_rock( "rock" );
 const mtype_id mon_zombie( "mon_zombie" );
 const itype_id itype_2h_flail_steel( "2h_flail_steel" );
+const itype_id itype_gasoline( "gasoline" );
+const itype_id itype_hose( "hose" );
+const itype_id itype_jerrycan( "jerrycan" );
+const itype_id itype_water( "water" );
+const itype_id itype_glock_19( "glock_19" );
+const itype_id itype_9mm( "9mm" );
+const ter_str_id ter_t_water_sh( "t_water_sh" );
+const vproto_id vehicle_prototype_none( "none" );
+const vpart_id vpart_frame( "frame" );
+const vpart_id vpart_tank_small( "tank_small" );
 const ter_str_id ter_t_door_c( "t_door_c" );
 const ter_str_id ter_t_floor( "t_floor" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
@@ -65,6 +80,12 @@ struct observed {
     int zombies_placed = 0;
     int visible = 0;         // creatures the avatar sees
     int safe_mode = 0;
+    int can_ml = -1;         // siphon check: gasoline in the carried jerrycan (-1 none carried)
+    int tank_ml = -1;        // gasoline left in the vehicle north (-1 no vehicle)
+    int puddle = 0;          // charges of water lying south
+    int hoses = 0;           // hoses carried (wielded included)
+    int ammo = -1;           // shoot check: rounds in the wielded gun (-1 nothing wielded)
+    int zombie_hp = -1;      // hp of the first monster (-1 none)
     std::vector<std::string> messages;
 };
 std::mutex observed_mutex;
@@ -72,8 +93,12 @@ observed last_observed;
 std::string sim_error;
 std::atomic<int> loads{ 0 };
 std::atomic<bool> spawn_zombie{ false };
-// Hand checks: 1 = a zombie to the west and a rock in hand, 2 = a two-handed flail in hand. Done on the sim
-// thread right before its next request.
+// Hand checks: 1 = a zombie to the west and a rock in hand, 2 = a two-handed flail in hand, 3 = a hose in hand,
+// an empty jerrycan carried and a one-tile vehicle north with 4 L of gasoline in a small tank, 4 = a zombie west,
+// 5 = zombies gone and a spare hose carried, 6 = the spare hose dropped here, 7 = picked up again, 8 = the jerrycan
+// wielded (the hose in hand gone), 9 = shallow water east and a puddle of 2 L of water south, 10 = a new empty
+// jerrycan wielded, 11 = a zombie 3 squares west and a loaded pistol in hand. Done on the sim thread right
+// before its next request.
 std::atomic<int> hand_setup{ 0 };
 
 void observe()
@@ -95,6 +120,81 @@ void observe()
         case 2:
             get_avatar().set_wielded_item( item( itype_2h_flail_steel ) );
             break;
+        case 3: {
+            g->clear_zombies();
+            get_avatar().set_wielded_item( item( itype_hose ) );
+            get_avatar().i_add( item( itype_jerrycan ) );
+            vehicle *veh = here.add_vehicle( vehicle_prototype_none, p + tripoint_rel_ms( 0, -1, 0 ), 0_degrees,
+                                             0, 0 );
+            if( veh != nullptr ) {
+                veh->install_part( here, point_rel_ms::zero, vpart_frame );
+                const int tank = veh->install_part( here, point_rel_ms::zero, vpart_tank_small );
+                if( tank >= 0 ) {
+                    veh->part( tank ).ammo_set( itype_gasoline, 4000 );
+                }
+                here.add_vehicle_to_cache( veh );
+            }
+            break;
+        }
+        case 4:
+            g->clear_zombies();
+            g->place_critter_at( mon_zombie, p + tripoint_rel_ms( -1, 0, 0 ) );
+            break;
+        case 5:
+            g->clear_zombies();
+            get_avatar().i_add( item( itype_hose ) );
+            break;
+        case 6: {
+            avatar &u = get_avatar();
+            const item *weapon = u.get_wielded_item() ? u.get_wielded_item().get_item() : nullptr;
+            for( item_location &loc : u.all_items_loc() ) {
+                if( loc->typeId() == itype_hose && loc.get_item() != weapon ) {
+                    here.add_item_or_charges( p, *loc );
+                    loc.remove_item();
+                    break;
+                }
+            }
+            break;
+        }
+        case 7: {
+            map_stack items = here.i_at( p );
+            for( auto it = items.begin(); it != items.end(); ++it ) {
+                if( it->typeId() == itype_hose ) {
+                    get_avatar().i_add( *it );
+                    items.erase( it );
+                    break;
+                }
+            }
+            break;
+        }
+        case 8: {
+            avatar &u = get_avatar();
+            const item *weapon = u.get_wielded_item() ? u.get_wielded_item().get_item() : nullptr;
+            for( item_location &loc : u.all_items_loc() ) {
+                if( loc->typeId() == itype_jerrycan && loc.get_item() != weapon ) {
+                    const item can = *loc;
+                    loc.remove_item();
+                    u.set_wielded_item( can );
+                    break;
+                }
+            }
+            break;
+        }
+        case 9:
+            here.ter_set( p + tripoint_rel_ms( 1, 0, 0 ), ter_t_water_sh );
+            here.add_item_or_charges( p + tripoint_rel_ms( 0, 1, 0 ), item( itype_water, calendar::turn, 8 ) );
+            break;
+        case 10:
+            get_avatar().set_wielded_item( item( itype_jerrycan ) );
+            break;
+        case 11: {
+            g->clear_zombies();
+            g->place_critter_at( mon_zombie, p + tripoint_rel_ms( -3, 0, 0 ) );
+            item gun( itype_glock_19 );
+            gun.ammo_set( itype_9mm, 15 );
+            get_avatar().set_wielded_item( gun );
+            break;
+        }
         default:
             break;
     }
@@ -119,6 +219,28 @@ void observe()
         }
     }
     o.apples_carried = u.amount_of( itype_apple );
+    for( const item_location &loc : get_avatar().all_items_loc() ) {
+        if( loc->typeId() == itype_jerrycan ) {
+            o.can_ml = units::to_milliliter( loc->get_total_contained_volume() );
+            break;
+        }
+    }
+    if( const optional_vpart_position vp = here.veh_at( p + tripoint_rel_ms( 0, -1, 0 ) ) ) {
+        o.tank_ml = vp->vehicle().fuel_left( here, itype_gasoline );
+    }
+    for( const item &it : here.i_at( p + tripoint_rel_ms( 0, 1, 0 ) ) ) {
+        if( it.typeId() == itype_water ) {
+            o.puddle += it.charges;
+        }
+    }
+    o.hoses = u.amount_of( itype_hose );
+    if( const item_location w = u.get_wielded_item() ) {
+        o.ammo = w->ammo_remaining();
+    }
+    for( monster &m : g->all_monsters() ) {
+        o.zombie_hp = m.get_hp();
+        break;
+    }
     o.rocks_carried = u.amount_of( itype_rock );
     o.loads = loads.load();
     for( const auto &m : Messages::recent_messages( 6 ) ) {
@@ -126,6 +248,7 @@ void observe()
     }
     // Block B3: the client reads this snapshot while the sim waits for the answer.
     fp3d::publish_snapshot( fp3d::capture_snapshot() );
+    fp3d::publish_held();   // as the bridge's hook does
     std::lock_guard<std::mutex> lk( observed_mutex );
     last_observed = o;
 }
@@ -487,6 +610,282 @@ static bool run_hand_checks()
     return failed == 0;
 }
 
+// Held items and context use (fp3d/held.h): pick a jerrycan for the off hand through the hold prompt, then use
+// the wielded hose on the vehicle north: it siphons into the jerrycan with no menu, one turn per second, and
+// the held view shows the jerrycan filling. Then: the off hand strikes with the jerrycan, a held item dropped and
+// picked up isn't held again, the wielded jerrycan refuels the vehicle, and E fills it from a puddle and from water.
+static bool run_siphon_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  siphon: %-35s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    hand_setup = 3;
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    fp3d::queue_action( "pause" );   // the setup runs before the next request
+    r = fp3d::wait_request( 20000, r->id );
+    const observed before = snapshot();
+    check( r && r->timed && before.can_ml == 0 && before.tank_ml == 4000, "scene: hose, jerrycan, 4 L tank",
+           "can " + std::to_string( before.can_ml ) + " ml, tank " + std::to_string( before.tank_ml ) + " ml" );
+    if( !r ) {
+        return false;
+    }
+    // Hold: CDDA's item menu comes up; pick the jerrycan.
+    fp3d::queue_action( "fp3d_hold_off" );
+    std::optional<fp3d::ui_request> menu = fp3d::wait_request( 20000, r->id );
+    std::string label;
+    const int entry = menu ? first_entry_with( *menu, "jerrycan", label ) : -1;
+    check( menu && !menu->timed && entry >= 0, "hold asks which item", label );
+    if( !menu || menu->timed || entry < 0 ) {
+        return false;
+    }
+    fp3d::ui_answer pick;
+    pick.id = menu->id;
+    pick.entry = entry;
+    fp3d::answer( pick );
+    r = fp3d::wait_request( 20000, menu->id );
+    fp3d::held_view h = fp3d::latest_held();
+    check( r && r->timed && h.main.id == "hose" && h.off.id == "jerrycan" && h.off.capacity_ml >= 10000,
+           "hose in the main hand, jerrycan in the off", h.main.id + " / " + h.off.id + " " +
+           std::to_string( h.off.capacity_ml ) + " ml" );
+    if( !r ) {
+        return false;
+    }
+    // Use the hose on the vehicle north: an activity runs (no request) until the tank is empty.
+    const auto t0 = std::chrono::steady_clock::now();
+    fp3d::queue_action( "fp3d_use_UP" );
+    std::vector<int64_t> levels;
+    std::optional<fp3d::ui_request> done;
+    while( !done && std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 40 ) ) {
+        done = fp3d::wait_request( 200, r->id );
+        h = fp3d::latest_held();
+        if( h.activity == "ACT_FILL_LIQUID" && ( levels.empty() || levels.back() != h.off.ml ) ) {
+            levels.push_back( h.off.ml );
+        }
+    }
+    const double secs = std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count();
+    const observed after = snapshot();
+    h = fp3d::latest_held();
+    check( done && done->timed, "back in the main loop", "" );
+    check( after.can_ml == 4000 && after.tank_ml == 0, "4 L moved into the jerrycan",
+           "can " + std::to_string( after.can_ml ) + " ml, tank " + std::to_string( after.tank_ml ) + " ml" );
+    check( h.off.ml == 4000 && h.off.liquid == "gasoline", "held view: jerrycan with gasoline",
+           std::to_string( h.off.ml ) + " ml " + h.off.liquid );
+    std::string seen;
+    for( const int64_t v : levels ) {
+        seen += std::to_string( v ) + " ";
+    }
+    check( levels.size() >= 3, "fill seen rising turn by turn", seen );
+    // One turn per 1 s / timescale (the real-time goal left the clock running faster).
+    const double turn_s = 1.0 / fp3d::get_clock().timescale;
+    check( secs >= 4 * turn_s, "paced in real time", std::to_string( secs ) + " s, " +
+           std::to_string( turn_s ) + " s per turn" );
+    // Nothing left to siphon: a message, no time.
+    fp3d::queue_action( "fp3d_use_UP" );
+    std::vector<fp3d::event> evs;
+    const std::optional<fp3d::ui_request> again = fp3d::wait_request( 20000, done ? done->id : 0 );
+    fp3d::drain_events( evs );
+    const bool told = std::any_of( evs.begin(), evs.end(), []( const fp3d::event & e ) {
+        return e.kind == fp3d::event_kind::message && e.text.find( "no liquid left" ) != std::string::npos;
+    } );
+    check( again && again->timed && told, "empty tank: told so", "" );
+    // Queues one action and waits (activities included) for the main loop again; the events in between.
+    const auto act = [&]( const std::string &a, std::vector<fp3d::event> &evs ) {
+        evs.clear();
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            return false;
+        }
+        fp3d::drain_events( evs );
+        evs.clear();
+        fp3d::queue_action( a );
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 40000, r0->id );
+        fp3d::drain_events( evs );
+        return r1 && r1->timed;
+    };
+    const auto said = []( const std::vector<fp3d::event> &evs, const std::string &text ) {
+        return std::any_of( evs.begin(), evs.end(), [&text]( const fp3d::event & e ) {
+            return e.kind == fp3d::event_kind::message && e.text.find( text ) != std::string::npos;
+        } );
+    };
+    const auto hold = [&]( const std::string &what ) {
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            return false;
+        }
+        fp3d::queue_action( "fp3d_hold_off" );
+        const std::optional<fp3d::ui_request> m = fp3d::wait_request( 20000, r0->id );
+        std::string l;
+        const int e = m ? first_entry_with( *m, what, l ) : -1;
+        if( !m || m->timed || e < 0 ) {
+            return false;
+        }
+        fp3d::ui_answer a;
+        a.id = m->id;
+        a.entry = e;
+        fp3d::answer( a );
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 20000, m->id );
+        return r1 && r1->timed && fp3d::latest_held().off.id == what;
+    };
+    const auto last_msg = []( const std::vector<fp3d::event> &evs ) {
+        std::string m;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                m = e.text;
+            }
+        }
+        return "[" + m + "]";
+    };
+    const auto ml = []( const char *what, int v ) {
+        return std::string( what ) + " " + std::to_string( v ) + " ml ";
+    };
+    // The off hand strikes with what it holds.
+    std::vector<fp3d::event> ev;
+    hand_setup = 4;
+    act( "pause", ev );
+    const bool struck = act( "fp3d_attack_off_LEFT", ev );
+    const bool armed = std::any_of( ev.begin(), ev.end(), []( const fp3d::event & e ) {
+        return e.kind == fp3d::event_kind::attack && e.uid == 1 && e.type != 0;
+    } );
+    check( struck && armed, "off hand strikes with the jerrycan", "" );
+    // Put the jerrycan away.
+    check( act( "fp3d_stow_off", ev ) && !fp3d::latest_held().off.held, "stow empties the off hand",
+           fp3d::latest_held().off.id );
+    // 4 L of gasoline make the jerrycan too heavy for one hand (this character): not offered to hold.
+    {
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        fp3d::queue_action( "fp3d_hold_off" );
+        const std::optional<fp3d::ui_request> m = r0 ? fp3d::wait_request( 20000, r0->id ) : std::nullopt;
+        std::string l;
+        const bool menu_up = m && !m->timed;
+        const bool offered = menu_up && first_entry_with( *m, "jerrycan", l ) >= 0;
+        if( menu_up ) {
+            fp3d::ui_answer a;
+            a.id = m->id;
+            a.cancel = true;
+            fp3d::answer( a );
+        }
+        const std::optional<fp3d::ui_request> r1 = menu_up ? fp3d::wait_request( 20000, m->id ) : m;
+        check( r1 && r1->timed && !offered && !fp3d::latest_held().off.held, "too heavy for one hand: not offered",
+               menu_up ? "menu" : "no menu" );
+    }
+    // A spare hose held, dropped, picked up: carried but not held (its mark's token went stale).
+    hand_setup = 5;
+    act( "pause", ev );
+    check( hold( "hose" ), "spare hose held", fp3d::latest_held().off.id );
+    hand_setup = 6;
+    act( "pause", ev );
+    h = fp3d::latest_held();
+    check( !h.off.held, "dropped: off hand empty", h.off.id );
+    hand_setup = 7;
+    act( "pause", ev );
+    h = fp3d::latest_held();
+    const int hoses = snapshot().hoses;
+    check( !h.off.held && hoses == 2, "picked up: carried, not held", h.off.id + " hoses " +
+           std::to_string( hoses ) );
+    // Wielded, no hose: E pours it into the vehicle's tank.
+    hand_setup = 8;
+    act( "pause", ev );
+    const bool poured = act( "fp3d_use_UP", ev );
+    const observed refueled = snapshot();
+    check( poured && refueled.tank_ml == 4000 && refueled.can_ml == 0 && said( ev, "You refill" ),
+           "refuel from the held jerrycan", fp3d::latest_held().main.id + " " + ml( "can", refueled.can_ml ) +
+           ml( "tank", refueled.tank_ml ) + last_msg( ev ) );
+    // E fills it from the puddle south, then from the shallow water east.
+    hand_setup = 9;
+    act( "pause", ev );
+    const bool from_puddle = act( "fp3d_use_DOWN", ev );
+    const observed puddled = snapshot();
+    h = fp3d::latest_held();
+    check( from_puddle && puddled.puddle == 0 && puddled.can_ml == 2000 && h.main.liquid == "water",
+           "fill from a puddle", ml( "can", puddled.can_ml ) + h.main.liquid + " puddle " +
+           std::to_string( puddled.puddle ) );
+    // The puddle's water doesn't combine with the river's (CDDA: dirty, other temperature): told so, no menu.
+    // A new jerrycan fills up.
+    check( act( "fp3d_use_RIGHT", ev ) && said( ev, "won't hold" ), "waters that don't mix: told so",
+           last_msg( ev ) );
+    hand_setup = 10;
+    act( "pause", ev );
+    const bool from_water = act( "fp3d_use_RIGHT", ev );
+    const observed filled = snapshot();
+    h = fp3d::latest_held();
+    check( from_water && filled.can_ml >= 10000 && filled.can_ml == h.main.capacity_ml, "fill from shallow water",
+           ml( "can", filled.can_ml ) + ml( "of", static_cast<int>( h.main.capacity_ml ) ) + last_msg( ev ) +
+           ( from_water ? "" : " stuck" ) );
+    return failed == 0;
+}
+
+// Shooting a zombie with a loaded pistol: "fire" opens CDDA's target_ui, which asks the client; FIRE at the
+// zombie shoots once (it crashed here: aim modes unset headless), then CDDA aims again for the next shot;
+// cancelling that goes back to the main loop.
+static bool run_shoot_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  shoot: %-36s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 11;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const observed before = snapshot();
+    check( r && r->timed && before.ammo == 15 && before.zombie_hp > 0, "scene: loaded pistol, zombie west",
+           "ammo " + std::to_string( before.ammo ) + " hp " + std::to_string( before.zombie_hp ) );
+    if( !r ) {
+        return false;
+    }
+    fp3d::queue_action( "fire" );
+    int targets = 0;
+    int others = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::optional<fp3d::ui_request> cur = fp3d::wait_request( 20000, r->id );
+    while( cur && !cur->timed && targets < 20 && others < 20 &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 60 ) ) {
+        fp3d::ui_answer a;
+        a.id = cur->id;
+        std::string note;
+        if( cur->kind == fp3d::request_kind::target && targets++ == 0 ) {
+            a.pos = fp3d::ui_point{ cur->origin.x - 3, cur->origin.y, cur->origin.z };
+            a.action = "FIRE";
+            note = cur->mode + " " + cur->status + " -> zombie FIRE";
+        } else if( cur->kind == fp3d::request_kind::target ) {
+            a.cancel = true;
+            note = cur->mode + " again -> cancel";
+        } else if( cur->kind == fp3d::request_kind::popup && !cur->actions.empty() ) {
+            others++;
+            a.action = has( cur->actions, "YES" ) ? "YES" : cur->actions.front();
+            note = a.action + " (" + cur->text.substr( 0, 60 ) + ")";
+        } else {
+            others++;
+            a.cancel = true;
+            note = "cancel (" + cur->text.substr( 0, 60 ) + ")";
+        }
+        print_request( *cur, note );
+        fp3d::answer( a );
+        const auto id = cur->id;
+        cur = fp3d::wait_request( 20000, id );
+    }
+    const observed after = snapshot();
+    check( cur && cur->timed, "back in the main loop", std::to_string( targets ) + " target, " +
+           std::to_string( others ) + " other requests" + ( cur ? "" : ", no request (stuck or crashed)" ) );
+    check( targets == 2 && others == 0, "aim, fire, aim again, cancel", std::to_string( targets ) +
+           " target requests" );
+    check( after.ammo == before.ammo - 1, "one shot fired", "ammo " + std::to_string( before.ammo ) + " -> " +
+           std::to_string( after.ammo ) );
+    std::printf( "  shoot: zombie hp %d -> %d\n", before.zombie_hp, after.zombie_hp );
+    return failed == 0;
+}
+
 static bool run_queue_checks()
 {
     int failed = 0;
@@ -639,6 +1038,8 @@ int main()
     drain();
     const bool queue_ok = g_idx == n_goals && run_queue_checks();
     const bool hands_ok = queue_ok && run_hand_checks();
+    const bool siphon_ok = hands_ok && run_siphon_checks();
+    const bool shoot_ok = siphon_ok && run_shoot_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -669,5 +1070,9 @@ int main()
                  count( event_kind::anim ), count( event_kind::attack ), events_dropped );
     std::printf( "queue: %s\n", queue_ok ? "ok" : "BAD" );
     std::printf( "hands: %s\n", hands_ok ? "ok" : "BAD" );
-    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && hands_ok ? EXIT_SUCCESS : EXIT_FAILURE;
+    std::printf( "siphon: %s\n", siphon_ok ? "ok" : "BAD" );
+    std::printf( "shoot: %s\n", shoot_ok ? "ok" : "BAD" );
+    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && hands_ok && siphon_ok &&
+           shoot_ok ?
+           EXIT_SUCCESS : EXIT_FAILURE;
 }

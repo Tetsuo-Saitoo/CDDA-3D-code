@@ -35,6 +35,7 @@
 #include "string_input_popup.h"
 #include "translations.h"
 #include "ui_manager.h"
+#include "fp3d/boot.h" // FP3D:
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/events.h" // FP3D:
 
@@ -452,6 +453,11 @@ const std::string &input_context::handle_input( const int timeout )
                 fp3d::set_next_timed();   // asking again after a bad answer is still the main loop
             }
             const fp3d::ui_answer a = fp3d::ask( req );
+            // A save the client asked for (fp3d::request_save) comes as the main loop's answer: save, ask again.
+            if( a.queued && a.action == fp3d::save_action ) {
+                fp3d::run_save();
+                continue;
+            }
             // A timed (main loop) request expired in real time: the player waits out the turn.
             const std::string wanted = a.timed_out ? "pause" : a.cancel ? "QUIT" : a.action;
             const auto it = std::find( registered_actions.begin(), registered_actions.end(), wanted );

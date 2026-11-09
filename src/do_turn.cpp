@@ -20,6 +20,7 @@
 #include "action.h"
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/events.h" // FP3D:
+#include "fp3d/held.h" // FP3D:
 #include "activity_type.h"
 #include "avatar.h"
 #include "bionics.h"
@@ -487,7 +488,11 @@ bool do_turn()
         // FP3D: pause and real-time pacing; activities and sleep fast-forward
         if( fp3d::active() ) {
             const avatar &u = get_avatar();
-            fp3d::pace_turn( static_cast<bool>( u.activity ) || u.has_effect( effect_sleep ) );
+            // A liquid fill runs one turn per second so the client can show it filling (fp3d/held.h)
+            const bool watched = fp3d::watched_activity( u );
+            fp3d::publish_held();
+            fp3d::pace_turn( !watched && ( static_cast<bool>( u.activity ) || u.has_effect( effect_sleep ) ),
+                             watched );
         }
         g->gamemode->per_turn();
         calendar::turn += 1_turns;

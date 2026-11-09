@@ -133,7 +133,8 @@ void set_paused( bool paused );          // client side; clears the reason
 // Sim side. Pauses with a reason (e.g. a monster came into view); only in real time.
 void auto_pause( const std::string &reason );
 // Sim side, at every turn advance: blocks while paused and paces real time. Throws shutdown_signal.
-void pace_turn( bool fast_forward );
+// `watched`: paced in real time in both modes, for an activity the player watches happen (a liquid fill).
+void pace_turn( bool fast_forward, bool watched = false );
 
 // Action queue (block B5). The client can send main-loop actions (names from a timed request's `actions`) at
 // any time instead of catching each timed request: the sim takes one per timed request, before waiting for an
@@ -148,6 +149,24 @@ size_t queued_actions();
 void interrupt();
 // Sim side. True once per interrupt().
 bool take_interrupt();
+
+// Saving (M1). Client side: asks the sim to save the game where it stands and play on (CDDA's quicksave without
+// its popup). The sim saves at the main loop's next request, also while paused; during a long activity or another
+// prompt it waits for that. `only_if_changed` (autosave) skips the save when nothing happened since the last one;
+// a plain request overrides it. False after shutdown.
+bool request_save( bool only_if_changed );
+struct save_status {
+    bool pending = false;      // asked for and not finished
+    uint64_t done = 0;         // saves finished (skipped autosaves too, with ok = true)
+    bool ok = false;           // how the last one went
+};
+save_status get_save_status();
+// What ask() answers a timed request with while a save is wanted; input_context then runs it (run_save, boot.h)
+// and asks again. Only the bridge sets `queued`, so a client can't fake it.
+constexpr const char *save_action = "fp3d_save";
+// Sim side. Takes the wanted save: nullopt if none, else its only_if_changed. note_saved() records the result.
+std::optional<bool> take_save_request();
+void note_saved( bool ok );
 
 // Diagnostics: input polls answered with a timeout (they never reach the client), counted per place.
 void note_poll( const std::string &where );

@@ -23,6 +23,9 @@ struct channel {
     bool shut_down = false;
     std::function<void()> before_ask;
     std::deque<std::string> actions;     // queued main-loop actions (block B5)
+    bool save_wanted = false;            // request_save() until the sim takes it
+    bool save_if_changed = false;
+    save_status saves;
     clock_state clock;
     // Wall time the current game turn started; real time ends it turn_length() later.
     std::chrono::steady_clock::time_point turn_start = std::chrono::steady_clock::now();
@@ -162,6 +165,15 @@ ui_answer ask( ui_request req )
         if( c.reply && c.reply->id == id ) {
             break;
         }
+        // A save goes first and doesn't wait for pause to end; the sim asks again afterwards.
+        if( timed && c.save_wanted ) {
+            ui_answer save;
+            save.id = id;
+            save.action = save_action;
+            save.queued = true;
+            c.reply = std::move( save );
+            break;
+        }
         // Checked under the same lock that posted the request, so a client never sees it as waiting while
         // a queued action is about to answer it.
         if( timed && !c.actions.empty() && !c.clock.paused ) {
@@ -286,6 +298,47 @@ bool queue_action( const std::string &action )
     return true;
 }
 
+bool request_save( bool only_if_changed )
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down ) {
+        return false;
+    }
+    // A plain request wins over a pending autosave's "only if changed".
+    c.save_if_changed = c.save_wanted ? c.save_if_changed && only_if_changed : only_if_changed;
+    c.save_wanted = true;
+    c.saves.pending = true;
+    c.cv.notify_all();
+    return true;
+}
+
+save_status get_save_status()
+{
+    std::lock_guard<std::mutex> lk( chan().m );
+    return chan().saves;
+}
+
+std::optional<bool> take_save_request()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( !c.save_wanted ) {
+        return std::nullopt;
+    }
+    c.save_wanted = false;
+    return c.save_if_changed;
+}
+
+void note_saved( bool ok )
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    c.saves.done++;
+    c.saves.ok = ok;
+    c.saves.pending = c.save_wanted;   // asked again while this one ran
+}
+
 void clear_actions()
 {
     std::lock_guard<std::mutex> lk( chan().m );
@@ -298,7 +351,7 @@ size_t queued_actions()
     return chan().actions.size();
 }
 
-void pace_turn( bool fast_forward )
+void pace_turn( bool fast_forward, bool watched )
 {
     channel &c = chan();
     std::unique_lock<std::mutex> lk( c.m );
@@ -311,7 +364,7 @@ void pace_turn( bool fast_forward )
             c.cv.wait( lk );
             continue;
         }
-        if( c.clock.mode == clock_mode::turn_based || fast_forward ) {
+        if( !watched && ( c.clock.mode == clock_mode::turn_based || fast_forward ) ) {
             paced_until.reset();
             break;
         }
