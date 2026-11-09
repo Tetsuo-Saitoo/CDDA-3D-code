@@ -41,6 +41,7 @@ struct item_pile_view {
     uint8_t tile = 0;
     uint16_t count = 0;                           // items on the tile
     std::array<uint32_t, 4> top{};                // itype indices, largest volume first; 0 = none
+    uint32_t corpse = 0;                          // mtype index of the largest corpse here, 0 = none
     bool operator==( const item_pile_view &o ) const;
 };
 

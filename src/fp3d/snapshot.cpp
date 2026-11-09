@@ -170,6 +170,13 @@ void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile
         for( size_t i = 0; i < n; i++ ) {
             pile.top[i] = intern_id( id_kind::itype, by_volume[i].second->typeId().str() );
         }
+        units::volume biggest = -1_ml;
+        for( const auto &[vol, it] : by_volume ) {
+            if( it->is_corpse() && it->get_mtype() != nullptr && vol > biggest ) {
+                biggest = vol;
+                pile.corpse = intern_id( id_kind::mtype, it->get_mtype()->id.str() );
+            }
+        }
         sm.items.push_back( pile );
     }
     size_t fields_here = 0;
@@ -391,7 +398,7 @@ void write_array( JsonOut &jo, const std::string &name, const Array &a )
 
 bool item_pile_view::operator==( const item_pile_view &o ) const
 {
-    return tile == o.tile && count == o.count && top == o.top;
+    return tile == o.tile && count == o.count && top == o.top && corpse == o.corpse;
 }
 
 bool field_view::operator==( const field_view &o ) const
@@ -616,6 +623,9 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
                 jo.write( static_cast<int64_t>( t ) );
             }
             jo.end_array();
+            if( p.corpse != 0 ) {
+                jo.write( static_cast<int64_t>( p.corpse ) );
+            }
             jo.end_array();
         }
         jo.end_array();

@@ -69,6 +69,18 @@ void on_projectile( const map &here, const Creature *shooter, const std::vector<
 // Radius 0 = computed from `area`.
 void on_explosion( const tripoint_bub_ms &centre, int radius, const std::vector<tripoint_bub_ms> &area,
                    const std::string &kind );
+// The item behind explosions started in this scope (a grenade, C4, a rocket's ammo); explosion events carry
+// its itype index in `detail` (0 = unknown, e.g. a vehicle or a monster).
+class explosion_item_scope
+{
+    public:
+        explicit explosion_item_scope( const std::string &itype );
+        ~explosion_item_scope();
+        explosion_item_scope( const explosion_item_scope & ) = delete;
+        explosion_item_scope &operator=( const explosion_item_scope & ) = delete;
+    private:
+        std::string prev;
+};
 void on_death( const Creature &c );
 void on_activity( const Character &ch, const std::string &activity );
 void on_turn_end();

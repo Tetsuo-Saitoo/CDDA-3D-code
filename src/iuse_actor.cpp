@@ -43,6 +43,7 @@
 #include "explosion.h"
 #include "field_type.h"
 #include "flag.h"
+#include "fp3d/events.h" // FP3D:
 #include "flexbuffer_json.h"
 #include "game.h"
 #include "game_inventory.h"
@@ -768,6 +769,7 @@ std::optional<int> explosion_iuse::use( Character *p, item &it, const tripoint_b
 std::optional<int> explosion_iuse::use( Character *p, item &it, map *here,
                                         const tripoint_bub_ms &pos ) const
 {
+    const fp3d::explosion_item_scope fp3d_item( it.typeId().str() ); // FP3D:
     if( explosion.power >= 0.0f ) {
         Character *source = p;
         if( it.has_var( "last_act_by_char_id" ) ) {
