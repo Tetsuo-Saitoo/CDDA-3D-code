@@ -9,6 +9,7 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <sstream>
 #include <string>
 #include <tuple>
 
@@ -24,12 +25,14 @@
 #include "map_scale_constants.h"
 #include "mapbuffer.h"
 #include "mapdata.h"
+#include "monster.h"
 #include "rng.h"
 #include "submap.h"
 #include "type_id.h"
 
 namespace
 {
+const mtype_id mon_dog( "mon_dog" );
 const mtype_id mon_zombie( "mon_zombie" );
 const ter_str_id ter_t_wall( "t_wall" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
@@ -167,10 +170,16 @@ int main()
         check( bumped == 1 && wall_seen, "a new wall bumps one submap's revision",
                std::to_string( bumped ) + " bumped" );
 
-        // A zombie in view shows up with its type and keeps its uid.
+        // A zombie in view shows up with its type and keeps its uid. A tamed dog comes along for the attitudes.
         const tripoint_bub_ms zed_at = u.pos_bub() + tripoint_rel_ms( 0, 2, 0 );
         here.ter_set( zed_at, ter_str_id( "t_floor" ) );
         g->place_critter_at( mon_zombie, zed_at );
+        const tripoint_bub_ms dog_at = u.pos_bub() + tripoint_rel_ms( 0, -2, 0 );
+        here.ter_set( dog_at, ter_str_id( "t_floor" ) );
+        monster *dog = g->place_critter_at( mon_dog, dog_at );
+        if( dog != nullptr ) {
+            dog->friendly = -1;
+        }
         refresh_caches();
         const uint32_t zed_type = fp3d::intern_id( fp3d::id_kind::mtype, mon_zombie.str() );
         const std::shared_ptr<const fp3d::snapshot> with_zed = timed_capture( ms );
@@ -179,6 +188,16 @@ int main()
         const fp3d::creature_view *z2 = find_monster( *with_zed2, zed_type );
         check( z1 && z2 && z1->uid == z2->uid && z1->uid >= ( uint64_t( 2 ) << 32 ) &&
                z1->pos.x == here.get_abs( zed_at ).x(), "zombie seen, uid stable across captures" );
+
+        // Attitude to the player: the zombie is hostile, a tamed dog friendly, the player itself neutral.
+        const fp3d::creature_view *d1 = find_monster( *with_zed2, fp3d::intern_id( fp3d::id_kind::mtype,
+                                        mon_dog.str() ) );
+        check( z2 && z2->attitude == 0 && d1 && d1->attitude == 2 && with_zed2->creatures[0].kind == 0 &&
+               with_zed2->creatures[0].attitude == 1, "attitude: zombie hostile, tame dog friendly, player neutral",
+               std::to_string( z2 ? z2->attitude : -1 ) + " " + std::to_string( d1 ? d1->attitude : -1 ) );
+        std::ostringstream creatures_json;
+        fp3d::write_snapshot_json( creatures_json, *with_zed2, u.posz(), u.posz() );
+        check( creatures_json.str().find( "\"attitude\":0" ) != std::string::npos, "creatures JSON has attitude" );
 
         // Walk two submaps east: the bubble shifts and the snapshot follows it.
         u.setpos( here, u.pos_bub() + tripoint_rel_ms( 2 * SEEX, 0, 0 ) );

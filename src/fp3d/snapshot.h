@@ -77,6 +77,7 @@ struct creature_view {
     uint32_t move_mode = 0;                       // move_mode index (characters) or 0
     uint8_t hp_frac = 0;                          // 0..255
     uint32_t wielded = 0;                         // itype index (characters) or 0
+    uint8_t attitude = 1;                         // to the player: 0 hostile, 1 neutral, 2 friendly (player: 1)
 };
 
 struct vehicle_part_view {
