@@ -139,6 +139,30 @@ int main()
             o2.allow_omitted_members();
             check( o2.get_string_array( "templates" ).size() == tl.size(), "catalog lists templates" );
         }
+        {
+            JsonValue r3 = json_loader::from_string( fp3d::chargen_catalog_json() );
+            JsonObject o3 = r3.get_object();
+            o3.allow_omitted_members();
+            JsonObject tc = o3.get_object( "template_choices" );
+            tc.allow_omitted_members();
+            bool described = false;
+            if( tc.has_object( "fp3d test" ) ) {
+                JsonObject one = tc.get_object( "fp3d test" );
+                one.allow_omitted_members();
+                described = one.get_int( "str" ) == 11 && one.get_string( "profession" ) == prof &&
+                            one.get_string( "name" ) == "Templ Person";
+                const std::vector<std::string> tr = one.get_string_array( "traits" );
+                described = described && std::find( tr.begin(), tr.end(), lone ) != tr.end();
+            }
+            check( described, "catalog describes the template for editing" );
+            check( get_scenario() == scenario::generic() || get_scenario() != nullptr, "scenario kept" );
+        }
+        check( !fp3d::apply_chargen( u, "{\"delete_template\":\"../x\"}" ).empty() &&
+               fp3d::list_templates().size() == tl.size(), "deleting an unlisted template refused" );
+        why = fp3d::apply_chargen( u, "{\"delete_template\":\"fp3d test\"}" );
+        const std::vector<std::string> tl2 = fp3d::list_templates();
+        check( why.rfind( "deleted", 0 ) == 0 && std::find( tl2.begin(), tl2.end(), "fp3d test" ) == tl2.end(),
+               "template deleted", why );
         check( !fp3d::apply_chargen( u, "{\"scenario\":" ).empty(), "broken JSON refused" );
         check( !fp3d::apply_chargen( u, "" ).empty(), "empty answer refused" );
         check( !fp3d::apply_chargen( u, std::string( 20000, ' ' ) ).empty(), "oversized answer refused" );

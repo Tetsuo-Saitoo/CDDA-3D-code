@@ -194,6 +194,63 @@ std::string checked_name( const std::string &raw )
     }
     return name.substr( start );
 }
+// Writes `name: {choices}` for template `name` (as apply_chargen reads them); nothing if it doesn't load.
+// load_template sets CDDA's global scenario: put the old one back.
+void write_template_choices( JsonOut &jo, const std::string &name )
+{
+    const scenario *before = get_scenario();
+    avatar t;
+    pool_type pool = pool_type::FREEFORM;
+    bool loaded = false;
+    try {
+        loaded = t.load_template( name, pool );
+    } catch( const std::exception & ) {
+        loaded = false;
+    }
+    const scenario *scen = get_scenario();
+    set_scenario( before );
+    if( !loaded || scen == nullptr || t.prof == nullptr ) {
+        return;
+    }
+    jo.member( name );
+    jo.start_object();
+    jo.member( "scenario", scen->ident().str() );
+    jo.member( "profession", t.prof->ident().str() );
+    std::vector<std::string> bgs;
+    for( const profession *h : t.hobbies ) {
+        bgs.push_back( h->ident().str() );
+    }
+    write_strings( jo, "backgrounds", bgs );
+    jo.member( "str", t.str_max );
+    jo.member( "dex", t.dex_max );
+    jo.member( "int", t.int_max );
+    jo.member( "per", t.per_max );
+    std::vector<std::string> traits;
+    for( const trait_id &m : t.get_mutations( true ) ) {
+        bool locked = scen->is_locked_trait( m ) || t.prof->is_locked_trait( m );
+        for( const profession *h : t.hobbies ) {
+            locked = locked || h->is_locked_trait( m );
+        }
+        if( !locked ) {
+            traits.push_back( m.str() );
+        }
+    }
+    write_strings( jo, "traits", traits );
+    jo.member( "skills" );
+    jo.start_object();
+    for( const Skill &sk : Skill::skills ) {
+        const int lvl = static_cast<int>( t.get_skill_level( sk.ident() ) );
+        if( lvl > 0 && !sk.is_contextual_skill() ) {
+            jo.member( sk.ident().str(), std::min<int>( lvl, skill_costs.size() - 1 ) );
+        }
+    }
+    jo.end_object();
+    jo.member( "name", t.name );
+    jo.member( "male", t.male );
+    jo.member( "age", t.base_age() );
+    jo.member( "height", t.base_height() );
+    jo.end_object();
+}
 } // namespace
 
 std::vector<std::string> list_templates()
@@ -254,6 +311,13 @@ std::string chargen_catalog_json()
     // Default selection: the generic scenario and its cheapest profession, as CDDA's own screen starts.
     jo.member( "default_scenario", scenario::generic()->ident().str() );
     write_strings( jo, "templates", list_templates() );
+    // What each template holds, in the answer's own format, so the client can open one for editing.
+    jo.member( "template_choices" );
+    jo.start_object();
+    for( const std::string &t : list_templates() ) {
+        write_template_choices( jo, t );
+    }
+    jo.end_object();
 
     jo.member( "scenarios" );
     jo.start_array();
@@ -375,6 +439,16 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
         const JsonObject jo = jv.get_object();
         jo.allow_omitted_members();
 
+        const std::string del = jo.get_string( "delete_template", "" );
+        if( !del.empty() ) {
+            const std::vector<std::string> listed = list_templates();
+            if( std::find( listed.begin(), listed.end(), del ) == listed.end() ) {
+                return "no template " + sanitize_text( del, 64 );
+            }
+            std::error_code ec;
+            std::filesystem::remove( std::filesystem::u8path( PATH_INFO::templatedir() + del + ".template" ), ec );
+            return ec ? "cannot delete template " + del : "deleted template " + del;
+        }
         const std::string tmpl = jo.get_string( "template", "" );
         if( !tmpl.empty() ) {
             const std::vector<std::string> listed = list_templates();
@@ -589,9 +663,10 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
 
 bool run_chargen()
 {
-    const std::string catalog = chargen_catalog_json();
     std::string status;
     for( ;; ) {
+        // Rebuilt every time: a deleted or saved template changes it.
+        const std::string catalog = chargen_catalog_json();
         ui_request req;
         req.kind = request_kind::chargen;
         req.context = "CHARGEN";
