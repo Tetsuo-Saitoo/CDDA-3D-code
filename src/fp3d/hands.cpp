@@ -126,4 +126,26 @@ bool offhand_strike()
 {
     return offhand_active;
 }
+
+std::vector<std::string> hand_dir_names()
+{
+    std::vector<std::string> out;
+    for( const dir_step &d : dirs ) {
+        out.emplace_back( d.name );
+    }
+    return out;
+}
+
+bool hand_dir( const std::string &name, int &dx, int &dy )
+{
+    const auto d = std::find_if( dirs.begin(), dirs.end(), [&name]( const dir_step & s ) {
+        return name == s.name;
+    } );
+    if( d == dirs.end() ) {
+        return false;
+    }
+    dx = d->dx;
+    dy = d->dy;
+    return true;
+}
 } // namespace fp3d

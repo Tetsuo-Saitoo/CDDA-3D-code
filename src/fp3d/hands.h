@@ -10,6 +10,7 @@
 // needs both hands or the left arm is broken. Nobody there (or someone friendly): a message, no time.
 
 #include <string>
+#include <vector>
 
 class avatar;
 class input_context;
@@ -22,6 +23,9 @@ bool is_hand_action( const std::string &action );
 bool hand_attack( avatar &u, const std::string &action );
 // True while an off-hand strike runs: Character::used_weapon() then gives the avatar no weapon.
 bool offhand_strike();
+// The eight direction names (UP ... LEFTUP) and the step of one; false for an unknown name.
+std::vector<std::string> hand_dir_names();
+bool hand_dir( const std::string &name, int &dx, int &dy );
 } // namespace fp3d
 
 #endif // CATA_SRC_FP3D_HANDS_H

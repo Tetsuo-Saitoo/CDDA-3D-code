@@ -19,6 +19,10 @@ class fp3d_game_access
         static bool load_game( game &g, const save_t &save ) {
             return g.load( save );
         }
+        // CDDA's examine of one square (doors, furniture, vehicles, items), as the examine action does it.
+        static void examine( game &g, const tripoint_bub_ms &p ) {
+            g.examine( p );
+        }
         // game::save() plus the counters quicksave() resets. Run it at the main loop, like quicksave.
         static bool save_game( game &g ) {
             if( !g.save() ) {

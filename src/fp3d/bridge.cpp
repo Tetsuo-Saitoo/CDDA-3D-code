@@ -348,7 +348,7 @@ size_t queued_actions()
     return chan().actions.size();
 }
 
-void pace_turn( bool fast_forward )
+void pace_turn( bool fast_forward, bool watched )
 {
     channel &c = chan();
     std::unique_lock<std::mutex> lk( c.m );
@@ -361,7 +361,7 @@ void pace_turn( bool fast_forward )
             c.cv.wait( lk );
             continue;
         }
-        if( c.clock.mode == clock_mode::turn_based || fast_forward ) {
+        if( !watched && ( c.clock.mode == clock_mode::turn_based || fast_forward ) ) {
             paced_until.reset();
             break;
         }

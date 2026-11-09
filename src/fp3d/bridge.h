@@ -130,7 +130,8 @@ void set_paused( bool paused );          // client side; clears the reason
 // Sim side. Pauses with a reason (e.g. a monster came into view); only in real time.
 void auto_pause( const std::string &reason );
 // Sim side, at every turn advance: blocks while paused and paces real time. Throws shutdown_signal.
-void pace_turn( bool fast_forward );
+// `watched`: paced in real time in both modes, for an activity the player watches happen (a liquid fill).
+void pace_turn( bool fast_forward, bool watched = false );
 
 // Action queue (block B5). The client can send main-loop actions (names from a timed request's `actions`) at
 // any time instead of catching each timed request: the sim takes one per timed request, before waiting for an
