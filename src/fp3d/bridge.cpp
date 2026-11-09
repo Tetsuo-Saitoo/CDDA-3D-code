@@ -71,6 +71,8 @@ const char *kind_name( request_kind k )
             return "item_multi";
         case request_kind::direction:
             return "direction";
+        case request_kind::chargen:
+            return "chargen";
         case request_kind::target:
             return "target";
     }
@@ -144,6 +146,7 @@ ui_answer ask( ui_request req )
     }
     std::unique_lock<std::mutex> lk( c.m );
     req.id = c.next_id++;
+    const request_kind kind = req.kind;
     req.paused = c.clock.paused;
     req.pause_reason = c.clock.pause_reason;
     const uint64_t id = req.id;
@@ -195,7 +198,7 @@ ui_answer ask( ui_request req )
     ui_answer a = std::move( *c.reply );
     c.reply.reset();
     a.timed_out = false;
-    a.text = sanitize_text( a.text, max_answer_text );
+    a.text = sanitize_text( a.text, kind == request_kind::chargen ? max_answer_json : max_answer_text );
     a.action = sanitize_text( a.action, 128 );
     if( a.picks.size() > max_answer_picks ) {
         a.picks.resize( max_answer_picks );

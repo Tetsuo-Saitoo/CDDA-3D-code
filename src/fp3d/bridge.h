@@ -27,6 +27,7 @@ enum class request_kind : int {
     item_multi,   // pick entries with counts (pickup / drop selectors)
     direction,    // pick an adjacent square (choose_direction / choose_adjacent)
     target,       // pick a square, plus an action when aiming (look_around, target_ui)
+    chargen,      // create a character: `text` is the catalog JSON, the answer's `text` the choices JSON (chargen.h)
 };
 const char *kind_name( request_kind k );
 
@@ -85,6 +86,8 @@ struct shutdown_signal {};
 
 // Hard caps on client-supplied data (answers are untrusted) and on lists the sim sends.
 constexpr size_t max_answer_text = 1024;
+// The chargen answer is JSON (traits, skills, name ...): a larger cap for that kind only.
+constexpr size_t max_answer_json = 16384;
 constexpr size_t max_answer_picks = 4096;
 constexpr size_t max_candidates = 256;
 

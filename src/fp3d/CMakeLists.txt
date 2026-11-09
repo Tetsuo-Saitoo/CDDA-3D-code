@@ -5,7 +5,8 @@ target_sources(cataclysm-tiles-common PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/snapshot.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/events.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/id_tables.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/hands.cpp)
+    ${CMAKE_CURRENT_SOURCE_DIR}/hands.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/chargen.cpp)
 
 # Block B1: headless smoke test. Links the same object library as the game, opens no window.
 add_executable(fp3d-headless headless_smoke.cpp ${MESSAGES_CPP})
@@ -31,6 +32,11 @@ target_compile_definitions(fp3d-events-test PUBLIC SDL_MAIN_HANDLED)
 add_executable(fp3d-ids-test ids_test.cpp ${MESSAGES_CPP})
 target_link_libraries(fp3d-ids-test PRIVATE cataclysm-tiles-common)
 target_compile_definitions(fp3d-ids-test PUBLIC SDL_MAIN_HANDLED)
+
+# FP3D character creation: catalog, applying choices, refusing bad ones.
+add_executable(fp3d-chargen-test chargen_test.cpp ${MESSAGES_CPP})
+target_link_libraries(fp3d-chargen-test PRIVATE cataclysm-tiles-common)
+target_compile_definitions(fp3d-chargen-test PUBLIC SDL_MAIN_HANDLED)
 
 # The Godot GDExtension (repo root bridge/), built when it and bridge/godot-cpp are there. See docs/BUILD.md.
 set(FP3D_BRIDGE_DIR "${CMAKE_SOURCE_DIR}/../bridge" CACHE PATH "Folder of the Godot bridge (GDExtension)")
