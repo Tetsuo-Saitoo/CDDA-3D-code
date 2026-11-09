@@ -27,6 +27,7 @@ enum class request_kind : int {
     item_multi,   // pick entries with counts (pickup / drop selectors)
     direction,    // pick an adjacent square (choose_direction / choose_adjacent)
     target,       // pick a square, plus an action when aiming (look_around, target_ui)
+    world_setup,  // new world settings + mods: `text` is the catalog JSON, the answer's `text` the choices (worldgen.h)
     chargen,      // create a character: `text` is the catalog JSON, the answer's `text` the choices JSON (chargen.h)
 };
 const char *kind_name( request_kind k );

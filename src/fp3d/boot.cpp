@@ -25,6 +25,7 @@
 #include "type_id.h"
 #include "weather.h"
 #include "worldfactory.h"
+#include "fp3d/worldgen.h"
 
 #if defined(TILES)
 #include "sdl_wrappers.h"
@@ -86,17 +87,26 @@ void boot_common( bool headless )
 }
 } // namespace
 
-void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless )
+void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless, bool world_setup )
 {
     boot_common( headless );
+    // As CDDA's main menu: core data (option sliders among it) before a world is made or picked.
+    g->load_core_data();
     WORLD *world = nullptr;
     if( fresh_world ) {
         if( world_generator->has_world( world_name ) ) {
             world_generator->delete_world( world_name, true );
         }
-        world = world_generator->make_new_world( world_name, { mod_id( "dda" ) } );
-        if( world == nullptr ) {
-            throw std::runtime_error( "make_new_world failed" );
+        if( world_setup ) {
+            world = run_world_setup( world_name );
+            if( world == nullptr ) {
+                throw std::runtime_error( "world creation cancelled" );
+            }
+        } else {
+            world = world_generator->make_new_world( world_name, { mod_id( "dda" ) } );
+            if( world == nullptr ) {
+                throw std::runtime_error( "make_new_world failed" );
+            }
         }
     } else {
         // A new character in a world world_generator->init() found; ask for nothing it didn't find.
@@ -112,7 +122,6 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
     calendar::set_eternal_season( get_option<bool>( "ETERNAL_SEASON" ) );
     calendar::set_season_length( get_option<int>( "SEASON_LENGTH" ) );
 
-    g->load_core_data();
     g->load_world_modfiles();
     build_id_tables();
 

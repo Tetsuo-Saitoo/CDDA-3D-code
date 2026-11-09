@@ -13,6 +13,9 @@
 #include "debug.h"
 #include "fp3d/boot.h"
 #include "fp3d/chargen.h"
+#include "fp3d/worldgen.h"
+#include "mod_manager.h"
+#include "worldfactory.h"
 #include "json.h"
 #include "json_loader.h"
 #include "mutation.h"
@@ -166,6 +169,70 @@ int main()
         check( !fp3d::apply_chargen( u, "{\"scenario\":" ).empty(), "broken JSON refused" );
         check( !fp3d::apply_chargen( u, "" ).empty(), "empty answer refused" );
         check( !fp3d::apply_chargen( u, std::string( 20000, ' ' ) ).empty(), "oversized answer refused" );
+        // World setup: settings and mods.
+        {
+            JsonValue wr = json_loader::from_string( fp3d::world_setup_catalog_json() );
+            JsonObject wo = wr.get_object();
+            wo.allow_omitted_members();
+            check( wo.get_array( "sliders" ).size() >= 3 && wo.get_array( "mods" ).size() > 5,
+                   "world setup catalog lists settings and mods" );
+            std::string dep_mod;
+            for( const mod_id &m : world_generator->get_mod_manager().get_usable_mods() ) {
+                if( m.is_valid() && !m->core && !m->obsolete && !m->dependencies.empty() &&
+                    m->conflicts.empty() ) {
+                    dep_mod = m.str();
+                    break;
+                }
+            }
+            options_manager::options_container opts;
+            std::vector<mod_id> mods;
+            // A slider at its top level, and the first shown bool setting flipped.
+            JsonObject sl = wo.get_array( "sliders" ).get_object( 0 );
+            sl.allow_omitted_members();
+            const std::string sl_id = sl.get_string( "id" );
+            const int top = static_cast<int>( sl.get_array( "levels" ).size() ) - 1;
+            std::string bool_id;
+            bool bool_was = false;
+            for( JsonObject o : wo.get_array( "options" ) ) {
+                o.allow_omitted_members();
+                if( bool_id.empty() && o.get_string( "type" ) == "bool" ) {
+                    bool_id = o.get_string( "id" );
+                    bool_was = o.get_bool( "value" );
+                }
+            }
+            options_manager::options_container plain = get_options().get_world_defaults();
+            for( const option_slider &osl : option_slider::get_all() ) {
+                if( osl.context() == "WORLDGEN" ) {
+                    osl.apply_opts( osl.id.str() == sl_id ? top : osl.default_level(), plain );
+                }
+            }
+            std::string w = fp3d::apply_world_setup( "{\"sliders\":{\"" + sl_id + "\":" + std::to_string( top ) +
+                            "},\"options\":{\"" + bool_id + "\":" + ( bool_was ? "false" : "true" ) + "},"
+                            "\"mods\":[\"" + dep_mod + "\"]}", opts, mods );
+            bool same = true;
+            for( const auto &kv : plain ) {
+                if( kv.first != bool_id && opts[kv.first].getValue() != kv.second.getValue() ) {
+                    same = false;
+                }
+            }
+            check( w.empty() && same && opts[bool_id].value_as<bool>() != bool_was &&
+                   !mods.empty() && mods.front()->core && mods.back().str() == dep_mod,
+                   "settings applied, core and dependencies added first", w + " " + dep_mod );
+            check( !fp3d::apply_world_setup( "{\"sliders\":{\"" + sl_id + "\":99}}", opts, mods ).empty(),
+                   "slider level out of range refused" );
+            check( !fp3d::apply_world_setup( "{\"sliders\":{\"nope\":0}}", opts, mods ).empty(),
+                   "unknown slider refused" );
+            check( !fp3d::apply_world_setup( "{\"options\":{\"CITY_SIZE\":4}}", opts, mods ).empty(),
+                   "hidden setting refused (sliders set it)" );
+            check( !fp3d::apply_world_setup( "{\"options\":{\"" + bool_id + "\":\"x\"}}", opts, mods ).empty(),
+                   "setting of the wrong type refused" );
+            check( !fp3d::apply_world_setup( "{\"options\":{\"USE_TILES\":true}}", opts, mods ).empty(),
+                   "non-world option refused" );
+            check( !fp3d::apply_world_setup( "{\"mods\":[\"no_such_mod\"]}", opts, mods ).empty(),
+                   "unknown mod refused" );
+            check( !fp3d::apply_world_setup( "{\"mods\":[]}", opts, mods ).empty(), "no core mod refused" );
+            check( fp3d::apply_world_setup( "{}", opts, mods ).empty() && !mods.empty(), "defaults when omitted" );
+        }
     } catch( const std::exception &e ) {
         std::printf( "error: %s\n", e.what() );
         return EXIT_FAILURE;
