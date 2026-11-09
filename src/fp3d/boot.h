@@ -32,6 +32,10 @@ void boot_saved_game( const std::string &world_name, const std::string &save_nam
 // afterwards only go to the log.
 void shutdown_world();
 
+// Saves the game the client asked for (fp3d::request_save), on the sim thread at the main loop, and records the
+// result with note_saved(); the message log says how it went. Does nothing if no save was asked for.
+void run_save();
+
 // Loads the reality bubble centred on the nearest city and puts the avatar in its middle.
 // Returns the bubble origin (absolute submap).
 tripoint_abs_sm load_bubble_in_town();
