@@ -38,6 +38,7 @@
 #include "map.h"
 #include "mapdata.h"
 #include "messages.h"
+#include "monster.h"
 #include "npc.h"
 #include "rng.h"
 #include "type_id.h"
@@ -57,6 +58,8 @@ const itype_id itype_gasoline( "gasoline" );
 const itype_id itype_hose( "hose" );
 const itype_id itype_jerrycan( "jerrycan" );
 const itype_id itype_water( "water" );
+const itype_id itype_glock_19( "glock_19" );
+const itype_id itype_9mm( "9mm" );
 const ter_str_id ter_t_water_sh( "t_water_sh" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
@@ -81,6 +84,8 @@ struct observed {
     int tank_ml = -1;        // gasoline left in the vehicle north (-1 no vehicle)
     int puddle = 0;          // charges of water lying south
     int hoses = 0;           // hoses carried (wielded included)
+    int ammo = -1;           // shoot check: rounds in the wielded gun (-1 nothing wielded)
+    int zombie_hp = -1;      // hp of the first monster (-1 none)
     std::vector<std::string> messages;
 };
 std::mutex observed_mutex;
@@ -92,7 +97,8 @@ std::atomic<bool> spawn_zombie{ false };
 // an empty jerrycan carried and a one-tile vehicle north with 4 L of gasoline in a small tank, 4 = a zombie west,
 // 5 = zombies gone and a spare hose carried, 6 = the spare hose dropped here, 7 = picked up again, 8 = the jerrycan
 // wielded (the hose in hand gone), 9 = shallow water east and a puddle of 2 L of water south, 10 = a new empty
-// jerrycan wielded. Done on the sim thread right before its next request.
+// jerrycan wielded, 11 = a zombie 3 squares west and a loaded pistol in hand. Done on the sim thread right
+// before its next request.
 std::atomic<int> hand_setup{ 0 };
 
 void observe()
@@ -181,6 +187,14 @@ void observe()
         case 10:
             get_avatar().set_wielded_item( item( itype_jerrycan ) );
             break;
+        case 11: {
+            g->clear_zombies();
+            g->place_critter_at( mon_zombie, p + tripoint_rel_ms( -3, 0, 0 ) );
+            item gun( itype_glock_19 );
+            gun.ammo_set( itype_9mm, 15 );
+            get_avatar().set_wielded_item( gun );
+            break;
+        }
         default:
             break;
     }
@@ -220,6 +234,13 @@ void observe()
         }
     }
     o.hoses = u.amount_of( itype_hose );
+    if( const item_location w = u.get_wielded_item() ) {
+        o.ammo = w->ammo_remaining();
+    }
+    for( monster &m : g->all_monsters() ) {
+        o.zombie_hp = m.get_hp();
+        break;
+    }
     o.rocks_carried = u.amount_of( itype_rock );
     o.loads = loads.load();
     for( const auto &m : Messages::recent_messages( 6 ) ) {
@@ -799,6 +820,72 @@ static bool run_siphon_checks()
     return failed == 0;
 }
 
+// Shooting a zombie with a loaded pistol: "fire" opens CDDA's target_ui, which asks the client; FIRE at the
+// zombie shoots once (it crashed here: aim modes unset headless), then CDDA aims again for the next shot;
+// cancelling that goes back to the main loop.
+static bool run_shoot_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  shoot: %-36s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 11;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const observed before = snapshot();
+    check( r && r->timed && before.ammo == 15 && before.zombie_hp > 0, "scene: loaded pistol, zombie west",
+           "ammo " + std::to_string( before.ammo ) + " hp " + std::to_string( before.zombie_hp ) );
+    if( !r ) {
+        return false;
+    }
+    fp3d::queue_action( "fire" );
+    int targets = 0;
+    int others = 0;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::optional<fp3d::ui_request> cur = fp3d::wait_request( 20000, r->id );
+    while( cur && !cur->timed && targets < 20 && others < 20 &&
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 60 ) ) {
+        fp3d::ui_answer a;
+        a.id = cur->id;
+        std::string note;
+        if( cur->kind == fp3d::request_kind::target && targets++ == 0 ) {
+            a.pos = fp3d::ui_point{ cur->origin.x - 3, cur->origin.y, cur->origin.z };
+            a.action = "FIRE";
+            note = cur->mode + " " + cur->status + " -> zombie FIRE";
+        } else if( cur->kind == fp3d::request_kind::target ) {
+            a.cancel = true;
+            note = cur->mode + " again -> cancel";
+        } else if( cur->kind == fp3d::request_kind::popup && !cur->actions.empty() ) {
+            others++;
+            a.action = has( cur->actions, "YES" ) ? "YES" : cur->actions.front();
+            note = a.action + " (" + cur->text.substr( 0, 60 ) + ")";
+        } else {
+            others++;
+            a.cancel = true;
+            note = "cancel (" + cur->text.substr( 0, 60 ) + ")";
+        }
+        print_request( *cur, note );
+        fp3d::answer( a );
+        const auto id = cur->id;
+        cur = fp3d::wait_request( 20000, id );
+    }
+    const observed after = snapshot();
+    check( cur && cur->timed, "back in the main loop", std::to_string( targets ) + " target, " +
+           std::to_string( others ) + " other requests" + ( cur ? "" : ", no request (stuck or crashed)" ) );
+    check( targets == 2 && others == 0, "aim, fire, aim again, cancel", std::to_string( targets ) +
+           " target requests" );
+    check( after.ammo == before.ammo - 1, "one shot fired", "ammo " + std::to_string( before.ammo ) + " -> " +
+           std::to_string( after.ammo ) );
+    std::printf( "  shoot: zombie hp %d -> %d\n", before.zombie_hp, after.zombie_hp );
+    return failed == 0;
+}
+
 static bool run_queue_checks()
 {
     int failed = 0;
@@ -952,6 +1039,7 @@ int main()
     const bool queue_ok = g_idx == n_goals && run_queue_checks();
     const bool hands_ok = queue_ok && run_hand_checks();
     const bool siphon_ok = hands_ok && run_siphon_checks();
+    const bool shoot_ok = siphon_ok && run_shoot_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -983,6 +1071,8 @@ int main()
     std::printf( "queue: %s\n", queue_ok ? "ok" : "BAD" );
     std::printf( "hands: %s\n", hands_ok ? "ok" : "BAD" );
     std::printf( "siphon: %s\n", siphon_ok ? "ok" : "BAD" );
-    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && hands_ok && siphon_ok ?
+    std::printf( "shoot: %s\n", shoot_ok ? "ok" : "BAD" );
+    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && hands_ok && siphon_ok &&
+           shoot_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

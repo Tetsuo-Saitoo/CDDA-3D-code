@@ -268,6 +268,8 @@ class target_ui
         target_handler::trajectory run();
         // FP3D: one `target` request in place of reading a key; may move the cursor; "" = ask again
         std::string fp3d_ask();
+        // FP3D: the aim modes init_window_and_input() sets up; headless, its resize callback never runs
+        void fp3d_init_aim();
 
         // returns the currently selected aim type (immediate/careful/precise etc)
         aim_type get_selected_aim_type() const;
@@ -2715,6 +2717,9 @@ target_handler::trajectory target_ui::run()
     ui.on_redraw( [&]( const ui_adaptor & ) {
         draw_ui_window();
     } );
+    if( fp3d::active() ) { // FP3D: else FIRE reads aim_mode in an empty list (crash on the first shot)
+        fp3d_init_aim();
+    }
 
     // Handle multi-turn aiming
     std::string action;
@@ -3010,6 +3015,20 @@ std::string target_ui::fp3d_ask()
         return a.action;
     }
     return "";
+}
+
+void target_ui::fp3d_init_aim()
+{
+    if( mode != TargetMode::Fire || relevant == nullptr ) {
+        return;
+    }
+    aim_types = you->get_aim_types( *relevant );
+    aim_mode = aim_types.begin();
+    for( auto it = aim_types.begin(); it != aim_types.end(); ++it ) {
+        if( you->preferred_aiming_mode == it->action ) {
+            aim_mode = it;
+        }
+    }
 }
 
 void target_ui::init_window_and_input()
