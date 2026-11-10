@@ -4,9 +4,13 @@
 
 // FP3D L8/E6: handles for single items and menu-free item actions (bridge.h `item_action`): take one item from a
 // square (into the inventory, the main hand or the off hand), put a carried item into a container (a worn or held
-// one, or one lying in reach, into CDDA's best pocket or a given one), drop or place it on a square. Each action
-// finds its items again by handle, square and itype, uses CDDA's rules (pockets, weight, volume, wielding) and move
-// costs, and refuses with a message saying why.
+// one, or one lying in reach, into CDDA's best pocket or a given one), drop or place it on a square, unload a gun or
+// magazine (carried or in reach; what comes out goes to the inventory, the main hand or the off hand), reload a
+// carried gun or magazine with given ammo or a given magazine (carried or in reach). Each action finds its items
+// again by handle, square and itype, uses CDDA's rules (pockets, weight, volume, wielding, what loads into what)
+// and move costs, and refuses with a message saying why. Nothing is ever asked: where CDDA would show a menu, the
+// choice is fixed (unload: the item itself, then its gunmods in order; reload: the first part CDDA's reload menu
+// lists that takes the ammo now) or the action is refused (liquids to pour, a loaded item outgrowing its pocket).
 //
 // Handle: a uid in the item var `fp3d_uid` (decimal text, 1 .. max_item_uid), given the first time a snapshot
 // lists the item. Saves keep it and CDDA's stacking ignores it (item.cpp). A copy made by splitting a stack

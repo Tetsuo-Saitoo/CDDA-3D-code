@@ -73,6 +73,9 @@ const itype_id itype_jerrycan( "jerrycan" );
 const itype_id itype_water( "water" );
 const itype_id itype_glock_19( "glock_19" );
 const itype_id itype_9mm( "9mm" );
+const itype_id itype_glockmag( "glockmag" );
+const itype_id itype_223( "223" );
+const itype_id itype_plastic_bag_vac( "plastic_bag_vac" );
 const itype_id itype_bag_plastic( "bag_plastic" );
 const itype_id itype_bottle_plastic( "bottle_plastic" );
 const itype_id itype_1l_gold( "1l_gold" );
@@ -120,6 +123,13 @@ struct observed {
     int torso_hp_lost = -1;  // ... hp the torso lost to a 10 damage hit (-1: not probed)
     int kit_guns = 0;        // ... carried Glock 19, Remington 870 and SCAR-L with ammo loaded
     bool big_pack = false;   // ... the kit's big backpack, worn (or carried when CDDA won't let it be worn)
+    // Gun item checks: every carried item with a handle, its rounds loaded (-1: not a gun or magazine) and charges.
+    struct carried_count {
+        uint64_t uid = 0;
+        int ammo = -1;
+        int charges = 0;
+    };
+    std::vector<carried_count> counts;
     std::vector<std::string> messages;
 };
 std::mutex observed_mutex;
@@ -141,7 +151,8 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 // rocks, a plastic bottle and a plastic bag west, a rock 3 squares west, a rock with a hostile save's handle and
 // spot north-west, 1 L of gold and a bottle of water carried, 13 = cooking checks (run_cooking_checks): a
 // fireplace with a fire and a pot of 1 L of water south-west, an unlit wood stove south-east, a pot of raw meat 2
-// west 1 north, a rock 2 west 1 south, a pot 8 west (out of reach), a pot put 2 west 2 south and taken away again.
+// west 1 north, a rock 2 west 1 south, a pot 8 west (out of reach), a pot put 2 west 2 south and taken away again,
+// 16 = gun item checks (run_gun_item_checks; see the case below).
 // Done on the sim thread right before its next request.
 std::atomic<int> hand_setup{ 0 };
 // Cooking checks: what scene 14 left for the driver (sim thread writes, driver reads).
@@ -150,6 +161,15 @@ std::atomic<uint64_t> cook_gone_uid{ 0 };     // the pot taken away again (a sta
 std::atomic<double> cook_capture_ms{ 0 };     // one full capture of the scene
 std::atomic<double> cook_heat_ms{ 0 };        // the heat and cookware part of it
 std::atomic<size_t> cook_heat_squares{ 0 };   // squares it built a crafting inventory for
+// Gun item checks: the handles scene 16 gave (sim thread writes, driver reads).
+std::atomic<uint64_t> gun_glock_uid{ 0 };      // a carried Glock 19 with a full magazine
+std::atomic<uint64_t> gun_spare_uid{ 0 };      // a carried empty Glock magazine
+std::atomic<uint64_t> gun_9mm_uid{ 0 };        // carried loose 9 mm
+std::atomic<uint64_t> gun_223_uid{ 0 };        // 10 carried .223
+std::atomic<uint64_t> gun_sealed_uid{ 0 };     // 10 9 mm in a sealed vacuum bag
+std::atomic<uint64_t> gun_far_glock_uid{ 0 };  // a loaded Glock 3 squares west
+std::atomic<uint64_t> gun_far_9mm_uid{ 0 };    // 5 9 mm 3 squares west
+std::atomic<uint64_t> gun_near_9mm_uid{ 0 };   // 5 9 mm 1 square west
 
 void observe()
 {
@@ -364,6 +384,59 @@ void observe()
             here.ter_set( s + tripoint_rel_ms( 0, 0, -1 ), ter_t_stairs_up );
             break;
         }
+        case 16: {
+            // Empty hands, nothing lying around but a loaded Glock 19 and 5 rounds of 9 mm 3 squares west (out of
+            // reach) and 5 rounds 1 square west. Carried: a Glock 19 with a full magazine, an empty Glock magazine,
+            // 30 loose 9 mm, 10 .223, 10 9 mm in a sealed vacuum bag.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -4; dx <= 4; dx++ ) {
+                for( int dy = -4; dy <= 4; dy++ ) {
+                    here.i_clear( p + tripoint_rel_ms( dx, dy, 0 ) );
+                }
+            }
+            u.remove_weapon();
+            const auto loaded_glock = []() {
+                item mag( itype_glockmag );
+                mag.ammo_set( itype_9mm, 15 );
+                item gun( itype_glock_19 );
+                gun.put_in( mag, pocket_type::MAGAZINE_WELL );
+                return gun;
+            };
+            const auto handle = []( item_location loc ) {
+                return loc ? fp3d::item_handle( *loc ) : 0;
+            };
+            gun_glock_uid = handle( u.i_add( loaded_glock() ) );
+            gun_spare_uid = handle( u.i_add( item( itype_glockmag ) ) );
+            gun_9mm_uid = handle( u.i_add( item( itype_9mm, calendar::turn, 30 ) ) );
+            gun_223_uid = handle( u.i_add( item( itype_223, calendar::turn, 10 ) ) );
+            item bag( itype_plastic_bag_vac );
+            bag.put_in( item( itype_9mm, calendar::turn, 10 ), pocket_type::CONTAINER );
+            for( item_pocket *pk : bag.get_all_contained_pockets() ) {
+                pk->seal();
+            }
+            item_location sealed = u.i_add( bag );
+            uint64_t sealed_uid = 0;
+            if( sealed ) {
+                for( item *in : sealed->all_items_top( pocket_type::CONTAINER ) ) {
+                    sealed_uid = fp3d::item_handle( *in );
+                }
+            }
+            gun_sealed_uid = sealed_uid;
+            const tripoint_bub_ms far_sq = p + tripoint_rel_ms( -3, 0, 0 );
+            here.ter_set( far_sq, ter_t_floor );
+            here.furn_set( far_sq, furn_str_id::NULL_ID() );
+            item &far_gun = here.add_item( far_sq, loaded_glock() );
+            gun_far_glock_uid = far_gun.is_null() ? 0 : fp3d::item_handle( far_gun );
+            item &far_ammo = here.add_item( far_sq, item( itype_9mm, calendar::turn, 5 ) );
+            gun_far_9mm_uid = far_ammo.is_null() ? 0 : fp3d::item_handle( far_ammo );
+            const tripoint_bub_ms near_sq = p + tripoint_rel_ms( -1, 0, 0 );
+            here.ter_set( near_sq, ter_t_floor );
+            here.furn_set( near_sq, furn_str_id::NULL_ID() );
+            item &near_ammo = here.add_item( near_sq, item( itype_9mm, calendar::turn, 5 ) );
+            gun_near_9mm_uid = near_ammo.is_null() ? 0 : fp3d::item_handle( near_ammo );
+            break;
+        }
         default:
             break;
     }
@@ -452,6 +525,17 @@ void observe()
     // Block B3: the client reads this snapshot while the sim waits for the answer.
     fp3d::publish_snapshot( fp3d::capture_snapshot() );
     fp3d::publish_held();   // as the bridge's hook does
+    // After the capture: items that just came out of something have their handles now.
+    for( const item_location &loc : get_avatar().all_items_loc() ) {
+        const uint64_t uid = fp3d::read_item_handle( *loc );
+        if( uid != 0 ) {
+            observed::carried_count c;
+            c.uid = uid;
+            c.ammo = loc->is_gun() || loc->is_magazine() ? loc->ammo_remaining() : -1;
+            c.charges = loc->count_by_charges() ? loc->charges : 1;
+            o.counts.push_back( c );
+        }
+    }
     std::lock_guard<std::mutex> lk( observed_mutex );
     last_observed = o;
 }
@@ -2116,6 +2200,234 @@ static bool run_cheat_checks()
     return failed == 0;
 }
 
+// Unload and reload by handle (fp3d/item_hands.h, 2026-11-10): a gun's magazine out into a hand, a magazine's rounds
+// into the pack, a magazine loaded from loose rounds and from rounds lying in reach, the gun loaded with it. Refusals
+// (incompatible ammo, itself, nothing loaded, out of reach, sealed, gone) say why, spend nothing and change nothing;
+// malformed requests never get queued.
+static bool run_gun_item_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  guns: %-44s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct result {
+        bool back = false;       // in the main loop again (no menu came up)
+        int spent = 0;           // moves
+        std::string msg;         // the last message
+    };
+    const auto run = [&]( const fp3d::item_action & ia ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            res.msg = "<no main loop>";
+            return res;
+        }
+        const observed o0 = snapshot();
+        fp3d::drain_events( evs );
+        evs.clear();
+        if( !fp3d::queue_item_action( ia ) ) {
+            res.msg = "<not queued>";
+            return res;
+        }
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 60000, r0->id );
+        fp3d::drain_events( evs );
+        const observed o1 = snapshot();
+        res.back = r1 && r1->timed;
+        res.spent = static_cast<int>( o1.turn - o0.turn ) * o0.speed + o0.moves - o1.moves;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msg = e.text;
+            }
+        }
+        return res;
+    };
+    const auto has = []( const std::string & s, const char *part ) {
+        return s.find( part ) != std::string::npos;
+    };
+    const auto show = []( const result & r ) {
+        return "[" + r.msg + "] " + std::to_string( r.spent ) + " moves";
+    };
+    const auto type_of = []( const char *id ) {
+        return fp3d::intern_id( fp3d::id_kind::itype, id );
+    };
+    // The carried item with this handle (uid 0: not carried, or inside a gun or magazine).
+    const auto count_of = []( uint64_t uid ) {
+        for( const observed::carried_count &c : snapshot().counts ) {
+            if( c.uid == uid ) {
+                return c;
+            }
+        }
+        return observed::carried_count();
+    };
+    const auto held_uid = []( uint32_t type, uint8_t flag ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.type == type && ( c.flags & flag ) ) {
+                return c.uid;
+            }
+        }
+        return uint64_t{ 0 };
+    };
+    const auto lying_at = []( const fp3d::ui_point & p, uint64_t uid ) {
+        for( const fp3d::item_handle_view &h : handles_at( p ) ) {
+            if( h.uid == uid ) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 16;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    const fp3d::ui_point west{ here.x - 1, here.y, here.z };
+    const fp3d::ui_point far_west{ here.x - 3, here.y, here.z };
+    const uint32_t t_glock = type_of( "glock_19" );
+    const uint32_t t_mag = type_of( "glockmag" );
+    const uint32_t t_9mm = type_of( "9mm" );
+    const uint32_t t_223 = type_of( "223" );
+    const uint64_t glock = gun_glock_uid;
+    const uint64_t spare = gun_spare_uid;
+    const uint64_t nine = gun_9mm_uid;
+    const uint64_t rifle_rounds = gun_223_uid;
+    const uint64_t sealed = gun_sealed_uid;
+    const uint64_t far_glock = gun_far_glock_uid;
+    const uint64_t far_9mm = gun_far_9mm_uid;
+    const uint64_t near_9mm = gun_near_9mm_uid;
+    check( glock != 0 && spare != 0 && nine != 0 && rifle_rounds != 0 && sealed != 0 && far_glock != 0 &&
+           far_9mm != 0 && near_9mm != 0 && count_of( glock ).ammo == 15 && count_of( spare ).ammo == 0 &&
+           count_of( sealed ).charges == 10 && !fp3d::latest_held().main.held, "scene",
+           "glock " + std::to_string( count_of( glock ).ammo ) + " rounds" );
+
+    // The bridge refuses malformed requests before they reach the game.
+    fp3d::item_action ul;
+    ul.op = fp3d::item_op::unload;
+    ul.item = { glock, t_glock };
+    ul.hand = fp3d::item_hand::main;
+    fp3d::item_action rl;
+    rl.op = fp3d::item_op::reload;
+    rl.item = { spare, t_mag };
+    rl.container = { nine, t_9mm };
+    fp3d::item_action no_ammo = rl;
+    no_ammo.container = {};
+    fp3d::item_action ammo_big = rl;
+    ammo_big.container.uid = fp3d::max_item_uid + 1;
+    fp3d::item_action ammo_untyped = rl;
+    ammo_untyped.container.type = 0;
+    fp3d::item_action target_zero = rl;
+    target_zero.item.uid = 0;
+    fp3d::item_action unload_big = ul;
+    unload_big.item.uid = fp3d::max_item_uid + 1;
+    fp3d::item_action bad_op = ul;
+    bad_op.op = static_cast<fp3d::item_op>( 5 );
+    fp3d::item_action bad_hand = ul;
+    bad_hand.hand = static_cast<fp3d::item_hand>( 3 );
+    check( !fp3d::queue_item_action( no_ammo ) && !fp3d::queue_item_action( ammo_big ) &&
+           !fp3d::queue_item_action( ammo_untyped ) && !fp3d::queue_item_action( target_zero ) &&
+           !fp3d::queue_item_action( unload_big ) && !fp3d::queue_item_action( bad_op ) &&
+           !fp3d::queue_item_action( bad_hand ), "malformed unload and reload refused by the bridge", "" );
+
+    // Unload: the gun's magazine into the main hand; its rounds into the pack; nothing left to unload.
+    result res = run( ul );
+    const uint64_t mag = held_uid( t_mag, fp3d::carried_wielded );
+    check( res.back && res.spent > 0 && fp3d::latest_held().main.id == "glockmag" && count_of( glock ).ammo == 0 &&
+           mag != 0 && count_of( mag ).ammo == 15, "unload: a gun's magazine into the main hand", show( res ) );
+    fp3d::item_action ul_mag = ul;
+    ul_mag.item = { mag, t_mag };
+    ul_mag.hand = fp3d::item_hand::pack;
+    const int loose0 = snapshot().carried_9mm;
+    res = run( ul_mag );
+    const int loose1 = snapshot().carried_9mm;
+    check( res.back && res.spent > 0 && count_of( mag ).ammo == 0 && loose1 == loose0 + 15,
+           "unload: a magazine's rounds into the pack", std::to_string( loose0 ) + " -> " + std::to_string( loose1 ) +
+           " loose " + show( res ) );
+    fp3d::item_action ul_spare = ul;
+    ul_spare.item = { spare, t_mag };
+    res = run( ul_spare );
+    check( res.back && res.spent == 0 && has( res.msg, "isn't loaded" ) && count_of( spare ).ammo == 0,
+           "unload: nothing loaded", show( res ) );
+
+    // Reload: the magazine (in hand) with loose rounds, then the gun with the magazine.
+    const int nine0 = count_of( nine ).charges;
+    fp3d::item_action rl_mag = rl;
+    rl_mag.item = { mag, t_mag };
+    res = run( rl_mag );
+    const int in_mag = count_of( mag ).ammo;
+    const int nine1 = count_of( nine ).charges;
+    check( res.back && res.spent > 0 && nine0 >= 15 && in_mag == 15 && nine1 == nine0 - 15,
+           "reload: a magazine with loose rounds", std::to_string( nine0 ) + " -> " + std::to_string( nine1 ) +
+           " loose, " + std::to_string( in_mag ) + " in the magazine " + show( res ) );
+    fp3d::item_action rl_gun = rl;
+    rl_gun.item = { glock, t_glock };
+    rl_gun.container = { mag, t_mag };
+    res = run( rl_gun );
+    check( res.back && res.spent > 0 && count_of( glock ).ammo == 15 && count_of( mag ).uid == 0 &&
+           !fp3d::latest_held().main.held, "reload: the gun with that magazine",
+           std::to_string( count_of( glock ).ammo ) + " in the gun " + show( res ) );
+
+    // Refusals: each says why, spends nothing, changes nothing.
+    fp3d::item_action rl_223 = rl;
+    rl_223.container = { rifle_rounds, t_223 };
+    res = run( rl_223 );
+    check( res.back && res.spent == 0 && has( res.msg, "can't reload" ) && count_of( spare ).ammo == 0 &&
+           count_of( rifle_rounds ).charges == 10, "reload: .223 into a 9 mm magazine", show( res ) );
+    fp3d::item_action rl_self = rl;
+    rl_self.container = { spare, t_mag };
+    res = run( rl_self );
+    check( res.back && res.spent == 0 && has( res.msg, "itself" ) && count_of( spare ).ammo == 0,
+           "reload: a magazine with itself", show( res ) );
+    fp3d::item_action ul_far = ul;
+    ul_far.item = { far_glock, t_glock };
+    ul_far.pos = far_west;
+    ul_far.hand = fp3d::item_hand::pack;
+    res = run( ul_far );
+    check( res.back && res.spent == 0 && has( res.msg, "can't reach" ) && lying_at( far_west, far_glock ),
+           "unload: a gun 3 squares away", show( res ) );
+    fp3d::item_action rl_far = rl;
+    rl_far.container = { far_9mm, t_9mm };
+    rl_far.pos = far_west;
+    res = run( rl_far );
+    check( res.back && res.spent == 0 && has( res.msg, "can't reach" ) && count_of( spare ).ammo == 0 &&
+           lying_at( far_west, far_9mm ), "reload: rounds 3 squares away", show( res ) );
+    fp3d::item_action rl_sealed = rl;
+    rl_sealed.container = { sealed, t_9mm };
+    res = run( rl_sealed );
+    check( res.back && res.spent == 0 && has( res.msg, "sealed" ) && count_of( spare ).ammo == 0 &&
+           count_of( sealed ).charges == 10, "reload: rounds in a sealed bag", show( res ) );
+    fp3d::item_action rl_gone = rl;
+    rl_gone.container = { 0x5eed, t_9mm };
+    rl_gone.pos = here;
+    res = run( rl_gone );
+    check( res.back && res.spent == 0 && has( res.msg, "isn't there" ) && count_of( spare ).ammo == 0,
+           "reload: ammo that isn't there", show( res ) );
+
+    // Reload from rounds lying in reach; unload into the off hand.
+    fp3d::item_action rl_near = rl;
+    rl_near.container = { near_9mm, t_9mm };
+    rl_near.pos = west;
+    res = run( rl_near );
+    check( res.back && res.spent > 0 && count_of( spare ).ammo == 5 && !lying_at( west, near_9mm ),
+           "reload: a magazine with rounds lying in reach", show( res ) );
+    fp3d::item_action ul_off = ul;
+    ul_off.hand = fp3d::item_hand::off;
+    res = run( ul_off );
+    check( res.back && res.spent > 0 && fp3d::latest_held().off.id == "glockmag" && count_of( glock ).ammo == 0,
+           "unload: a gun's magazine into the off hand", show( res ) );
+    return failed == 0;
+}
+
 int main()
 {
     std::setvbuf( stdout, nullptr, _IONBF, 0 );
@@ -2214,6 +2526,7 @@ int main()
     const bool cooking_ok = items_ok && run_cooking_checks();
     const bool cheats_ok = cooking_ok && run_cheat_checks();
     const bool stairs_ok = cheats_ok && run_stairs_checks();
+    const bool guns_ok = stairs_ok && run_gun_item_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -2251,10 +2564,11 @@ int main()
     std::printf( "cooking: %s\n", cooking_ok ? "ok" : "BAD" );
     std::printf( "cheats: %s\n", cheats_ok ? "ok" : "BAD" );
     std::printf( "stairs: %s\n", stairs_ok ? "ok" : "BAD" );
+    std::printf( "guns: %s\n", guns_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
-           shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && worlds_ok ?
+           shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && worlds_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }
