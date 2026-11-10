@@ -3065,7 +3065,7 @@ std::string target_ui::fp3d_ask()
         p.gun = relevant;
         p.target = here.get_abs( dst );
         p.range = range;
-        p.targets = fp3d::shot_targets( dst_critter, targets );   // after the answer moved the cursor
+        fp3d::set_shot_targets( p, dst_critter, targets );   // after the answer moved the cursor
         fp3d::set_shot_plan( p );
     }
     return a.action;

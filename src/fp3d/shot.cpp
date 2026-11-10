@@ -48,6 +48,7 @@ std::atomic<uint64_t> n_accepted{ 0 };
 std::atomic<uint64_t> n_refused{ 0 };
 std::atomic<uint64_t> n_planned{ 0 };
 std::atomic<uint64_t> n_parts{ 0 };
+std::atomic<uint64_t> n_spared{ 0 };
 
 constexpr double fire_line_tiles = 1.0;     // a FIRE answer's outcome: off the line to the aimed square
 constexpr double shot_line_tiles = 1.5;     // a shot answer: off CDDA's deviated line
@@ -75,10 +76,10 @@ bool near_line( const tripoint_bub_ms &source, const tripoint_bub_ms &p, double 
     return px * ux + py * uy > 0.0 && std::abs( px * uy - py * ux ) <= max_off;
 }
 
-// A hit must name a creature the request offered (the cursor creature or a candidate) that is alive and seen
-// now; it stops at that creature's square. A miss's `end_abs` only gives a distance along CDDA's line
-// (miss_outcome). Either square must be on the shooter's level, in the bubble, within the gun's range and near the
-// line.
+// A hit must name a creature the request offered (the cursor creature or a hostile candidate) that is alive, seen
+// and, unless it is the cursor creature, still hostile now; it stops at that creature's square. A miss's
+// `end_abs` is only checked (CDDA keeps the path). Either square must be on the shooter's level, in the bubble,
+// within the gun's range and near the line.
 std::optional<claim> check_claim( map &here, const Character &you, const shot_plan &p,
                                   const tripoint_bub_ms &source, double ux, double uy, double max_off,
                                   uint64_t hit_uid, const tripoint_abs_ms &end_abs, double quality,
@@ -97,7 +98,8 @@ std::optional<claim> check_claim( map &here, const Character &you, const shot_pl
         const Creature *hit = g->get_creature_if( [hit_uid]( const Creature & cr ) {
             return !cr.is_avatar() && creature_uid( cr ) == hit_uid;
         } );
-        if( hit == nullptr || hit->is_dead_state() || !you.sees( here, *hit ) ) {
+        if( hit == nullptr || hit->is_dead_state() || !you.sees( here, *hit ) ||
+            ( hit_uid != p.cursor_uid && hit->attitude_to( you ) != Creature::Attitude::HOSTILE ) ) {
             return std::nullopt;
         }
         end = hit->pos_bub( here );
@@ -113,15 +115,6 @@ std::optional<claim> check_claim( map &here, const Character &you, const shot_pl
     }
     c.end = end;
     return c;
-}
-
-// The square `dist` squares from `source` along the unit direction (vx, vy), on the source's level, kept in the map
-// as CDDA's wild misses are.
-tripoint_bub_ms along( const tripoint_bub_ms &source, double vx, double vy, double dist )
-{
-    const double x = std::clamp( source.x() + vx * dist, 0.0, MAPSIZE_X - 1.0 );
-    const double y = std::clamp( source.y() + vy * dist, 0.0, MAPSIZE_Y - 1.0 );
-    return tripoint_bub_ms( static_cast<int>( std::lround( x ) ), static_cast<int>( std::lround( y ) ), source.z() );
 }
 
 // CDDA's line from `source` along the unit direction (vx, vy): how far `at` lies along it and how far off it.
@@ -171,45 +164,23 @@ double own_missed_by( const Creature &c, const tripoint_bub_ms &source, const tr
     return std::isfinite( missed_by ) ? std::min( missed_by, 1.0 ) : 1.0;
 }
 
-// A client hit counts only if the creature's own roll `own` hits (else CDDA's own path: nullopt); goodhit =
-// max(own, quality).
-std::optional<shot_outcome> hit_outcome( const claim &c, double own )
+// A claim that passed the checks. A hit counts only if the creature's own roll `own` hits, goodhit = max(own,
+// quality); when it misses, CDDA keeps the path and that creature, its roll made, isn't rolled again. A miss leaves
+// the path to CDDA.
+shot_outcome outcome_of( const claim &c, double own )
 {
-    if( c.hit_uid == 0 || !( own < 1.0 ) ) {
-        return std::nullopt;
-    }
     shot_outcome o;
+    if( c.hit_uid == 0 ) {
+        return o;
+    }
+    if( !( own < 1.0 ) ) {
+        o.spared_uid = c.hit_uid;
+        return o;
+    }
     o.end = c.end;
-    o.beyond = c.end;
-    o.stop = true;
     o.hit_uid = c.hit_uid;
     o.goodhit = std::max( own, c.quality );
     o.part = c.part;
-    return o;
-}
-
-// A client miss flies CDDA's line (vx, vy), never toward the client's end: to the aimed distance and, past it, as
-// CDDA's overshoot would (`beyond`, the line at the gun's range). The client's end only stops it early, at the
-// distance it lies along the line, where the line's square there is impassable (a wall, a closed door).
-shot_outcome miss_outcome( const map &here, const tripoint_bub_ms &source, const tripoint_bub_ms &target,
-                           double vx, double vy, const claim &c, int range )
-{
-    shot_outcome o;
-    const tripoint_bub_ms stop_at = along( source, vx, vy, offset_from( source, c.end, vx, vy ).along );
-    if( stop_at != source && here.impassable( stop_at ) ) {
-        o.end = stop_at;
-        o.beyond = stop_at;
-        o.stop = true;
-        return o;
-    }
-    o.end = along( source, vx, vy, std::hypot( target.x() - source.x(), target.y() - source.y() ) );
-    o.beyond = along( source, vx, vy, std::max( range, 1 ) );
-    if( o.end == source ) {
-        o.end = target;
-    }
-    if( o.beyond == source ) {
-        o.beyond = o.end;
-    }
     return o;
 }
 
@@ -245,11 +216,13 @@ bool has_shot_plan()
     return plan.has_value();
 }
 
-std::vector<uint64_t> shot_targets( const Creature *cursor, const std::vector<tripoint_bub_ms> &squares )
+void set_shot_targets( shot_plan &p, const Creature *cursor, const std::vector<tripoint_bub_ms> &squares )
 {
     std::vector<uint64_t> out;
+    p.cursor_uid = 0;
     if( cursor != nullptr && !cursor->is_avatar() ) {
-        out.push_back( creature_uid( *cursor ) );
+        p.cursor_uid = creature_uid( *cursor );
+        out.push_back( p.cursor_uid );
     }
     creature_tracker &creatures = get_creature_tracker();
     for( const tripoint_bub_ms &t : squares ) {
@@ -262,7 +235,7 @@ std::vector<uint64_t> shot_targets( const Creature *cursor, const std::vector<tr
             }
         }
     }
-    return out;
+    p.targets = std::move( out );
 }
 
 firing_scope::firing_scope( const Character &shooter, const item &gun, const map &here,
@@ -350,7 +323,7 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
             const double h = units::to_radians( units::from_arcmin( err * side ) );
             const double vx = ux * std::cos( h ) - uy * std::sin( h );
             const double vy = uy * std::cos( h ) + ux * std::sin( h );
-            heading_ = std::atan2( vy, vx );
+            side_ = h >= 0.0 ? 1 : -1;
             bool used = false;
             if( a && !a->cancel && a->shot ) {
                 const std::optional<claim> c = check_claim( here, you, *p, source, vx, vy, shot_line_tiles,
@@ -359,13 +332,7 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
                 if( c ) {
                     // the error's vertical part, err * cos(angle), is known: the line itself is the horizontal part
                     const double vert = err * std::cos( units::to_radians( units::from_degrees( angle ) ) );
-                    // a miss on CDDA's wild miss (a square or more off) takes CDDA's own wild-miss path, heading
-                    // along this line (wild_heading)
-                    if( c->hit != nullptr ) {
-                        out = hit_outcome( *c, own_roll( *c, vx, vy, vert, 0.0 ) );
-                    } else if( aim.missed_by_tiles < 1.0 ) {
-                        out = miss_outcome( here, source, target, vx, vy, *c, proj.range );
-                    }
+                    out = outcome_of( *c, c->hit != nullptr ? own_roll( *c, vx, vy, vert, 0.0 ) : 1.0 );
                     used = true;
                     n_accepted++;
                 }
@@ -376,14 +343,9 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
         } else if( first && p->turn == calendar::turn ) {
             const std::optional<claim> c = check_claim( here, you, *p, source, ux, uy, fire_line_tiles, p->hit_uid,
                                            p->end, p->quality, p->part );
-            // A miss keeps the aim line, as CDDA's near miss does; CDDA's wild miss (a square or more off) keeps its
-            // own path. A hit's creature off the aimed square: the error's direction is unknown, so the worst.
-            if( c && c->hit != nullptr ) {
-                out = hit_outcome( *c, own_roll( *c, ux, uy, 0.0, rolled_arcmin ) );
-            } else if( c && aim.missed_by_tiles < 1.0 ) {
-                out = miss_outcome( here, source, target, ux, uy, *c, proj.range );
-            }
+            // A hit's creature off the aimed square: the error's direction is unknown, so the worst.
             if( c ) {
+                out = outcome_of( *c, c->hit != nullptr ? own_roll( *c, ux, uy, 0.0, rolled_arcmin ) : 1.0 );
                 n_planned++;     // passed the checks, as n_accepted (CDDA's roll may still leave it to its own path)
             }
         }
@@ -407,16 +369,21 @@ const shot_outcome *projectile_scope::outcome() const
     return outer_ && current ? &*current : nullptr;
 }
 
-std::optional<double> projectile_scope::wild_heading() const
+std::optional<int> projectile_scope::wild_side() const
 {
-    return outer_ && heading_ && std::isfinite( *heading_ ) ? heading_ : std::nullopt;
+    return outer_ ? side_ : std::nullopt;
 }
 
 double outcome_missed_by( const shot_outcome &o, const Creature &critter, double cur, bool at_target,
                           double cdda_missed_by, double spread_add )
 {
-    if( o.hit_uid != 0 && creature_uid( critter ) == o.hit_uid ) {
+    const uint64_t uid = creature_uid( critter );
+    if( o.hit_uid != 0 && uid == o.hit_uid ) {
         return std::min( 1.0, o.goodhit + spread_add );     // goodhit: the creature's own roll at best
+    }
+    if( o.spared_uid != 0 && uid == o.spared_uid ) {
+        n_spared++;
+        return 1.0;     // its own roll for the claim missed; one roll per creature
     }
     if( at_target ) {
         // The aimed square's creature, which the client's bullet didn't hit: CDDA's unintended-hit roll, never
@@ -484,6 +451,7 @@ shot_counts get_shot_counts()
     c.refused = n_refused.load();
     c.planned = n_planned.load();
     c.parts = n_parts.load();
+    c.spared = n_spared.load();
     return c;
 }
 

@@ -319,15 +319,10 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
     double extend_to_range = no_overshoot ? range : proj_arg.range;
 
     tripoint_bub_ms target = target_arg;
-    if( fp3d_out != nullptr ) { // FP3D: a hit stops at its creature; a miss flies CDDA's line (fp3d/shot.h)
+    if( fp3d_out != nullptr && fp3d_out->hit_uid != 0 ) { // FP3D: the client's hit stops at its creature
         target = fp3d_out->end;
-        if( !fp3d_out->stop && !no_overshoot ) {
-            target = fp3d_out->beyond;     // CDDA's overshoot, straight along the line
-        }
         range = rl_dist( source, target );
-        if( fp3d_out->stop || !no_overshoot ) {
-            extend_to_range = range;
-        }
+        extend_to_range = range;
         aim.missed_by_tiles = 0.0;
     }
     std::vector<tripoint_bub_ms> trajectory;
@@ -340,11 +335,9 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         // cap wild misses at +/- 30 degrees
         units::angle dispersion_angle =
             std::min( units::from_arcmin( aim.dispersion ), 30_degrees );
-        if( const std::optional<double> heading = fp3d_shot.wild_heading() ) {
-            rad = units::from_radians( *heading );  // FP3D: the side CDDA rolled for the client's shot request
-        } else {
-            rad += ( one_in( 2 ) ? 1 : -1 ) * dispersion_angle;
-        }
+        // FP3D: the side the client's shot request turned to (CDDA's own roll), else the coin flip
+        const std::optional<int> fp3d_side = fp3d_shot.wild_side();
+        rad += ( fp3d_side ? *fp3d_side : ( one_in( 2 ) ? 1 : -1 ) ) * dispersion_angle;
 
         // TODO: This should also represent the miss on z axis
         const int offset = std::min<int>( range, std::sqrt( aim.missed_by_tiles ) );

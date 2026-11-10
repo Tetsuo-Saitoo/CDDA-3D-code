@@ -1162,7 +1162,7 @@ static bool run_shoot_checks()
     const fp3d::shot_counts c0 = fp3d::get_shot_counts();
     const auto miss = client_shot( false );
     const fp3d::shot_counts cm = fp3d::get_shot_counts();
-    check( miss.first > 0 && miss.second <= miss.first && cm.planned == c0.planned + 1, "client shot: planned miss",
+    check( miss.first > 0 && cm.planned == c0.planned + 1, "client shot: planned miss taken",
            "hp " + std::to_string( miss.first ) + " -> " + std::to_string( miss.second ) );
     const auto head = client_shot( true );
     const fp3d::shot_counts c1 = fp3d::get_shot_counts();
@@ -2643,8 +2643,9 @@ static bool run_combat_checks()
                std::to_string( friend_hurt ) + ", the aimed zombie hurt " + std::to_string( zombie_hurt ) );
     }
     // CDDA's wild miss isn't the client's to place: aiming at an empty square 8 west, unskilled, the client claims a
-    // miss ending on the cursor every time; where CDDA's roll is a square or more off there, CDDA's wild-miss path
-    // runs (its distance scatter, the request's heading), so not all of those end on the cursor.
+    // miss ending on the cursor every time. Where CDDA's roll is a square or more off there, CDDA's wild-miss path
+    // runs: turned by its whole error (30 degrees at most, as CDDA's own), to the side the shot request showed
+    // (sin(shot_angle) > 0: the shooter's right, north when facing west), at CDDA's scattered distance.
     {
         scene empty_aim;
         empty_aim.zx = 0;
@@ -2654,6 +2655,7 @@ static bool run_combat_checks()
         const claim on_cursor = { who::none, -8, 0, "", 0.99f };
         int wild = 0;
         int wild_on_cursor = 0;
+        int placed = 0;
         std::string ends;
         for( int i = 0; i < 16 && wild < 6; i++ ) {
             const result r = run( empty_aim, "fire", answer_with::fire, on_cursor, true, on_cursor );
@@ -2669,10 +2671,48 @@ static bool run_combat_checks()
             const int ey = e.y - r.target->origin.y;
             ends += " (" + std::to_string( ex ) + "," + std::to_string( ey ) + ")";
             wild_on_cursor += ex == -8 && ey == 0 ? 1 : 0;
+            const double deg = 180.0 / M_PI;
+            const double want = std::min( r.shots.front().shot_error / 60.0, 30.0 );
+            const double dist = std::hypot( ex, ey );
+            const double got = dist > 0.0 ? std::atan2( std::abs( ey ), -ex ) * deg : 0.0;
+            const double slack = dist > 0.0 ? std::atan2( 1.0, dist ) * deg + 2.0 : 180.0;
+            const double sin_angle = std::sin( r.shots.front().shot_angle / deg );
+            const bool side_ok = ey == 0 || ( sin_angle >= 0.0 ? ey < 0 : ey > 0 );
+            placed += std::abs( got - want ) <= slack && side_ok ? 1 : 0;
         }
-        check( wild >= 3 && wild_on_cursor < wild, "client miss on CDDA's wild miss: CDDA places it",
-               std::to_string( wild ) + " wild misses, on the cursor " + std::to_string( wild_on_cursor ) + ", ends" +
-               ends );
+        check( wild >= 3 && wild_on_cursor < wild && placed == wild, "client miss on CDDA's wild miss: CDDA places it",
+               std::to_string( wild ) + " wild misses, " + std::to_string( placed ) + " at CDDA's angle and the "
+               "request's side, on the cursor " + std::to_string( wild_on_cursor ) + ", ends" + ends );
+    }
+    // One roll per creature: skilled and steady, aiming at a zombie 8 west with another hostile one on the line
+    // at 4 west, the client claims the near one every time. When that creature's own roll misses, CDDA's path runs
+    // and meets it without rolling it again (spared): it stays unhurt in those runs.
+    {
+        scene two_in_line = point_blank;
+        two_in_line.zx = -8;
+        two_in_line.sx = -4;
+        const claim near_one = { who::side, 0, 0, "", 0.5f };
+        int used = 0;
+        int spared_runs = 0;
+        int hurt_when_spared = 0;
+        int hits = 0;
+        for( int i = 0; i < 10; i++ ) {
+            const result r = run( two_in_line, "fire", answer_with::fire, near_one, true, near_one );
+            if( !fired( r, 1 ) || r.before.side_hp <= 0 || delta( r.c0.accepted, r.c1.accepted ) != 1 ) {
+                continue;
+            }
+            used++;
+            const bool hurt = r.after.side_hp < r.before.side_hp;
+            if( delta( r.c0.spared, r.c1.spared ) > 0 ) {
+                spared_runs++;
+                hurt_when_spared += hurt ? 1 : 0;
+            } else {
+                hits += hurt ? 1 : 0;
+            }
+        }
+        check( spared_runs >= 2 && hurt_when_spared == 0, "a claim's missed roll: no second roll",
+               std::to_string( used ) + " used, spared " + std::to_string( spared_runs ) + " (hurt then " +
+               std::to_string( hurt_when_spared ) + "), claimed hits landed " + std::to_string( hits ) );
     }
     // A hit claimed on a creature a square off CDDA's line (lead-bridge's case): skilled and steady, aiming at a
     // zombie 8 squares west, the client claims a dead-centre hit on another zombie at (-3, 1), close by. Its own

@@ -13,13 +13,12 @@
 //   that projectile to CDDA's own path (the plan's outcome is not used with `fly`).
 // A client hit counts only if the creature's own roll hits (CDDA's roll for the aimed square's creature; for any
 // other, its square's distance off the projectile's line against its size, never better than CDDA's roll for an
-// unintended hit), with goodhit = max(that roll, the client's quality). A client miss never picks the direction:
-// it flies CDDA's line on as CDDA's overshoot would, its end only stopping it at an impassable square on that line;
-// when CDDA's roll is a wild miss (a square or more off) CDDA's own wild-miss path runs, heading along the shot
-// request's deviated line with `fly`. The creatures a miss meets get CDDA's rolls, the aimed square's one never
-// better than CDDA's own (a CDDA miss stays a miss). A client hit the roll misses runs CDDA's own path. The planned
-// part lands only if goodhit <= sqrt(its hit chance). CDDA does everything else (ammo, recoil, noise, time,
-// damage, armour, wounds).
+// unintended hit), with goodhit = max(that roll, the client's quality). A client miss, or a hit its roll misses,
+// leaves the path to CDDA (its near miss along the aim line with its overshoot, or its wild miss; with `fly` the
+// wild miss turns to the side the shot request showed): the creatures it meets get CDDA's rolls, the aimed
+// square's one never better than CDDA's own (a CDDA miss stays a miss), and a creature whose own roll already
+// missed for the claim isn't rolled again. The planned part lands only if goodhit <= sqrt(its hit chance). CDDA
+// does everything else (ammo, recoil, noise, time, damage, armour, wounds).
 // The plan is dropped when the trigger pull ends or the aiming ends without one (aim_activity_actor).
 // Sim thread only, except get_shot_counts().
 
@@ -60,15 +59,16 @@ struct shot_plan {
     // From the target request the answer belongs to:
     int range = 0;                    // the gun's range for the avatar, squares
     std::vector<uint64_t> targets;    // creatures a client hit may name: the cursor creature, hostile candidates
+    uint64_t cursor_uid = 0;          // the cursor creature (0 = none); any other must still be hostile
 };
 
 void set_shot_plan( const shot_plan &p );
 void clear_shot_plan();
 bool has_shot_plan();
-// Snapshot uids of `cursor` (may be null) and of the hostile creatures on `squares` (bubble), for
-// shot_plan::targets: a client hit may name the cursor creature or a hostile one, never a bystander CDDA would ask
+// Sets p.targets and p.cursor_uid: snapshot uids of `cursor` (may be null) and of the hostile creatures on
+// `squares` (bubble). A client hit may name the cursor creature or a hostile one, never a bystander CDDA would ask
 // about first.
-std::vector<uint64_t> shot_targets( const Creature *cursor, const std::vector<tripoint_bub_ms> &squares );
+void set_shot_targets( shot_plan &p, const Creature *cursor, const std::vector<tripoint_bub_ms> &squares );
 
 // Character::fire_gun. While it lives in the avatar's fire_gun with the plan's gun (wielded, firing itself, not
 // an attached gunmod) at the plan's square, the avatar's projectiles use the plan. When the avatar's fire_gun
@@ -86,12 +86,9 @@ class firing_scope
 
 // The outcome of one projectile.
 struct shot_outcome {
-    uint64_t hit_uid = 0;       // the creature hit; 0 = a miss
-    // A hit: the creature's square, where it stops. A miss: CDDA's line (never the client's) at the aimed distance;
-    // `beyond` is the same line at the gun's range, for a miss that flies on (overshoot) in that exact direction.
+    uint64_t hit_uid = 0;       // the creature hit, the projectile stops at its square `end`; 0 = CDDA's path
     tripoint_bub_ms end;
-    tripoint_bub_ms beyond;
-    bool stop = false;          // a miss that stops at `end`: the line's square there is impassable
+    uint64_t spared_uid = 0;    // a creature whose own roll for the client's claim missed: not rolled again
     double goodhit = 1.0;       // missed_by for the hit
     std::string part;           // the client's part; checked again when the hit lands
 };
@@ -110,18 +107,18 @@ class projectile_scope
         projectile_scope &operator=( const projectile_scope & ) = delete;
         // null: CDDA's own path
         const shot_outcome *outcome() const;
-        // With `fly`: the heading (radians, atan2 of the bubble's y over x) of the shot request's deviated line, which
-        // CDDA's wild miss takes instead of its coin-flip side; the angle is CDDA's own roll the client flew.
-        std::optional<double> wild_heading() const;
+        // With `fly`: the side (+1 / -1, the sign CDDA's wild miss adds its angle with) the shot request's deviated
+        // line turned to, which CDDA's wild miss takes instead of its coin flip; the angle is CDDA's own roll.
+        std::optional<int> wild_side() const;
     private:
         bool outer_ = false;
-        std::optional<double> heading_;
+        std::optional<int> side_;
 };
 
 // missed_by for `critter` met on the projectile's path, `cur` being CDDA's own (its roll on the aimed square, its
 // unintended-hit roll elsewhere): the outcome's creature gets its goodhit (its own roll at best, plus `spread_add`
-// for pellets); the aimed square's creature, when it isn't that one, CDDA's roll for an unintended hit, never
-// below `cur`; any other creature keeps `cur`.
+// for pellets); the spared creature 1 (its roll was made); the aimed square's creature, when it isn't the hit one,
+// CDDA's roll for an unintended hit, never below `cur`; any other creature keeps `cur`.
 double outcome_missed_by( const shot_outcome &o, const Creature &critter, double cur, bool at_target,
                           double cdda_missed_by, double spread_add );
 
@@ -139,6 +136,7 @@ struct shot_counts {
     uint64_t refused = 0;       // `shot` answers cancelled, without a shot, or failing a check
     uint64_t planned = 0;       // FIRE-answer outcomes that passed the checks (first projectile)
     uint64_t parts = 0;         // client parts that landed
+    uint64_t spared = 0;        // creatures met on the path that a claim's missed roll kept from a second roll
 };
 shot_counts get_shot_counts();
 
