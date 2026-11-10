@@ -23,7 +23,9 @@ void boot_world( const std::string &world_name, bool headless );
 // boot_world's first half, for character creation (chargen.h): loads game data and, with `fresh_world`, creates
 // world `world_name` (replacing one of that name), otherwise uses the existing world of that name (throws if
 // there is none). The avatar is blank: build it (run_chargen / avatar::create), then g->start_game().
-void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless );
+// `world_setup` (fresh worlds only) asks the client for the world's settings and mods first (worldgen.h).
+void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless,
+                         bool world_setup = false );
 
 // Loads game data and the saved character `save_name` (its save id, i.e. the character name) from the existing
 // world `world_name` under the user directory, the way CDDA's main menu loads a game (g->setup(), then

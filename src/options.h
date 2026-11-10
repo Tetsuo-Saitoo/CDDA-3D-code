@@ -80,6 +80,7 @@ class options_manager
         class cOpt
         {
                 friend class options_manager;
+                friend struct fp3d_option_access;  // FP3D: world settings screen (fp3d/worldgen.cpp)
             public:
                 cOpt();
 

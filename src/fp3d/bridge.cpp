@@ -76,6 +76,8 @@ const char *kind_name( request_kind k )
             return "direction";
         case request_kind::chargen:
             return "chargen";
+        case request_kind::world_setup:
+            return "world_setup";
         case request_kind::target:
             return "target";
     }
@@ -210,7 +212,7 @@ ui_answer ask( ui_request req )
     ui_answer a = std::move( *c.reply );
     c.reply.reset();
     a.timed_out = false;
-    a.text = sanitize_text( a.text, kind == request_kind::chargen ? max_answer_json : max_answer_text );
+    a.text = sanitize_text( a.text, kind == request_kind::chargen || kind == request_kind::world_setup ? max_answer_json : max_answer_text );
     a.action = sanitize_text( a.action, 128 );
     if( a.picks.size() > max_answer_picks ) {
         a.picks.resize( max_answer_picks );
