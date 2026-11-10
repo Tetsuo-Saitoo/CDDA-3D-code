@@ -3580,6 +3580,13 @@ static bool run_combat_checks()
         s = swing_run( short_reach, "fp3d_attack_main_aim_LEFT", aimed_at( "head" ) );
         check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ),
                "a bat doesn't reach 2 squares", shown( s ) );
+        // unseen behind a wall: no strike (it would bash the wall, spending a turn only when someone stood there)
+        scene walled = spear;
+        walled.wx = -1;
+        s = swing_run( walled, "fp3d_attack_main_aim_LEFT", aimed_at( "head" ) );
+        check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ) && s.after.moves == s.before.moves &&
+               s.after.hp == s.before.hp, "a spear doesn't strike someone unseen behind a wall",
+               shown( s ) + ", moves " + std::to_string( s.before.moves ) + " -> " + std::to_string( s.after.moves ) );
     }
     return failed == 0;
 }

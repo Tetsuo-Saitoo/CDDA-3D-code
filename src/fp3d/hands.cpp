@@ -15,6 +15,7 @@
 #include "input_context.h"
 #include "item.h"
 #include "item_location.h"
+#include "map.h"
 #include "monster.h"
 #include "npc.h"
 #include "translation.h"
@@ -115,7 +116,9 @@ bool hand_attack( avatar &u, const std::string &action )
         const int reach = weapon ? std::clamp( weapon->current_reach_range( u ), 1, max_reach ) : 1;
         for( int r = 2; r <= reach; r++ ) {
             const tripoint_bub_ms q = u.pos_bub() + tripoint_rel_ms( d->dx * r, d->dy * r, 0 );
-            if( Creature *beyond = get_creature_tracker().creature_at<Creature>( q ) ) {
+            // only a creature you see: a strike must not find (or give away) someone unseen behind a wall
+            Creature *beyond = get_creature_tracker().creature_at<Creature>( q );
+            if( beyond != nullptr && u.sees( get_map(), *beyond ) ) {
                 c = beyond;
                 reach_target = q;
                 break;
