@@ -310,10 +310,22 @@ bool put( avatar &u, const item_action &a )
             return failed( _( "it has no such pocket" ) );
         }
     }
-    // Already where it's going: nothing to move. (A copy would merge into the original.)
+    // Already where it's going: nothing to move. (A copy would merge into the original.) But the off-hand item
+    // lies in a pocket while it's held, so putting it there just takes it out of the hand.
     if( src.has_parent() && ( pocket != nullptr ? pocket == src.parent_pocket() :
                               src.parent_item().get_item() == dst.get_item() ) ) {
-        return failed( _( "it's already in there" ) );
+        const item_location off = offhand_item( u );
+        if( !off || off.get_item() != src.get_item() ) {
+            return failed( _( "it's already in there" ) );
+        }
+        const std::string name = it.display_name();
+        const std::string dst_name = dst->type->nname( 1 );
+        clear_offhand_mark( it );
+        u.mod_moves( -Pickup::cost_to_move_item( u, it ) );
+        after_inventory_change( u );
+        //~ %1$s: item to put in the container, %2$s: container to put item in
+        u.add_msg_if_player( _( "You put your %1$s into the %2$s." ), name, dst_name );
+        return true;
     }
     if( pocket != nullptr ) {
         const ret_val<item_pocket::contain_code> r = pocket->can_contain( it );

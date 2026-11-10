@@ -1022,6 +1022,12 @@ fp3d::ui_answer answer_for( const fp3d::ui_request &req, const goal &cur, driver
             a.cancel = true;
             note = "cancel";
             break;
+        case fp3d::request_kind::world_setup:
+        case fp3d::request_kind::chargen:
+        case fp3d::request_kind::shot:
+            // Not asked by these goals (world setup and character creation have their own tests; shots go CDDA's
+            // way): an empty answer.
+            break;
         case fp3d::request_kind::direction:
             a.pos = fp3d::ui_point{ cur.dx, cur.dy, 0 };
             note = "(" + std::to_string( cur.dx ) + "," + std::to_string( cur.dy ) + ")";
@@ -1705,6 +1711,32 @@ static bool run_item_checks()
     const fp3d::carried_view in_pack = carried( rock_b.uid );
     check( res.back && res.spent > 0 && in_pack.parent == backpack.uid && in_pack.pocket == 0 &&
            !fp3d::latest_held().off.held, "put into a worn pack's pocket 0", show( res ) );
+    // Held again where it lies (pocket 0), then put into that same pocket: it just leaves the hand.
+    bool held_again = false;
+    if( const std::optional<fp3d::ui_request> h0 = fp3d::wait_request( 5000 ); h0 && h0->timed ) {
+        fp3d::queue_action( "fp3d_hold_off" );
+        const std::optional<fp3d::ui_request> m = fp3d::wait_request( 20000, h0->id );
+        std::string label;
+        const int e = m && !m->timed ? first_entry_with( *m, "rock", label ) : -1;
+        if( e >= 0 ) {
+            fp3d::ui_answer a;
+            a.id = m->id;
+            a.entry = e;
+            fp3d::answer( a );
+            const std::optional<fp3d::ui_request> h1 = fp3d::wait_request( 20000, m->id );
+            held_again = h1 && h1->timed && fp3d::latest_held().off.id == "rock";
+        } else if( m && !m->timed ) {
+            fp3d::ui_answer a;
+            a.id = m->id;
+            a.cancel = true;
+            fp3d::answer( a );
+        }
+    }
+    res = run( put );
+    const fp3d::carried_view still = carried( rock_b.uid );
+    check( held_again && res.back && res.spent > 0 && has( res.msg, "You put" ) && still.parent == backpack.uid &&
+           still.pocket == 0 && !fp3d::latest_held().off.held, "put the held item into the pocket it lies in",
+           show( res ) );
     put.pocket = -1;
     put.item = { water.uid, water.type };
     put.container = { bottle.uid, bottle.type };
@@ -3417,7 +3449,8 @@ static bool run_safemode_checks()
     spawn_zombie = true;
     const int64_t turn0 = r->turn;
     const std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
-    while( ms_since( t ) < 2000 ) {
+    // 2 s at 4x is 8 turns; a loaded machine (an overmap loading meanwhile) gets up to 10 s for 3 of them.
+    while( ms_since( t ) < 2000 || ( r->turn < turn0 + 3 && ms_since( t ) < 10000 ) ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, r->id ) ) {
             r = next;
         }
@@ -3427,7 +3460,8 @@ static bool run_safemode_checks()
     check( o.zombies_placed > placed_before && o.visible > 0, "a new zombie in view", "seen " +
            std::to_string( o.visible ) );
     check( !c.paused && r->turn >= turn0 + 3 && !c.auto_pause_hostiles, "auto-pause off: real time runs on",
-           "turns +" + std::to_string( r->turn - turn0 ) + ( c.paused ? ", paused: " + c.pause_reason : "" ) );
+           "turns +" + std::to_string( r->turn - turn0 ) + " in " + std::to_string( static_cast<int64_t>( ms_since( t ) ) ) + " ms" +
+           ( c.paused ? ", paused: " + c.pause_reason : "" ) );
     fp3d::set_auto_pause_hostiles( true );
     fp3d::set_clock_mode( fp3d::clock_mode::turn_based );
     fp3d::set_paused( false );
