@@ -72,6 +72,18 @@ struct carried_view {
     uint8_t flags = 0;                            // carried_* bits
 };
 
+// A square that adds light to CDDA's lightmap (C6): the strongest of its terrain/furniture, item and field sources.
+constexpr uint8_t light_fixed = 0;                // terrain or furniture (light_emitted)
+constexpr uint8_t light_item = 1;                 // an item lying there (item::getlight)
+constexpr uint8_t light_fire = 2;                 // a field (fire and other glowing fields)
+constexpr size_t max_lights_per_submap = 16;
+struct light_view {
+    uint8_t tile = 0;
+    uint8_t luminance = 0;                        // CDDA luminance, rounded, clamped to 0..255
+    uint8_t kind = light_fixed;
+    bool operator==( const light_view &o ) const;
+};
+
 struct field_view {
     uint8_t tile = 0;
     uint32_t type = 0;                            // field type index
@@ -125,6 +137,7 @@ struct submap_view {
     std::vector<field_view> fields;               // tiles seen now only (cap 4 per tile)
     std::vector<heat_view> heat;                  // tiles seen now only (cap 32)
     std::vector<cookware_view> cookware;          // on those heat tiles (cap 16)
+    std::vector<light_view> lights;               // tiles seen now only, brightest first (cap 16)
     bool same_shape( const submap_view &o ) const;
     bool same_detail( const submap_view &o ) const;
 };

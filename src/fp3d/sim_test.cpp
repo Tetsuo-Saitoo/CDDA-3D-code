@@ -1652,9 +1652,22 @@ static bool run_cooking_checks()
     [&]( const fp3d::cookware_view & cw ) {
         return cw.tile == meat_tile;
     } ), "a pot off the heat is no cookware entry", "" );
+    // C6 lights: the fire on the fireplace lights its square (a field: kind 2); the z range and natural light ride
+    // along at the top and in env.
+    int fire_tile = 0;
+    const fp3d::submap_view *fire_sm = submap_at( fire_at, fire_tile );
+    const bool fire_lit = fire_sm != nullptr && std::any_of( fire_sm->lights.begin(), fire_sm->lights.end(),
+    [&]( const fp3d::light_view & l ) {
+        return l.tile == fire_tile && l.kind == fp3d::light_fire && l.luminance > 0;
+    } );
     std::ostringstream js;
     fp3d::write_snapshot_json( js, *s0, me.z, me.z );
     const std::string json = js.str();
+    check( fire_lit && fire_sm->lights.size() <= fp3d::max_lights_per_submap &&
+           json.find( "\"z_levels\":[-10,10]" ) != std::string::npos &&
+           json.find( "\"ambient_light\":" ) != std::string::npos && json.find( "\"lights\":[[" ) != std::string::npos,
+           "lights: the fire's square, z range, natural light", fire_sm ? std::to_string( fire_sm->lights.size() ) +
+           " lights" : "no submap" );
     check( json.find( "\"heat\":[[" ) != std::string::npos && json.find( "\"cookware\":[{\"tile\":" ) !=
            std::string::npos && json.find( "\"craft_recipe\":\"\"" ) != std::string::npos, "snapshot JSON: heat and cookware",
            "" );
