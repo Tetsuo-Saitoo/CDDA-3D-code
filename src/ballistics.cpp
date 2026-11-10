@@ -400,6 +400,8 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         trajectory.insert( trajectory.end(), trajectory_extension.begin(), trajectory_extension.end() );
     }
 
+    // FP3D: a bullet goes on through bodies and glances off walls (fp3d/bullet_paths.h)
+    const bool fp3d_paths = fp3d::paths_apply( proj_arg, is_bullet, stream );
     bool first = true;
     bool print_messages = true;
     bool multishot = false;
@@ -417,13 +419,22 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         fp3d_shot.select_pellet( static_cast<size_t>( j ) );
         const fp3d::shot_outcome *fp3d_pellet = fp3d_shot.outcome();
         bool fp3d_bounced = false;
+        bool fp3d_passed = false;               // went on through a body
         Creature *fp3d_first_hit = nullptr;     // the event names it after a bullet went on through
+        damage_instance fp3d_wall_impact;       // the bullet's damage before the square it is shot into
 
         // calculate dispersion from shot_spread
-        if( proj.shot_spread > 0 && static_cast<size_t>( j ) < fp3d_pellets.size() ) {
-            // FP3D: rolled before the projectile flew (fp3d::roll_pellets)
-            const fp3d::pellet &pel = fp3d_pellets[j];
-            units::angle arc = units::from_arcmin( pel.arcmin );
+        if( proj.shot_spread > 0 ) {
+            // FP3D: in an FP3D game rolled before the projectile flew (fp3d::roll_pellets)
+            const bool fp3d_rolled = static_cast<size_t>( j ) < fp3d_pellets.size();
+            units::angle arc;
+            if( fp3d_rolled ) {
+                arc = units::from_arcmin( fp3d_pellets[j].arcmin );
+            } else {
+                double sample = rng_normal( -proj.shot_spread, proj.shot_spread );
+                sample = sample >= 0 ? sample : -sample;
+                arc = std::min( units::from_arcmin( sample ), 30_degrees );
+            }
             spread = tan( arc / 2 ) * 2.0;
             double max_spread = spread * ( t_copy.size() - 1 );
             if( fp3d_pellet != nullptr && fp3d_shot.per_pellet() && fp3d_pellet->hit_uid != 0 ) {
@@ -438,7 +449,7 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                 double dx = target_c.x() - source.x();
                 double dy = target_c.y() - source.y();
                 units::angle d = units::atan2( dy, dx );
-                d += pel.side * arc;
+                d += ( fp3d_rolled ? fp3d_pellets[j].side : ( one_in( 2 ) ? 1 : -1 ) ) * arc;
                 target_c.x() = std::clamp( source.x() + roll_remainder( range * cos( d ) ),
                                            0, MAPSIZE_X - 1 );
                 target_c.y() = std::clamp( source.y() + roll_remainder( range * sin( d ) ),
@@ -617,11 +628,12 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                     }
                     has_momentum = false;
                     // FP3D: a bullet with damage to spare goes on through the body (fp3d/bullet_paths.h)
-                    if( is_bullet && !stream && proj_arg.count == 1 ) {
+                    if( fp3d_paths ) {
                         const double left = fp3d::through_body( proj, *attack.last_hit_critter );
                         if( left > 0.0 ) {
                             proj.impact.mult_damage( left );
                             has_momentum = true;
+                            fp3d_passed = true;
                         }
                     }
                     // on-hit effects for inflicted damage types
@@ -632,6 +644,9 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
             } else if( in_veh != nullptr && veh_pointer_or_null( here->veh_at( tp ) ) == in_veh ) {
                 // Don't do anything, especially don't call map::shoot as this would damage the vehicle
             } else {
+                if( fp3d_paths ) {
+                    fp3d_wall_impact = proj.impact;     // FP3D: map::shoot clears it when it stops the bullet
+                }
                 double it = here->shoot( tp, proj, !no_item_damage && tp == target_c );
                 if( it > 0 ) {
                     // even if it's a shot, as we will never use impact after point-blank,
@@ -655,9 +670,9 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
             }
 
             // FP3D: a bullet a wall stopped may glance off it at a shallow angle, once (fp3d/bullet_paths.h)
-            if( !has_momentum && is_bullet && !stream && proj_arg.count == 1 && !fp3d_bounced &&
-                attack.last_hit_critter == nullptr &&
-                fp3d::ricochet( *here, proj, t_copy, i, prev_point, proj_arg.range - rl_dist( source, prev_point ) ) ) {
+            if( fp3d_paths && !has_momentum && !fp3d_bounced && attack.last_hit_critter == nullptr &&
+                fp3d::ricochet( *here, proj, fp3d_wall_impact, t_copy, i, prev_point,
+                                proj_arg.range - rl_dist( source, prev_point ) ) ) {
                 fp3d_bounced = true;
                 has_momentum = true;
                 traj_len = t_copy.size();
@@ -673,7 +688,7 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
             prev_point = tp;
         }
         // FP3D: a bullet that went on through a body and hit nothing more still hit it (callers read this)
-        if( attack.last_hit_critter == nullptr ) {
+        if( fp3d_passed && attack.last_hit_critter == nullptr ) {
             attack.last_hit_critter = fp3d_first_hit;
         }
         // FP3D: the flight path for the client

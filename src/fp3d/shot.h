@@ -102,8 +102,8 @@ struct pellet {
     double arcmin = 0.0;
     int side = 1;
 };
-// ballistics.cpp: every pellet's spread for `proj`, rolled before the projectile flies as CDDA rolled each one in
-// its pellet loop (none without shot_spread).
+// ballistics.cpp: every pellet's spread for `proj` in an FP3D game, rolled before the projectile flies as CDDA
+// rolls each one in its pellet loop (none without shot_spread, or outside FP3D games: CDDA's own roll order).
 std::vector<pellet> roll_pellets( const projectile &proj );
 
 // projectile_attack: one per call, right after CDDA's dispersion roll. In the avatar's firing_scope the outermost

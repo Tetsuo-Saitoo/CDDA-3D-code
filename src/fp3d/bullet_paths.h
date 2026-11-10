@@ -5,8 +5,8 @@
 // Bullet paths CDDA doesn't have, in FP3D games only (plain CDDA keeps its own): a bullet going on through a body
 // it hit, and a bullet glancing off a wall it met at a shallow angle. Soft cover needs nothing here: CDDA's
 // map::shoot already lets a bullet through furniture and terrain with `shoot` data, losing damage.
-// ballistics.cpp (projectile_attack) calls them for any shooter's single bullet: speed 200 or more, not
-// NO_PENETRATE_OBSTACLES, not a stream, not a shell's pellets. Sim thread only, except get_path_counts().
+// ballistics.cpp (projectile_attack) calls them for any shooter's plain bullet (paths_apply). Sim thread only,
+// except get_path_counts().
 
 #include <cstddef>
 #include <cstdint>
@@ -16,10 +16,17 @@
 
 class Creature;
 class map;
+struct damage_instance;
 struct projectile;
 
 namespace fp3d
 {
+
+// Whether bullet paths apply to `proj`: an FP3D game and a single plain bullet (`is_bullet` as ballistics.cpp has
+// it: speed 200 or more, not NO_PENETRATE_OBSTACLES), not a stream, nothing that explodes or spreads an effect
+// (custom explosion, an effect's blast, EMP, flashbang or area field), not a laser, plasma, BOUNCE or
+// SHATTER_SELF, and nothing dropped or embedded (arrows, bolts).
+bool paths_apply( const projectile &proj, bool is_bullet, bool stream );
 
 // What a body stops of a bullet going through it, in damage, by its size (tiny .. huge).
 constexpr double body_stop_tiny = 5.0;
@@ -42,12 +49,13 @@ constexpr double ricochet_chance_max = 0.8;
 constexpr double ricochet_keep = 0.5;
 constexpr int ricochet_reach = 20;
 
-// `bullet` was stopped by the wall at path[i], coming from the passable square `from`. True when it glances off:
-// the path from i on is replaced with the bounce (from `from` along the line reflected off the wall's face, at
-// most `range_left` and ricochet_reach squares, inside the bubble) and the bullet's damage is lowered. False
+// `bullet` was stopped by the wall at path[i], coming from the passable square `from`; `before` is its damage
+// before that square (map::shoot clears it when it stops a bullet). True when it glances off: the path from i on
+// is replaced with the bounce (from `from` along the line reflected off the wall's face, at most `range_left` and
+// ricochet_reach squares, inside the bubble) and the bullet's damage becomes `before` times ricochet_keep. False
 // (nothing changed) for a head-on hit, a corner, a failed roll or no room.
-bool ricochet( map &here, projectile &bullet, std::vector<tripoint_bub_ms> &path, size_t i,
-               const tripoint_bub_ms &from, int range_left );
+bool ricochet( map &here, projectile &bullet, const damage_instance &before, std::vector<tripoint_bub_ms> &path,
+               size_t i, const tripoint_bub_ms &from, int range_left );
 
 // Counters for tests and diagnostics; any thread.
 struct path_counts {

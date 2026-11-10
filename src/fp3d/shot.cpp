@@ -531,7 +531,7 @@ std::optional<bodypart_id> planned_body_part( const Creature &target, const Crea
 std::vector<pellet> roll_pellets( const projectile &proj )
 {
     std::vector<pellet> out;
-    if( proj.shot_spread <= 0 || proj.count <= 0 ) {
+    if( !active() || proj.shot_spread <= 0 || proj.count <= 0 ) {
         return out;
     }
     out.reserve( proj.count );

@@ -5,6 +5,7 @@
 #include <cmath>
 #include <string>
 
+#include "ammo_effect.h"
 #include "creature.h"
 #include "damage.h"
 #include "fp3d/bridge.h"
@@ -14,6 +15,11 @@
 #include "projectile.h"
 #include "rng.h"
 #include "translations.h"
+
+static const ammo_effect_str_id ammo_effect_BOUNCE( "BOUNCE" );
+static const ammo_effect_str_id ammo_effect_LASER( "LASER" );
+static const ammo_effect_str_id ammo_effect_PLASMA( "PLASMA" );
+static const ammo_effect_str_id ammo_effect_SHATTER_SELF( "SHATTER_SELF" );
 
 namespace fp3d
 {
@@ -41,6 +47,29 @@ double body_stop( creature_size size )
 }
 } // namespace
 
+bool paths_apply( const projectile &proj, bool is_bullet, bool stream )
+{
+    if( !active() || !is_bullet || stream || proj.count != 1 || proj.get_custom_explosion().power > 0.0f ||
+        !proj.get_drop().is_null() ) {
+        return false;
+    }
+    for( const ammo_effect_str_id &id : proj.proj_effects ) {
+        if( id == ammo_effect_BOUNCE || id == ammo_effect_LASER || id == ammo_effect_PLASMA ||
+            id == ammo_effect_SHATTER_SELF ) {
+            return false;
+        }
+        if( !id.is_valid() ) {
+            continue;
+        }
+        const ammo_effect &ae = id.obj();
+        if( ae.aoe_explosion_data.power > 0.0f || ae.do_emp_blast || ae.do_flashbang ||
+            ( !ae.aoe_field_type_name.empty() && ae.aoe_field_type_name != "fd_null" ) ) {
+            return false;
+        }
+    }
+    return true;
+}
+
 double through_body( const projectile &bullet, const Creature &critter )
 {
     if( !active() ) {
@@ -58,8 +87,8 @@ double through_body( const projectile &bullet, const Creature &critter )
     return left / damage;
 }
 
-bool ricochet( map &here, projectile &bullet, std::vector<tripoint_bub_ms> &path, size_t i,
-               const tripoint_bub_ms &from, int range_left )
+bool ricochet( map &here, projectile &bullet, const damage_instance &before, std::vector<tripoint_bub_ms> &path,
+               size_t i, const tripoint_bub_ms &from, int range_left )
 {
     if( !active() || i == 0 || i >= path.size() || range_left <= 0 ) {
         return false;
@@ -125,10 +154,11 @@ bool ricochet( map &here, projectile &bullet, std::vector<tripoint_bub_ms> &path
     }
     path.resize( i );
     path.insert( path.end(), bounce.begin(), bounce.end() );
+    bullet.impact = before;
     bullet.impact.mult_damage( ricochet_keep );
     n_ricochets++;
-    //~ %s: what the bullet glanced off (a wall's name)
-    add_msg_if_player_sees( wall, _( "The bullet glances off the %s!" ), here.tername( wall ) );
+    //~ %s: what the shot glanced off (a wall's name)
+    add_msg_if_player_sees( wall, _( "The shot glances off the %s!" ), here.tername( wall ) );
     return true;
 }
 
