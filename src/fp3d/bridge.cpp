@@ -68,6 +68,7 @@ channel &chan()
 std::atomic<bool> bridge_active{ false };
 std::atomic<bool> interrupt_requested{ false };
 thread_local bool next_timed = false;
+thread_local bool hook_timed = false;
 thread_local bool in_query = false;
 std::mutex poll_mutex;
 std::map<std::string, uint64_t> poll_counts;
@@ -196,6 +197,11 @@ bool next_is_timed()
     return next_timed;
 }
 
+bool in_timed_hook()
+{
+    return hook_timed;
+}
+
 ui_answer ask( ui_request req )
 {
     if( in_query ) {
@@ -210,19 +216,23 @@ ui_answer ask( ui_request req )
         }
         hook = c.before_ask;
     }
+    // Taken before the hook, so a request asked inside it isn't posted as the main loop's.
+    const bool timed = std::exchange( next_timed, false );
     // Not again from a request asked inside the hook itself (CDDA's debug message prompt, say).
     static thread_local bool in_hook = false;
     if( hook && !in_hook ) {
         in_hook = true;
+        hook_timed = timed;
         try {
             hook();
         } catch( ... ) {
             in_hook = false;
+            hook_timed = false;
             throw;
         }
         in_hook = false;
+        hook_timed = false;
     }
-    const bool timed = std::exchange( next_timed, false );
     req.timed = timed;
     req.turn = to_turns<int64_t>( calendar::turn - calendar::turn_zero );
     if( req.candidates.size() > max_candidates ) {

@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <utility>
 
+#include "achievement.h"
 #include "auto_note.h"
 #include "auto_pickup.h"
 #include "avatar.h"
@@ -26,6 +27,7 @@
 #include "event_bus.h"
 #include "field_type.h"
 #include "flag.h"
+#include "fp3d/boot.h"
 #include "fp3d/chargen.h"
 #include "fp3d/game_access.h"
 #include "fp3d/snapshot.h"
@@ -149,6 +151,8 @@ registry &reg()
 }
 
 std::atomic<bool> frozen{ false };
+// Set by boot_test_range for the game it starts, cleared by every boot (reset_test_range).
+std::atomic<bool> session{ false };
 
 std::mutex info_mutex;
 fp3d::range_info info_latest;
@@ -702,11 +706,12 @@ void reset_test_range()
     reg() = registry();
     reg().version = version + 1;
     frozen.store( false );
+    session.store( false );
 }
 
 bool range_active()
 {
-    return g != nullptr && avatar_flag( range_var );
+    return session.load() && g != nullptr && avatar_flag( range_var );
 }
 
 const std::vector<range_zone> &range_zones()
@@ -773,9 +778,15 @@ void boot_test_range( unsigned seed )
     if( g == nullptr || world_generator->active_world == nullptr ) {
         throw std::runtime_error( "test range: load the game data first (boot_new_game_data)" );
     }
+    // The range changes the world's options and clears land: only in the throwaway world boot made for it.
+    const std::string &world = world_generator->active_world->world_name;
+    if( world.compare( 0, 10, "fp3d-range" ) != 0 || !owned_world( world ) ) {
+        throw std::runtime_error( "test range: needs its own fp3d-range world (boot_new_game_data with replace)" );
+    }
     const auto t0 = std::chrono::steady_clock::now();
     rng_set_engine_seed( seed );
     reset_test_range();
+    session.store( true );
     quiet_world_options();
     calendar::start_of_cataclysm = calendar::turn_zero;
     calendar::start_of_game = calendar::turn_zero + 1_days + 10_hours;
@@ -795,6 +806,8 @@ void boot_test_range( unsigned seed )
     u.setpos( hub, false );
     settle_avatar();
     frozen.store( true );
+    // As CDDA's debug menu: a game with cheats earns no achievements.
+    get_achievements().set_enabled( false );
     std::printf( "range: booted with seed %u, %zu zones, in %.1f s\n", seed, zones.size(),
                  std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
 }
@@ -805,9 +818,24 @@ namespace
 // in the middle of an action (a popup's or menu's request) and never from another thread.
 bool between_turns()
 {
-    return next_is_timed();
+    return in_timed_hook();
 }
 constexpr const char *not_now = "Only between turns.";
+
+// Why an operation can't run now, "" if it can.
+std::string op_refusal()
+{
+    if( !between_turns() ) {
+        return not_now;
+    }
+    if( !range_active() ) {
+        return "Only in the test range.";
+    }
+    if( g->uquit != QUIT_NO || get_avatar().is_dead_state() ) {
+        return "Not now.";
+    }
+    return "";
+}
 
 bool coord_ok( const ui_point &p )
 {
@@ -820,8 +848,8 @@ bool coord_ok( const ui_point &p )
 
 std::string spawn_item( uint32_t itype, int count, const ui_point &square )
 {
-    if( !between_turns() ) {
-        return not_now;
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
     }
     if( count < 1 || count > max_spawn_count ) {
         return string_format( "Count must be 1 to %d.", max_spawn_count );
@@ -856,8 +884,8 @@ std::string spawn_item( uint32_t itype, int count, const ui_point &square )
 
 std::string spawn_monster( const std::string &mtype, const ui_point &square )
 {
-    if( !between_turns() ) {
-        return not_now;
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
     }
     if( mtype.empty() || mtype.size() > max_monster_id ) {
         return "No such monster.";
@@ -869,8 +897,15 @@ std::string spawn_monster( const std::string &mtype, const ui_point &square )
             return "No such monster.";
         }
     }
-    const mtype_id type( mtype );
-    if( !type.is_valid() || type.is_null() ) {
+    // Looked up among the loaded types: an id made from the client's text would stay interned for good.
+    mtype_id type = mtype_id::NULL_ID();
+    for( const ::mtype &m : MonsterGenerator::generator().get_all_mtypes() ) {
+        if( m.id.str() == mtype ) {
+            type = m.id;
+            break;
+        }
+    }
+    if( type.is_null() ) {
         return "No such monster.";
     }
     if( !coord_ok( square ) ) {
@@ -895,11 +930,8 @@ std::string spawn_monster( const std::string &mtype, const ui_point &square )
 
 std::string teleport_to_zone( size_t index )
 {
-    if( !between_turns() ) {
-        return not_now;
-    }
-    if( !range_active() ) {
-        return "Only in the test range.";
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
     }
     const std::vector<range_zone> &zones = range_zones();
     if( index >= zones.size() ) {
@@ -922,8 +954,8 @@ std::string teleport_to_zone( size_t index )
 
 std::string set_time_of_day( int minute )
 {
-    if( !between_turns() ) {
-        return not_now;
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
     }
     if( minute < 0 || minute > 1439 ) {
         return "The minute of the day must be 0 to 1439.";
@@ -942,8 +974,8 @@ std::string set_time_of_day( int minute )
 
 std::string advance( int minutes )
 {
-    if( !between_turns() ) {
-        return not_now;
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
     }
     if( minutes < 1 || minutes > max_advance_minutes ) {
         return string_format( "Minutes must be 1 to %d.", max_advance_minutes );
@@ -952,6 +984,19 @@ std::string advance( int minutes )
     if( u.activity ) {
         return "Finish what you are doing first.";
     }
+    // As CDDA's wait menu (handle_action.cpp): not while controlling a vehicle that moves, or would.
+    if( u.controlling_vehicle ) {
+        map &here = get_map();
+        if( const optional_vpart_position vp = here.veh_at( u.pos_bub() ) ) {
+            const vehicle &veh = vp->vehicle();
+            if( !veh.can_use_rails( here ) && ( veh.is_flying_in_air() || veh.is_falling || veh.velocity ||
+                                                ( veh.cruise_velocity && ( ( veh.is_watercraft() && veh.can_float( here ) ) ||
+                                                        veh.sufficient_wheel_config() ) ) ||
+                                                ( veh.is_in_water( true ) && !veh.can_float( here ) ) ) ) {
+                return "You can't pass time while controlling a moving vehicle.";
+            }
+        }
+    }
     u.assign_activity( player_activity( act_wait, 100 * to_turns<int>( time_duration::from_minutes( minutes ) ),
                                         0 ) );
     return "";
@@ -959,16 +1004,18 @@ std::string advance( int minutes )
 
 std::string set_ai_frozen( bool on )
 {
-    if( frozen.exchange( on ) != on ) {
-        reg().version++;
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
     }
+    // capture_range_info sees the change through ai_frozen().
+    frozen.store( on );
     return "";
 }
 
 std::string heal()
 {
-    if( !between_turns() ) {
-        return not_now;
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
     }
     avatar &u = get_avatar();
     u.set_all_parts_hp_to_max();
