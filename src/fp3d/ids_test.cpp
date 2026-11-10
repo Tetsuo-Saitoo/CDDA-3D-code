@@ -82,6 +82,16 @@ int main()
                zombie < t->monsters.size() && t->monsters[zombie].hp > 0 && t->monsters[zombie].speed > 0 &&
                t->vparts.size() > 100 && !t->vparts[1].id.empty(), "apple, mon_zombie, vehicle parts defined" );
 
+        // Pockets per item type: a plastic bottle has one rigid, watertight, sealable 500 ml pocket.
+        const uint32_t bottle = fp3d::intern_id( fp3d::id_kind::itype, "bottle_plastic" );
+        const bool bottle_ok = bottle < t->items.size() && t->items[bottle].pockets.size() == 1;
+        const fp3d::pocket_def bp = bottle_ok ? t->items[bottle].pockets[0] : fp3d::pocket_def();
+        const uint16_t want = fp3d::pocket_rigid | fp3d::pocket_watertight | fp3d::pocket_sealable;
+        check( bottle_ok && bp.volume_ml == 500 && bp.max_weight_g == 1250 && ( bp.flags & want ) == want &&
+               !( bp.flags & fp3d::pocket_ammo_only ) && t->items[apple].pockets.empty(),
+               "pockets: bottle_plastic one 500 ml watertight pocket, apple none",
+               std::to_string( bp.volume_ml ) + " ml flags " + std::to_string( bp.flags ) );
+
         const uint32_t zdog = fp3d::intern_id( fp3d::id_kind::mtype, "mon_dog_zombie_cop" );
         check( t->monsters[zombie].bodytype == "human" && zdog < t->monsters.size() &&
                t->monsters[zdog].bodytype == "dog", "monster body types (zombie human, zombie dog dog)",
@@ -120,6 +130,8 @@ int main()
         std::ostringstream os;
         fp3d::write_id_tables_json( os, *t2 );
         const std::string text = os.str();
+        check( text.find( "\"pockets\":[{\"volume_ml\":500,\"max_weight_g\":1250," ) != std::string::npos,
+               "pockets in the JSON" );
         JsonValue root = json_loader::from_string( text );
         JsonObject jo = root.get_object();
         jo.allow_omitted_members();

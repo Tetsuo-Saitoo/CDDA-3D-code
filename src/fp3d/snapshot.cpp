@@ -14,12 +14,15 @@
 
 #include "avatar.h"
 #include "calendar.h"
+#include "catacharset.h"
 #include "character_id.h"
 #include "coordinates.h"
 #include "creature.h"
+#include "effect.h"
 #include "enums.h"
 #include "type_id.h"
 #include "field.h"
+#include "fp3d/bridge.h"
 #include "fp3d/cooking.h"
 #include "fp3d/held.h"
 #include "fp3d/id_tables.h"
@@ -38,6 +41,7 @@
 #include "mapdata.h"
 #include "memory_fast.h"
 #include "monster.h"
+#include "output.h"
 #include "mtype.h"
 #include "npc.h"
 #include "trap.h"
@@ -415,6 +419,43 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
             }
         }
         pv.wielded_gun = std::move( g );
+    }
+    for( const effect &e : u.get_effects() ) {
+        if( pv.effects.size() >= max_player_effects ) {
+            break;
+        }
+        const std::string &id = e.get_id().str();
+        const std::string name = sanitize_text( utf8_truncate( remove_color_tags( e.disp_name() ),
+                                                max_effect_name_columns ), 4 * max_effect_name_columns );
+        if( name.empty() || id.empty() || id.size() > max_effect_id_bytes ) {
+            continue;
+        }
+        effect_view ev;
+        ev.id = id;
+        ev.name = name;
+        const bodypart_id bp = e.get_bp();
+        ev.body_part = bp.id().is_null() ? 0 : intern_id( id_kind::body_part, bp.id().str() );
+        ev.intensity = clamp_u8( e.get_intensity() );
+        const effect_type *t = e.get_effect_type();
+        switch( t ? t->get_rating( e.get_intensity() ) : m_neutral ) {
+            case m_good:
+                ev.rating = 1;
+                break;
+            case m_bad:
+                ev.rating = -1;
+                break;
+            case m_mixed:
+                ev.rating = 2;
+                break;
+            default:
+                ev.rating = 0;
+                break;
+        }
+        if( !e.is_permanent() ) {
+            ev.seconds_left = static_cast<int32_t>( std::clamp<int64_t>( to_seconds<int64_t>( e.get_duration() ), 0,
+                                                    INT32_MAX ) );
+        }
+        pv.effects.push_back( std::move( ev ) );
     }
     for( const bodypart_id &bp : u.get_all_body_parts( get_body_part_flags::only_main ) ) {
         const auto eff = [&]( const char *id ) {
@@ -822,6 +863,19 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         jo.end_array();
         jo.end_object();
     }
+    jo.member( "effects" );
+    jo.start_array();
+    for( const effect_view &e : pv.effects ) {
+        jo.start_object();
+        jo.member( "id", e.id );
+        jo.member( "name", e.name );
+        jo.member( "body_part", static_cast<int64_t>( e.body_part ) );
+        jo.member( "intensity", static_cast<int>( e.intensity ) );
+        jo.member( "rating", static_cast<int>( e.rating ) );
+        jo.member( "seconds_left", e.seconds_left );
+        jo.end_object();
+    }
+    jo.end_array();
     write_array( jo, "bleed", pv.bleed );
     write_array( jo, "bandaged", pv.bandaged );
     write_array( jo, "disinfected", pv.disinfected );

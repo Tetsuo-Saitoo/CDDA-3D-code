@@ -200,6 +200,27 @@ int main()
                    std::string::npos, "wielded_gun in the JSON" );
             u.remove_weapon();
         }
+        {
+            // Effects on the player: id, display name, body part (0 = whole body), rating, time left.
+            const efftype_id stunned( "stunned" );
+            u.add_effect( stunned, 5_minutes );
+            double eff_ms = 0;
+            const std::shared_ptr<const fp3d::snapshot> dazed = timed_capture( eff_ms );
+            const fp3d::effect_view *found = nullptr;
+            for( const fp3d::effect_view &e : dazed->player.effects ) {
+                found = e.id == "stunned" ? &e : found;
+            }
+            check( found && found->name == "Stunned" && found->body_part == 0 && found->rating == -1 &&
+                   found->intensity == 1 && found->seconds_left > 0 && found->seconds_left <= 300,
+                   "stunned effect in the player view", found ? found->name + " " +
+                   std::to_string( found->seconds_left ) + " s" : "none" );
+            std::ostringstream eff_json;
+            fp3d::write_snapshot_json( eff_json, *dazed, u.posz(), u.posz() );
+            check( eff_json.str().find( "{\"id\":\"stunned\",\"name\":\"Stunned\",\"body_part\":0,\"intensity\":1,"
+                                        "\"rating\":-1,\"seconds_left\":" ) != std::string::npos,
+                   "effects in the JSON" );
+            u.remove_effect( stunned );
+        }
 
         // One wall 3 squares east of the player: exactly one submap's shape revision moves.
         const tripoint_bub_ms wall_at = u.pos_bub() + tripoint_rel_ms( 3, 0, 0 );

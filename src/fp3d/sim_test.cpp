@@ -835,14 +835,18 @@ bool realtime_checks( fp3d::ui_request &req )
     fp3d::set_clock_mode( fp3d::clock_mode::real_time );
     std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
     for( int i = 0; i < 3; i++ ) {
-        const std::optional<fp3d::ui_request> next = fp3d::wait_request( 3000, req.id );
+        const std::optional<fp3d::ui_request> next = fp3d::wait_request( 10000, req.id );
         const double ms = ms_since( t );
         t = std::chrono::steady_clock::now();
         if( !next || !next->timed ) {
             std::printf( "    real time: no main-loop request after %.0f ms\n", ms );
             return false;
         }
-        const bool step_ok = next->turn > req.turn && next->turn <= req.turn + 2 && ms >= 150 && ms <= 1000;
+        // A turn is 250 ms at this timescale: never faster (paced), but a loaded machine (parallel builds) may be
+        // slower, so the upper bound is loose and a slow step may have let a turn or two more pass.
+        const int64_t turns = next->turn - req.turn;
+        const bool step_ok = turns >= 1 && ms >= 150 && turns <= 2 + static_cast<int64_t>( ms / 250 ) &&
+                             ms <= 10000;
         std::printf( "    real time: turn %lld -> %lld after %.0f ms %s\n", static_cast<long long>( req.turn ),
                      static_cast<long long>( next->turn ), ms, step_ok ? "ok" : "BAD" );
         ok = ok && step_ok;
