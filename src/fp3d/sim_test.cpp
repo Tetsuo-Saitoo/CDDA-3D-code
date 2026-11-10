@@ -31,6 +31,7 @@
 #include "fp3d/game_access.h"
 #include "fp3d/held.h"
 #include "fp3d/points.h"
+#include "fp3d/shot.h"
 #include "fp3d/events.h"
 #include "fp3d/snapshot.h"
 #include "game.h"
@@ -86,6 +87,7 @@ struct observed {
     int hoses = 0;           // hoses carried (wielded included)
     int ammo = -1;           // shoot check: rounds in the wielded gun (-1 nothing wielded)
     int zombie_hp = -1;      // hp of the first monster (-1 none)
+    uint64_t zombie_uid = 0; // its snapshot uid
     std::vector<std::string> messages;
 };
 std::mutex observed_mutex;
@@ -239,6 +241,7 @@ void observe()
     }
     for( monster &m : g->all_monsters() ) {
         o.zombie_hp = m.get_hp();
+        o.zombie_uid = fp3d::creature_uid( m );
         break;
     }
     o.rocks_carried = u.amount_of( itype_rock );
@@ -883,6 +886,52 @@ static bool run_shoot_checks()
     check( after.ammo == before.ammo - 1, "one shot fired", "ammo " + std::to_string( before.ammo ) + " -> " +
            std::to_string( after.ammo ) );
     std::printf( "  shoot: zombie hp %d -> %d\n", before.zombie_hp, after.zombie_hp );
+
+    // Client-flown shots (fp3d/shot.h): a planned miss leaves the zombie as it was, a planned head hit
+    // always hurts it. Pistol reloaded, zombie restored each time (hand_setup 11).
+    const auto client_shot = [&]( bool hit ) {
+        hand_setup = 11;
+        std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
+        if( !q || !q->timed ) {
+            return std::make_pair( -1, -1 );
+        }
+        fp3d::queue_action( "pause" );
+        q = fp3d::wait_request( 20000, q->id );
+        const observed b = snapshot();
+        if( !q ) {
+            return std::make_pair( -1, -1 );
+        }
+        fp3d::queue_action( "fire" );
+        std::optional<fp3d::ui_request> c = fp3d::wait_request( 20000, q->id );
+        int n = 0;
+        while( c && !c->timed && n++ < 20 ) {
+            fp3d::ui_answer a;
+            a.id = c->id;
+            if( c->kind == fp3d::request_kind::target && n == 1 ) {
+                fp3d::shot_answer s;
+                // a miss stops 2 squares north of the zombie; a hit is in its head
+                s.end = fp3d::ui_point{ c->origin.x - 3, c->origin.y - ( hit ? 0 : 2 ), c->origin.z };
+                s.hit_uid = hit ? b.zombie_uid : 0;
+                s.part = "head";
+                s.quality = 0.1f;
+                a.pos = s.end;
+                a.action = "FIRE";
+                a.shot = s;
+            } else {
+                a.cancel = true;
+            }
+            fp3d::answer( a );
+            const auto id = c->id;
+            c = fp3d::wait_request( 20000, id );
+        }
+        return std::make_pair( b.zombie_hp, snapshot().zombie_hp );
+    };
+    const auto miss = client_shot( false );
+    check( miss.first > 0 && miss.second == miss.first, "client shot: planned miss",
+           "hp " + std::to_string( miss.first ) + " -> " + std::to_string( miss.second ) );
+    const auto head = client_shot( true );
+    check( head.first > 0 && head.second < head.first, "client shot: planned head hit",
+           "hp " + std::to_string( head.first ) + " -> " + std::to_string( head.second ) );
     return failed == 0;
 }
 

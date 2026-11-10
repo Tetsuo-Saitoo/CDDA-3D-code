@@ -21,6 +21,8 @@
 #include "cata_variant.h"
 #include "character.h"
 #include "fp3d/events.h" // FP3D:
+#include "fp3d/shot.h" // FP3D:
+#include "fp3d/snapshot.h" // FP3D:
 #include "character_attire.h"
 #include "character_id.h"
 #include "color.h"
@@ -1145,6 +1147,15 @@ projectile_attack_results Creature::select_body_part_projectile_attack(
     if( mon ) {
         fatal_hit = ret.max_damage * crit_multiplier > get_hp_max();
         ret.wp = mon->type->weakpoints.select_weakpoint( attack );
+        const fp3d::shot_plan *plan = fp3d::shot_plan_for( attack.source ); // FP3D: the part the client hit
+        if( plan != nullptr && plan->hit_uid == fp3d::creature_uid( *this ) ) {
+            for( const weakpoint &w : mon->type->weakpoints.weakpoint_list ) {
+                if( w.id == plan->part ) {
+                    ret.wp = &w;
+                    break;
+                }
+            }
+        }
         crit_roll &= ret.wp->is_good && !ret.wp->id.empty();
         ret.is_headshot = !has_flag( mon_flag_NOHEAD ) && ret.wp->is_head;
     } else {
@@ -1157,6 +1168,13 @@ projectile_attack_results Creature::select_body_part_projectile_attack(
         // Range is -0.5 to 1.5 -> missed_by will be [1, 0], so the rng addition to it
         // will push it to at most 1.5 and at least -0.5
         ret.bp_hit = get_anatomy()->select_body_part_projectile_attack( -0.5, 1.5, hit_value );
+        const fp3d::shot_plan *plan = fp3d::shot_plan_for( attack.source ); // FP3D: the part the client hit
+        if( !magic && plan != nullptr && plan->hit_uid == fp3d::creature_uid( *this ) && !plan->part.empty() ) {
+            const bodypart_str_id bp( plan->part );
+            if( bp.is_valid() && has_part( bp.id() ) ) {
+                ret.bp_hit = bp.id();
+            }
+        }
         crit_mod = get_crit_factor( ret.bp_hit );
         fatal_hit = ret.max_damage * crit_multiplier > get_hp_max( ret.bp_hit );
         ret.is_headshot = ret.bp_hit.id() == body_part_head;

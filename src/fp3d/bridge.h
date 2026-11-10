@@ -69,6 +69,14 @@ struct ui_request {
     std::string pause_reason;
 };
 
+// A shot the client flew itself (target requests, with FIRE): see fp3d/shot.h.
+struct shot_answer {
+    ui_point end;                        // absolute square where the bullet stopped
+    uint64_t hit_uid = 0;                // creature hit, 0 = miss
+    std::string part;                    // body part / weak point id, "" = CDDA picks
+    float quality = 0.3f;                // 0 dead centre .. <1 grazing
+};
+
 struct ui_answer {
     uint64_t id = 0;
     bool cancel = false;
@@ -77,6 +85,7 @@ struct ui_answer {
     std::string text;                    // string
     std::vector<std::pair<int, int>> picks;  // item_multi: (entry id, count; 0 = all)
     std::optional<ui_point> pos;         // direction: relative (-1..1); target: absolute square
+    std::optional<shot_answer> shot;     // target: where the client's own bullet went
     bool timed_out = false;              // set by the bridge only: a timed request expired
     bool queued = false;                 // set by the bridge only: taken from the action queue
 };

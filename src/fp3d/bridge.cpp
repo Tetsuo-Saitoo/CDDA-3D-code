@@ -220,6 +220,15 @@ ui_answer ask( ui_request req )
     if( a.pos && !( coord_ok( a.pos->x ) && coord_ok( a.pos->y ) && coord_ok( a.pos->z ) ) ) {
         a.pos.reset();
     }
+    // A client shot only answers a target request, lands somewhere real and names a short id.
+    if( a.shot && ( kind != request_kind::target ||
+                    !( coord_ok( a.shot->end.x ) && coord_ok( a.shot->end.y ) && coord_ok( a.shot->end.z ) ) ) ) {
+        a.shot.reset();
+    }
+    if( a.shot ) {
+        a.shot->part = sanitize_text( a.shot->part, 64 );
+        a.shot->quality = std::clamp( a.shot->quality, 0.0f, 0.99f );
+    }
     return a;
 }
 
