@@ -23,6 +23,7 @@
 #include <windows.h>
 #endif
 
+#include "achievement.h"
 #include "avatar.h"
 #include "cached_options.h"
 #include "calendar.h"
@@ -120,6 +121,7 @@ struct observed {
     int torso_hp_lost = -1;  // ... hp the torso lost to a 10 damage hit (-1: not probed)
     int kit_guns = 0;        // ... carried Glock 19, Remington 870 and SCAR-L with ammo loaded
     bool big_pack = false;   // ... the kit's big backpack, worn (or carried when CDDA won't let it be worn)
+    bool achievements = true; // ... CDDA's achievements still on in this game
     std::vector<std::string> messages;
 };
 std::mutex observed_mutex;
@@ -379,6 +381,7 @@ void observe()
         get_avatar().set_wielded_item( empty );
     }
     o.carry_kg = static_cast<int>( units::to_kilogram( u.weight_capacity() ) );
+    o.achievements = get_achievements().is_enabled();
     for( const item_location &it : get_avatar().all_items_loc() ) {
         if( it->typeId() == itype_9mm && !( it.has_parent() && ( it.parent_item()->is_gun() ||
                                             it.parent_item()->is_magazine() ) ) ) {
@@ -517,6 +520,18 @@ int check_world_names()
     check( fp3d::replaceable_world( "fp3d-live" ) && !fp3d::replaceable_world( "fp3d-" ) &&
            !fp3d::replaceable_world( "World" ) && !fp3d::replaceable_world( "FP3D-live" ),
            "only fp3d- worlds replaceable" );
+    check( fp3d::reserved_world_name( "FP3D-x" ) && fp3d::reserved_world_name( "fp3d-" ) &&
+           fp3d::reserved_world_name( "Fp3D-live" ) && !fp3d::reserved_world_name( "fp3d" ) &&
+           !fp3d::reserved_world_name( "x-fp3d-" ) && !fp3d::reserved_world_name( "" ),
+           "fp3d- names reserved, any case" );
+    check( fp3d::owned_world( "fp3d-sim" ), "the world boot made is marked as its own" );
+    const std::filesystem::path theirs = std::filesystem::u8path( PATH_INFO::savedir() ) / "fp3d-theirs";
+    std::filesystem::create_directories( theirs, ec );
+    const bool plain = !fp3d::owned_world( "fp3d-theirs" );
+    std::filesystem::create_directories( theirs / fp3d::owned_world_marker, ec );
+    check( plain && !fp3d::owned_world( "fp3d-theirs" ) && !fp3d::owned_world( "fp3d-nothere" ),
+           "unmarked worlds aren't replaced" );
+    std::filesystem::remove_all( theirs, ec );
     return failed;
 }
 
@@ -2057,6 +2072,9 @@ static bool run_cheat_checks()
            !fp3d::queue_action( fp3d::item_action_name ), "bridge's own actions can't be queued", "" );
     check( !fp3d::request_cheat( fp3d::cheat::count, true ) &&
            !fp3d::request_cheat( static_cast<fp3d::cheat>( 200 ), true ), "out-of-range cheat refused", "" );
+    check( !fp3d::cheats_allowed() && !fp3d::request_cheat( fp3d::cheat::invincible, true ) &&
+           !fp3d::request_test_kit() && snapshot().achievements, "refused until allowed, achievements on", "" );
+    fp3d::set_cheats_allowed( true );
 
     // All on: applied at the main loop's next request (the sim asks again right after).
     for( size_t i = 0; i < fp3d::cheat_count; i++ ) {
@@ -2065,7 +2083,7 @@ static bool run_cheat_checks()
     r = fp3d::wait_request( 20000, r->id );
     const uint32_t all = ( 1U << fp3d::cheat_count ) - 1;
     const fp3d::cheats_view on = fp3d::latest_cheats();
-    check( r && on.on == all, "all on", std::to_string( on.on ) );
+    check( r && on.on == all && !snapshot().achievements, "all on, achievements off", std::to_string( on.on ) );
     if( !r ) {
         return false;
     }
@@ -2113,6 +2131,9 @@ static bool run_cheat_checks()
     const observed hurt = snapshot();
     check( r && hurt.torso_hp_lost > 0 && hurt.carry_kg < 1000, "off: a hit hurts, normal weight limit",
            std::to_string( hurt.torso_hp_lost ) + " hp, " + std::to_string( hurt.carry_kg ) + " kg" );
+    fp3d::set_cheats_allowed( false );
+    check( !fp3d::request_cheat( fp3d::cheat::invincible, true ) && !fp3d::request_test_kit() &&
+           !hurt.achievements, "refused again once disallowed", "" );
     return failed == 0;
 }
 

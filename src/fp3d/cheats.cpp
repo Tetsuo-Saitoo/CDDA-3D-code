@@ -5,6 +5,7 @@
 #include <utility>
 #include <vector>
 
+#include "achievement.h"
 #include "avatar.h"
 #include "calendar.h"
 #include "fp3d/bridge.h"
@@ -12,6 +13,7 @@
 #include "item_location.h"
 #include "itype.h"
 #include "messages.h"
+#include "translations.h"
 #include "type_id.h"
 
 static const itype_id itype_backpack_giant( "backpack_giant" );
@@ -77,6 +79,7 @@ struct requests {
     std::mutex m;
     std::array<std::optional<bool>, cheat_count> want{};
     bool kit = false;
+    bool allowed = false;
     cheats_view latest;
     uint64_t kits_given = 0;
 };
@@ -84,6 +87,16 @@ requests &reqs()
 {
     static requests r;
     return r;
+}
+
+// As CDDA's debug menu: a game where cheats were used earns no achievements.
+void no_achievements()
+{
+    achievements_tracker &a = get_achievements();
+    if( a.is_enabled() ) {
+        add_msg( m_mixed, _( "Achievements have been disabled." ) );
+        a.set_enabled( false );
+    }
 }
 
 // The ammo to fill a gun with: what it holds now, else its default; null when it takes no ammo items.
@@ -226,6 +239,24 @@ std::optional<cheat> cheat_from_name( const std::string &name )
     return std::nullopt;
 }
 
+void set_cheats_allowed( bool on )
+{
+    requests &r = reqs();
+    std::lock_guard<std::mutex> lk( r.m );
+    r.allowed = on;
+    if( !on ) {
+        r.want = {};
+        r.kit = false;
+    }
+}
+
+bool cheats_allowed()
+{
+    requests &r = reqs();
+    std::lock_guard<std::mutex> lk( r.m );
+    return r.allowed;
+}
+
 bool request_cheat( cheat c, bool on )
 {
     const size_t i = static_cast<size_t>( c );
@@ -235,6 +266,9 @@ bool request_cheat( cheat c, bool on )
     {
         requests &r = reqs();
         std::lock_guard<std::mutex> lk( r.m );
+        if( !r.allowed ) {
+            return false;
+        }
         r.want[i] = on;
     }
     return want_job();
@@ -248,6 +282,9 @@ bool request_test_kit()
     {
         requests &r = reqs();
         std::lock_guard<std::mutex> lk( r.m );
+        if( !r.allowed ) {
+            return false;
+        }
         r.kit = true;
     }
     return want_job();
@@ -286,6 +323,13 @@ void run_cheat_requests( avatar &u )
         std::lock_guard<std::mutex> lk( r.m );
         want = std::exchange( r.want, {} );
         kit = std::exchange( r.kit, false );
+    }
+    bool turning_on = kit;
+    for( size_t i = 0; i < cheat_count; i++ ) {
+        turning_on = turning_on || ( want[i] && *want[i] && !cheat_on( u, static_cast<cheat>( i ) ) );
+    }
+    if( turning_on ) {
+        no_achievements();
     }
     for( size_t i = 0; i < cheat_count; i++ ) {
         if( want[i] && cheat_on( u, static_cast<cheat>( i ) ) != *want[i] ) {

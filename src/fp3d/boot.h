@@ -35,6 +35,12 @@ std::optional<std::string> world_name_taken( const std::string &world_name );
 
 // FP3D's own throwaway worlds ("fp3d-" names: --quick, the tests), which a fresh start may replace.
 bool replaceable_world( const std::string &world_name );
+// Names kept for those: "fp3d-" in any case. A new world can't take one unless boot may replace it.
+bool reserved_world_name( const std::string &world_name );
+// The file boot writes into the worlds it makes for a replacing start; only a world folder holding it (a plain
+// file) is replaced, so a player's world of such a name never is.
+constexpr const char *owned_world_marker = "fp3d_made_this_world.txt";
+bool owned_world( const std::string &world_name );
 
 // Loads game data and the saved character `save_name` (its save id, i.e. the character name) from the existing
 // world `world_name` under the user directory, the way CDDA's main menu loads a game (g->setup(), then
