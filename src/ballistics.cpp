@@ -12,6 +12,8 @@
 
 #include "character.h"
 #include "fp3d/events.h" // FP3D:
+#include "fp3d/shot.h" // FP3D:
+#include "fp3d/snapshot.h" // FP3D:
 #include "coordinates.h"
 #include "creature.h"
 #include "creature_tracker.h"
@@ -276,6 +278,14 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         }
     }
 
+    // FP3D: the client flew this shot; its outcome replaces the dispersion roll
+    const fp3d::shot_plan *fp3d_plan = fp3d::shot_plan_for( origin );
+    if( fp3d_plan != nullptr ) {
+        aim.missed_by = fp3d_plan->hit_uid != 0 ? fp3d_plan->quality : 1.0;
+        aim.missed_by_tiles = 0.0;
+        aim.dispersion = 0.0;
+    }
+
     // TODO: move to-hit roll back in here
 
     attack.proj = proj_arg;
@@ -313,6 +323,14 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
     double extend_to_range = no_overshoot ? range : proj_arg.range;
 
     tripoint_bub_ms target = target_arg;
+    if( fp3d_plan != nullptr ) { // FP3D: stop where the client's bullet stopped
+        const tripoint_bub_ms end = here->get_bub( fp3d_plan->end );
+        if( here->inbounds( end ) && end != source ) {
+            target = end;
+            range = rl_dist( source, target );
+            extend_to_range = range;
+        }
+    }
     std::vector<tripoint_bub_ms> trajectory;
     if( aim.missed_by_tiles >= 1.0 ) {
         // We missed enough to target a different tile
@@ -531,6 +549,9 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                 // Unintentional hit
                 cur_missed_by = std::max( rng_float( 0.1, 1.5 - aim.missed_by ) /
                                           critter->ranged_target_size(), 0.4 );
+            }
+            if( fp3d_plan != nullptr && critter != nullptr ) { // FP3D: only the creature the client hit
+                cur_missed_by = fp3d::creature_uid( *critter ) == fp3d_plan->hit_uid ? fp3d_plan->quality : 1.0;
             }
             // If the attack is shot, once we're past point-blank,
             // don't print normal hit msg.

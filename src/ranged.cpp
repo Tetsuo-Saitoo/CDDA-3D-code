@@ -17,6 +17,7 @@
 #include "activity_actor_definitions.h"
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/events.h" // FP3D:
+#include "fp3d/shot.h" // FP3D:
 #include "fp3d/points.h" // FP3D:
 #include "avatar.h"
 #include "ballistics.h"
@@ -1014,6 +1015,12 @@ int Character::fire_gun( const tripoint_bub_ms &target, int shots )
 int Character::fire_gun( map &here, const tripoint_bub_ms &target, int shots, item &gun,
                          item_location ammo )
 {
+    // FP3D: a client-decided shot covers this one trigger pull only
+    struct fp3d_plan_done {
+        ~fp3d_plan_done() {
+            fp3d::clear_shot_plan();
+        }
+    } fp3d_plan_done_now;
     if( !gun.is_gun() ) {
         debugmsg( "%s tried to fire non-gun (%s).", get_name(), gun.tname() );
         return 0;
@@ -3005,6 +3012,12 @@ std::string target_ui::fp3d_ask()
         }
     }
     const fp3d::ui_answer a = fp3d::ask( req );
+    if( a.shot ) {
+        fp3d::set_shot_plan( { fp3d::to_abs_ms( a.shot->end ), a.shot->hit_uid, a.shot->part,
+                               static_cast<double>( a.shot->quality ) } );
+    } else {
+        fp3d::clear_shot_plan();
+    }
     if( a.cancel ) {
         return "QUIT";
     }

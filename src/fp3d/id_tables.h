@@ -57,6 +57,7 @@ struct item_def {
     std::string color;
     std::string looks_like;
     std::string category;
+    std::string gun_ammo;   // a gun's first ammo type (9mm, 223, shot, arrow, ...), "" if not a gun
     std::string gun;        // skill a gun uses (pistol, rifle, archery, launcher, ...), "" if not a gun
     int volume_ml = 0;
     int weight_g = 0;
@@ -75,6 +76,7 @@ struct monster_def {
     int weight_g = 0;
     std::vector<std::string> species;
     std::string bodytype;          // CDDA's body type: human, dog, insect, snake, bird, blob, ...; may be empty
+    std::vector<std::string> weakpoints;   // weak point ids (head, eye, arm, leg, ...; "" = the body), cap 32
 };
 
 struct vpart_def {

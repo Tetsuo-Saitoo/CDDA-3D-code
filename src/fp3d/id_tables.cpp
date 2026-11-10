@@ -24,6 +24,7 @@
 #include "trap.h"
 #include "units.h"
 #include "veh_type.h"
+#include "weakpoint.h"
 #include "weather_type.h"
 
 namespace fp3d
@@ -237,6 +238,9 @@ void build_id_tables()
         d.category = it.category_force.str();
         if( it.gun ) {
             d.gun = it.gun->skill_used.str();
+            if( !it.gun->ammo.empty() ) {
+                d.gun_ammo = it.gun->ammo.begin()->str();
+            }
         }
         d.volume_ml = static_cast<int>( units::to_milliliter( it.volume ) );
         d.weight_g = static_cast<int>( units::to_gram( it.weight ) );
@@ -264,6 +268,11 @@ void build_id_tables()
             d.species.push_back( s.str() );
         }
         d.bodytype = m.bodytype;
+        for( const weakpoint &w : m.weakpoints.weakpoint_list ) {
+            if( d.weakpoints.size() < 32 && !w.id.empty() ) {
+                d.weakpoints.push_back( w.id );
+            }
+        }
     }
     const std::vector<std::string> vp_names = id_names( id_kind::vpart );
     t->vparts.resize( vp_names.size() );
@@ -335,6 +344,7 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         jo.member( "category", d.category );
         if( !d.gun.empty() ) {
             jo.member( "gun", d.gun );
+            jo.member( "gun_ammo", d.gun_ammo );
         }
         jo.member( "volume_ml", d.volume_ml );
         jo.member( "weight_g", d.weight_g );
@@ -357,6 +367,7 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         jo.member( "weight_g", d.weight_g );
         write_strings( jo, "species", d.species );
         jo.member( "bodytype", d.bodytype );
+        jo.member( "weakpoints", d.weakpoints );
         jo.end_object();
     }
     jo.end_array();
