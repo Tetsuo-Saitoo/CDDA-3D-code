@@ -192,7 +192,7 @@ void fill_range_ops()
 {
     fp3d::range_op heal;
     heal.kind = fp3d::range_op_kind::heal;
-    std::vector<fp3d::range_op> ops( 25, heal );
+    std::vector<fp3d::range_op> ops( 24, heal );
     fp3d::range_op op;
     op.kind = fp3d::range_op_kind::ai_frozen;
     op.number = 1;
@@ -208,6 +208,10 @@ void fill_range_ops()
     ops.push_back( op );
     op = {};
     op.kind = fp3d::range_op_kind::teleport;
+    ops.push_back( op );
+    op = {};
+    op.kind = fp3d::range_op_kind::rebuild_zone;
+    op.number = 1;
     ops.push_back( op );
     op = {};
     op.kind = fp3d::range_op_kind::time_of_day;

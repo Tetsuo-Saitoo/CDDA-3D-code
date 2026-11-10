@@ -253,6 +253,8 @@ enum class id_kind : int {
 };
 uint32_t intern_id( id_kind kind, const std::string &id );
 std::vector<std::string> id_names( id_kind kind );
+// One name of a session table without copying the table: "" for index 0 ("none") or past the end.
+std::string id_name( id_kind kind, uint32_t index );
 // Empties every session table (block B6 refills them; see id_tables.h).
 void reset_id_names();
 // Name for an index of ter/furn/trap/field ("ter", "furn", "trap", "field"); "" if out of range.
