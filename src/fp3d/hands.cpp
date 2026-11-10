@@ -11,6 +11,7 @@
 #include "creature.h"
 #include "creature_tracker.h"
 #include "fp3d/held.h"
+#include "fp3d/swing.h"
 #include "input_context.h"
 #include "item.h"
 #include "item_location.h"
@@ -24,6 +25,8 @@ namespace fp3d
 namespace
 {
 const std::string attack_prefix = "fp3d_attack_";
+// The furthest a reach weapon strikes along a direction, in squares.
+constexpr int max_reach = 3;
 
 struct dir_step {
     const char *name;
@@ -67,6 +70,8 @@ void register_hand_actions( input_context &ctxt )
         for( const dir_step &d : dirs ) {
             ctxt.register_action( attack_prefix + hand + "_" + d.name,
                                   no_translation( std::string( "attack, " ) + hand + " hand" ) );
+            ctxt.register_action( attack_prefix + hand + "_aim_" + d.name,
+                                  no_translation( std::string( "aimed attack, " ) + hand + " hand" ) );
         }
     }
 }
@@ -91,6 +96,10 @@ bool hand_attack( avatar &u, const std::string &action )
     } else {
         return false;
     }
+    const bool aimed = starts_with( rest, "aim_" );
+    if( aimed ) {
+        rest = rest.substr( 4 );
+    }
     const auto d = std::find_if( dirs.begin(), dirs.end(), [&rest]( const dir_step & s ) {
         return rest == s.name;
     } );
@@ -99,6 +108,20 @@ bool hand_attack( avatar &u, const std::string &action )
     }
     const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( d->dx, d->dy, 0 );
     Creature *c = get_creature_tracker().creature_at<Creature>( target );
+    // Nobody next to you that way: the main hand's weapon may reach further along it (CDDA's reach attack).
+    tripoint_bub_ms reach_target = target;
+    if( ( c == nullptr || c == &u ) && !off ) {
+        const item_location weapon = u.get_wielded_item();
+        const int reach = weapon ? std::clamp( weapon->current_reach_range( u ), 1, max_reach ) : 1;
+        for( int r = 2; r <= reach; r++ ) {
+            const tripoint_bub_ms q = u.pos_bub() + tripoint_rel_ms( d->dx * r, d->dy * r, 0 );
+            if( Creature *beyond = get_creature_tracker().creature_at<Creature>( q ) ) {
+                c = beyond;
+                reach_target = q;
+                break;
+            }
+        }
+    }
     if( c == nullptr || c == &u ) {
         u.add_msg_if_player( m_info, _( "Nothing there to hit." ) );
         return false;
@@ -113,6 +136,16 @@ bool hand_attack( avatar &u, const std::string &action )
             u.add_msg_if_player( m_info, _( "You hold back from hitting your %s." ), mon->get_name() );
             return false;
         }
+    }
+    // An aimed strike asks the client which part it aims at (fp3d/swing.h).
+    std::optional<aimed_strike> aim;
+    if( aimed ) {
+        aim.emplace();
+    }
+    if( !off && reach_target != target ) {
+        const int moves = u.get_moves();
+        u.reach_attack( reach_target );
+        return u.get_moves() != moves;
     }
     if( !off ) {
         return u.melee_attack( *c, true );

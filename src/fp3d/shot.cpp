@@ -478,34 +478,23 @@ double outcome_missed_by( const shot_outcome &o, const Creature &critter, double
     return cur;
 }
 
-const weakpoint *planned_weakpoint( const monster &target, const weakpoint_attack &attack, double goodhit )
+const weakpoint *client_weakpoint( const monster &target, const weakpoint_attack &attack, const std::string &part,
+                                  double goodhit )
 {
-    const std::string *part = planned_part( target, attack.source );
-    if( part == nullptr ) {
-        return nullptr;
-    }
     for( const weakpoint &w : target.type->weakpoints.weakpoint_list ) {
-        if( w.id == *part ) {
-            if( part_lands( w.hit_chance( attack ) / 100.0, goodhit ) ) {
-                n_parts++;
-                return &w;
-            }
-            return nullptr;
+        if( w.id == part ) {
+            return part_lands( w.hit_chance( attack ) / 100.0, goodhit ) ? &w : nullptr;
         }
     }
     return nullptr;
 }
 
-std::optional<bodypart_id> planned_body_part( const Creature &target, const Creature *source, double goodhit )
+std::optional<bodypart_id> client_body_part( const Creature &target, const std::string &part, double goodhit )
 {
-    const std::string *part = planned_part( target, source );
-    if( part == nullptr ) {
-        return std::nullopt;
-    }
     // Found by name among the loaded body parts, so the client's string never becomes an id itself.
     const body_part_type *found = nullptr;
     for( const body_part_type &bp : body_part_type::get_all() ) {
-        if( bp.id.str() == *part ) {
+        if( bp.id.str() == part ) {
             found = &bp;
             break;
         }
@@ -524,7 +513,32 @@ std::optional<bodypart_id> planned_body_part( const Creature &target, const Crea
     if( !( total > 0.0 ) || !part_lands( id->hit_size / total, goodhit ) ) {
         return std::nullopt;
     }
-    n_parts++;
+    return id;
+}
+
+const weakpoint *planned_weakpoint( const monster &target, const weakpoint_attack &attack, double goodhit )
+{
+    const std::string *part = planned_part( target, attack.source );
+    if( part == nullptr ) {
+        return nullptr;
+    }
+    const weakpoint *w = client_weakpoint( target, attack, *part, goodhit );
+    if( w != nullptr ) {
+        n_parts++;
+    }
+    return w;
+}
+
+std::optional<bodypart_id> planned_body_part( const Creature &target, const Creature *source, double goodhit )
+{
+    const std::string *part = planned_part( target, source );
+    if( part == nullptr ) {
+        return std::nullopt;
+    }
+    std::optional<bodypart_id> id = client_body_part( target, *part, goodhit );
+    if( id ) {
+        n_parts++;
+    }
     return id;
 }
 

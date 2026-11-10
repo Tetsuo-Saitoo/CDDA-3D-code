@@ -30,6 +30,7 @@ enum class request_kind : int {
     world_setup,  // new world settings + mods: `text` is the catalog JSON, the answer's `text` the choices (worldgen.h)
     chargen,      // create a character: `text` is the catalog JSON, the answer's `text` the choices JSON (chargen.h)
     shot,         // one projectile of a client-flown trigger pull: CDDA's rolled error; answered with `shot` (shot.h)
+    swing,        // an aimed melee strike (origin: attacker, cursor: the creature struck); answered with `shot` (swing.h)
 };
 const char *kind_name( request_kind k );
 

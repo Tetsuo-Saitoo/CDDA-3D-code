@@ -26,6 +26,7 @@
 #include "character.h"
 #include "fp3d/events.h" // FP3D:
 #include "fp3d/hands.h" // FP3D:
+#include "fp3d/swing.h" // FP3D:
 #include "character_attire.h"
 #include "character_martial_arts.h"
 #include "color.h"
@@ -598,6 +599,9 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
 
     recalculate_enchantment_cache();
 
+    // FP3D: an aimed strike asks the client which part this swing aims at (fp3d/swing.h)
+    const fp3d::swing_scope fp3d_swing( *this, t );
+
     melee::melee_stats.attack_count += 1;
     int hit_spread = t.deal_melee_attack( this, hit_roll() );
     if( !t.is_avatar() ) {
@@ -745,8 +749,15 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
             melee::melee_stats.actual_crit_count += 1;
         }
         // select target body part
-        const bodypart_id &target_bp = t.select_body_part( -1, -1, can_attack_high(),
-                                       hit_spread );
+        bodypart_id target_bp = t.select_body_part( -1, -1, can_attack_high(), // FP3D: a copy, not a reference
+                                hit_spread );
+        // FP3D: an aimed strike's part (fp3d/swing.h) weights the pick; a monster's is a weak point (absorb_hit)
+        fp3d::swing_rolled( hit_spread, critical_hit );
+        if( !t.is_monster() && can_attack_high() ) {
+            if( const std::optional<bodypart_id> fp3d_bp = fp3d::swing_body_part( t ) ) {
+                target_bp = *fp3d_bp;
+            }
+        }
 
         const bool has_force_technique = !force_technique.str().empty();
 

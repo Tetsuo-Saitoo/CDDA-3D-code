@@ -20,6 +20,7 @@
 #include "catacharset.h"
 #include "character.h"
 #include "fp3d/events.h" // FP3D:
+#include "fp3d/swing.h" // FP3D:
 #include "coordinates.h"
 #include "creature_tracker.h"
 #include "cursesdef.h"
@@ -2080,6 +2081,11 @@ const weakpoint *monster::absorb_hit( const weakpoint_attack &attack, const body
     const weakpoint *wkpt = attack.accuracy == -1.0 ?
                             type->weakpoints.select_weakpoint( attack ) :
                             &wp;
+    if( attack.accuracy == -1.0 ) {
+        if( const weakpoint *fp3d_wp = fp3d::swing_weakpoint( *this, attack ) ) {
+            wkpt = fp3d_wp; // FP3D: an aimed strike's weak point, when the hit lands there (fp3d/swing.h)
+        }
+    }
     wkpt->apply_to( r );
     for( damage_unit &elem : dam.damage_units ) {
         adjust_taken_damage_by_enchantments( elem );

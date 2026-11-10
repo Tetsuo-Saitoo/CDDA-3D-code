@@ -149,6 +149,12 @@ const weakpoint *planned_weakpoint( const monster &target, const weakpoint_attac
 std::optional<bodypart_id> planned_body_part( const Creature &target, const Creature *source,
         double goodhit );
 
+// The same for any hit (fp3d/swing.h too): the client's weak point / body part `part` (an id string, looked up,
+// never made an id) if it lands with `goodhit` (0 dead centre .. 1 graze), else null / nullopt.
+const weakpoint *client_weakpoint( const monster &target, const weakpoint_attack &attack, const std::string &part,
+                                  double goodhit );
+std::optional<bodypart_id> client_body_part( const Creature &target, const std::string &part, double goodhit );
+
 // A dead-centre hit makes the client's part this many times as likely as its own chance (1 for a graze).
 constexpr double aim_weight_max = 4.0;
 // `shot` requests per trigger pull at most (a long `fly` burst would stall the client one frame per round).

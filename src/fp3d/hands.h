@@ -8,6 +8,9 @@
 // melee attack with what is wielded. The off hand (left) strikes with what it holds (fp3d/held.h), else unarmed,
 // as CDDA fights unarmed (strength, unarmed skill, the style's unarmed techniques, gloves); it is refused while the
 // wielded item needs both hands or the left arm is broken. Nobody there (or someone friendly): a message, no time.
+// Nobody next to you that way: the main hand's weapon with reach strikes the first creature along it (CDDA's
+// reach attack, up to its reach, 3 at most). "fp3d_attack_<main|off>_aim_<DIR>" is the same strike, aimed: the
+// client's crosshair is on that creature, so the swing asks a `swing` request (fp3d/swing.h).
 
 #include <string>
 #include <vector>

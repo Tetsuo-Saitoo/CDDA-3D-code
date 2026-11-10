@@ -51,6 +51,7 @@
 #include "fp3d/test_range.h"
 #include "fp3d/events.h"
 #include "fp3d/snapshot.h"
+#include "fp3d/swing.h"
 #include "game.h"
 #include "game_constants.h"
 #include "item.h"
@@ -2098,6 +2099,7 @@ static bool run_combat_checks()
         int moves = 0;              // moves left for the turn that fires (0 = a full turn)
         bool armed = true;          // wield a loaded `gun`; else empty hands (throwing wields the rock)
         bool rock = false;          // carry a rock to throw
+        std::string melee;          // wield this item instead of `gun` ("" = none)
     };
     struct seen {
         int ammo = -1;
@@ -2192,11 +2194,15 @@ static bool run_combat_checks()
             }
             u.set_all_parts_hp_to_max();
             u.clear_effects();
-            for( const char *s : { "gun", "pistol", "smg", "shotgun", "rifle", "throw" } ) {
+            for( const char *s : { "gun", "pistol", "smg", "shotgun", "rifle", "throw", "melee", "bashing",
+                                   "stabbing", "cutting", "unarmed"
+                                 } ) {
                 u.set_skill_level( skill_id( s ), sc->skill );
             }
             u.recoil = sc->steady ? 0.0 : MAX_RECOIL;
-            if( sc->armed ) {
+            if( !sc->melee.empty() ) {
+                u.set_wielded_item( item( itype_id( sc->melee ) ) );
+            } else if( sc->armed ) {
                 item gun( itype_id( sc->gun ) );
                 gun.ammo_set( sc->ammo.empty() ? itype_9mm : itype_id( sc->ammo ), sc->rounds );
                 if( !sc->mode.empty() ) {
@@ -2711,10 +2717,11 @@ static bool run_combat_checks()
         check( straight == 4 && p2.ricochets == p1.ricochets, "  never head-on",
                std::to_string( straight ) + " shots, " + std::to_string( p2.ricochets - p1.ricochets ) + " ricochets" );
     }
-    // The client's part only weights CDDA's pick (QA): point blank, skilled, every hit claimed on the head dead
-    // centre; the head lands on some of them, not on all (a roll against its chance times 4).
+    // The client's part only weights CDDA's pick (QA): point blank, skilled, every hit claimed on a leg dead
+    // centre; the leg lands on some of them, not on all (a roll against its chance times 4). A leg (15% cover, not
+    // the head's 5%), so neither none nor all of 16 is a likely roll.
     {
-        const claim dead_head = { who::zombie, 0, 0, "head", 0.0f };
+        const claim dead_head = { who::zombie, 0, 0, "leg", 0.0f };
         int hits = 0;
         int landed = 0;
         for( int i = 0; i < 16; i++ ) {
@@ -2726,7 +2733,7 @@ static bool run_combat_checks()
             landed += delta( r.c0.parts, r.c1.parts ) > 0 ? 1 : 0;
         }
         check( hits >= 10 && landed > 0 && landed < hits, "client part weights CDDA's pick",
-               "head landed on " + std::to_string( landed ) + " of " + std::to_string( hits ) + " claimed hits" );
+               "leg landed on " + std::to_string( landed ) + " of " + std::to_string( hits ) + " claimed hits" );
     }
     // Parts: unknown or junk ids are ignored (CDDA picks), the hit still counts.
     {
@@ -3419,6 +3426,160 @@ static bool run_combat_checks()
         check( c.back && c.before.jammed && !c.after.jammed && took >= 9 && took <= 15 &&
                c.after.ammo == c.before.ammo && said( c.after, "You eject the spent casing" ),
                "clear: the wielded jammed gun, CDDA's mend", shown( c ) );
+    }
+    // Aimed melee (fp3d/swing.h): an aimed strike asks one swing request for the creature struck, a plain one
+    // none; the client's part (an answer for that creature on its square) only weights CDDA's pick; any other
+    // answer leaves CDDA's pick; the off hand says so; a reach weapon strikes along the direction.
+    {
+        struct swung {
+            bool back = false;
+            std::vector<fp3d::ui_request> swings;
+            seen before;
+            seen after;
+            fp3d::swing_counts c0;
+            fp3d::swing_counts c1;
+        };
+        using swing_answerer = std::function<std::optional<fp3d::shot_answer>( const fp3d::ui_request &,
+                               const seen & )>;
+        const auto swing_run = [&]( const scene & sc, const std::string & action, const swing_answerer & reply ) {
+            swung s;
+            std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
+            if( q && q->timed ) {
+                {
+                    std::lock_guard<std::mutex> lk( st->mx );
+                    st->want = sc;
+                }
+                fp3d::queue_action( "pause" );
+                q = fp3d::wait_request( 20000, q->id );
+            }
+            if( !q || !q->timed ) {
+                return s;
+            }
+            s.before = seen_now();
+            s.c0 = fp3d::get_swing_counts();
+            fp3d::queue_action( action );
+            std::optional<fp3d::ui_request> c = fp3d::wait_request( 20000, q->id );
+            int asked = 0;
+            while( c && !c->timed && asked++ < 10 ) {
+                fp3d::ui_answer a;
+                a.id = c->id;
+                if( c->kind == fp3d::request_kind::swing ) {
+                    s.swings.push_back( *c );
+                    if( std::optional<fp3d::shot_answer> sa = reply( *c, s.before ) ) {
+                        a.shot = sa;
+                    } else {
+                        a.cancel = true;
+                    }
+                } else {
+                    print_request( *c, "unexpected, cancel" );
+                    a.cancel = true;
+                }
+                const uint64_t id = c->id;
+                fp3d::answer( a );
+                c = fp3d::wait_request( 20000, id );
+            }
+            s.back = c && c->timed;
+            s.after = seen_now();
+            s.c1 = fp3d::get_swing_counts();
+            return s;
+        };
+        const auto aimed_at = []( const char *part ) {
+            return [part]( const fp3d::ui_request & r, const seen & b ) {
+                fp3d::shot_answer a;
+                a.end = r.cursor;
+                a.hit_uid = b.uid;
+                a.part = part;
+                return std::optional<fp3d::shot_answer>( a );
+            };
+        };
+        const auto shown = []( const swung & s ) {
+            std::string out = std::to_string( s.swings.size() ) + " swing requests, asked +" +
+                              std::to_string( s.c1.asked - s.c0.asked ) + " accepted +" +
+                              std::to_string( s.c1.accepted - s.c0.accepted ) + " refused +" +
+                              std::to_string( s.c1.refused - s.c0.refused ) + " parts +" +
+                              std::to_string( s.c1.parts - s.c0.parts ) + ", hp " + std::to_string( s.before.hp ) +
+                              " -> " + std::to_string( s.after.hp );
+            if( !s.swings.empty() ) {
+                const fp3d::ui_request &r = s.swings.front();
+                out += ", at (" + std::to_string( r.cursor.x - r.origin.x ) + "," +
+                       std::to_string( r.cursor.y - r.origin.y ) + ") range " + std::to_string( r.range ) + " " +
+                       r.mode;
+            }
+            return out + ( s.back ? "" : ", stuck" );
+        };
+        const auto at = []( const swung & s, int dx, int dy ) {
+            return s.swings.size() == 1 && s.swings[0].cursor.x - s.swings[0].origin.x == dx &&
+                   s.swings[0].cursor.y - s.swings[0].origin.y == dy && s.swings[0].cursor.z == s.swings[0].origin.z;
+        };
+        scene bat = point_blank;
+        bat.zx = -1;
+        bat.melee = "bat";
+        swung s = swing_run( bat, "fp3d_attack_main_aim_LEFT", aimed_at( "head" ) );
+        check( s.back && at( s, -1, 0 ) && s.swings[0].range == 1 && s.swings[0].mode == "main" &&
+               s.c1.asked - s.c0.asked == 1 && s.c1.accepted - s.c0.accepted == 1,
+               "aimed strike: one swing request for its creature", shown( s ) );
+        s = swing_run( bat, "fp3d_attack_main_LEFT", aimed_at( "head" ) );
+        check( s.back && s.swings.empty() && s.c1.asked == s.c0.asked, "plain strike: no swing request",
+               shown( s ) );
+        int legs = 0;   // a zombie's leg covers 15%, its head only 5%
+        int accepted = 0;
+        int ran = 0;
+        for( int i = 0; i < 16; i++ ) {
+            s = swing_run( bat, "fp3d_attack_main_aim_LEFT", aimed_at( "leg" ) );
+            ran += s.back && s.swings.size() == 1 ? 1 : 0;
+            accepted += static_cast<int>( s.c1.accepted - s.c0.accepted );
+            legs += static_cast<int>( s.c1.parts - s.c0.parts );
+        }
+        check( ran == 16 && accepted == 16 && legs >= 1, "the client's part weights CDDA's pick",
+               std::to_string( ran ) + " swung, " + std::to_string( accepted ) + " accepted, " +
+               std::to_string( legs ) + " landed on the leg" );
+        const swing_answerer other_uid = []( const fp3d::ui_request & r, const seen & b ) {
+            fp3d::shot_answer a;
+            a.end = r.cursor;
+            a.hit_uid = b.uid + 12345;
+            a.part = "head";
+            return std::optional<fp3d::shot_answer>( a );
+        };
+        const swing_answerer other_square = []( const fp3d::ui_request & r, const seen & b ) {
+            fp3d::shot_answer a;
+            a.end = r.cursor;
+            a.end.y += 1;
+            a.hit_uid = b.uid;
+            a.part = "head";
+            return std::optional<fp3d::shot_answer>( a );
+        };
+        const swing_answerer cancel = []( const fp3d::ui_request &, const seen & ) {
+            return std::optional<fp3d::shot_answer>();
+        };
+        int refused = 0;
+        int parts = 0;
+        int swings = 0;
+        for( const swing_answerer *r : { &other_uid, &other_square, &cancel } ) {
+            s = swing_run( bat, "fp3d_attack_main_aim_LEFT", *r );
+            swings += s.back ? static_cast<int>( s.swings.size() ) : 0;
+            refused += static_cast<int>( s.c1.refused - s.c0.refused );
+            parts += static_cast<int>( s.c1.parts - s.c0.parts );
+        }
+        check( swings == 3 && refused == 3 && parts == 0, "another creature, square or a cancel: CDDA's pick",
+               std::to_string( swings ) + " swings, refused " + std::to_string( refused ) + ", parts " +
+               std::to_string( parts ) );
+        scene bare = point_blank;
+        bare.zx = -1;
+        bare.armed = false;
+        s = swing_run( bare, "fp3d_attack_off_aim_LEFT", aimed_at( "head" ) );
+        check( s.back && at( s, -1, 0 ) && s.swings[0].mode == "off", "off-hand aimed strike says off", shown( s ) );
+        scene spear = point_blank;
+        spear.zx = -2;
+        spear.melee = "spear_wood";
+        s = swing_run( spear, "fp3d_attack_main_aim_LEFT", aimed_at( "head" ) );
+        check( s.back && at( s, -2, 0 ) && s.swings[0].range == 2 && s.after.moves < s.before.moves,
+               "a spear strikes 2 squares off", shown( s ) + ", moves " + std::to_string( s.before.moves ) + " -> " +
+               std::to_string( s.after.moves ) );
+        scene short_reach = spear;
+        short_reach.melee = "bat";
+        s = swing_run( short_reach, "fp3d_attack_main_aim_LEFT", aimed_at( "head" ) );
+        check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ),
+               "a bat doesn't reach 2 squares", shown( s ) );
     }
     return failed == 0;
 }
