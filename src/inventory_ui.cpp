@@ -3574,6 +3574,20 @@ void ammo_inventory_selector::mod_chosen_count( inventory_entry &entry, int valu
 
 drop_location ammo_inventory_selector::execute()
 {
+    // FP3D: headless clients pick the ammo from a flat list of selectable entries
+    if( fp3d::active() ) {
+        const std::vector<inventory_entry *> picks = fp3d_selectable_entries( get_all_columns() );
+        const fp3d::ui_request req = fp3d_item_request( picks, fp3d::request_kind::item_select );
+        while( true ) {
+            const fp3d::ui_answer a = fp3d::ask( req );
+            if( a.cancel ) {
+                return drop_location();
+            }
+            if( a.entry >= 0 && static_cast<size_t>( a.entry ) < picks.size() ) {
+                return { picks[a.entry]->any_item(), static_cast<int>( picks[a.entry]->chosen_count ) };
+            }
+        }
+    }
     shared_ptr_fast<ui_adaptor> ui = create_or_get_ui_adaptor();
     debug_print_timer( tp_start );
     while( true ) {

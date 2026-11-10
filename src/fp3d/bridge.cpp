@@ -147,6 +147,8 @@ const char *kind_name( request_kind k )
             return "world_setup";
         case request_kind::target:
             return "target";
+        case request_kind::shot:
+            return "shot";
     }
     return "?";
 }
@@ -210,9 +212,11 @@ ui_answer ask( ui_request req )
         }
         hook = c.before_ask;
     }
-    // Not again from a request asked inside the hook itself (CDDA's debug message prompt, say).
+    // Not again from a request asked inside the hook itself (CDDA's debug message prompt, say). A shot request
+    // skips it too: the client flies the shot against the figures it already shows, and a burst asks once per
+    // round while the game waits.
     static thread_local bool in_hook = false;
-    if( hook && !in_hook ) {
+    if( hook && !in_hook && req.kind != request_kind::shot ) {
         in_hook = true;
         try {
             hook();
@@ -321,15 +325,18 @@ ui_answer ask( ui_request req )
     if( a.pos && !( coord_ok( a.pos->x ) && coord_ok( a.pos->y ) && coord_ok( a.pos->z ) ) ) {
         a.pos.reset();
     }
-    // A client shot only answers a target request, lands somewhere real and names a short id.
-    if( a.shot && ( kind != request_kind::target ||
-                    !( coord_ok( a.shot->end.x ) && coord_ok( a.shot->end.y ) && coord_ok( a.shot->end.z ) ) ) ) {
+    // A client shot only answers a target or shot request, lands somewhere real, has a finite quality and
+    // names a short id. Only a target answer can ask for shot requests (`fly`).
+    if( a.shot && ( ( kind != request_kind::target && kind != request_kind::shot ) ||
+                    !( coord_ok( a.shot->end.x ) && coord_ok( a.shot->end.y ) && coord_ok( a.shot->end.z ) ) ||
+                    !std::isfinite( a.shot->quality ) ) ) {
         a.shot.reset();
     }
     if( a.shot ) {
         a.shot->part = sanitize_text( a.shot->part, 64 );
         // Not a number is not a quality: the worst one.
         a.shot->quality = std::isfinite( a.shot->quality ) ? std::clamp( a.shot->quality, 0.0f, 0.99f ) : 0.99f;
+        a.shot->fly = a.shot->fly && kind == request_kind::target;
     }
     return a;
 }
@@ -451,11 +458,12 @@ bool queue_item_action( const item_action &a )
     const auto ref_ok = []( const item_ref & r ) {
         return r.uid >= 1 && r.uid <= max_item_uid && r.type >= 1 && r.type < ( 1u << 24 );
     };
-    const bool op_ok = a.op == item_op::take || a.op == item_op::put || a.op == item_op::drop;
+    const bool op_ok = a.op == item_op::take || a.op == item_op::put || a.op == item_op::drop ||
+                       a.op == item_op::unload || a.op == item_op::reload;
     const bool hand_ok = a.hand == item_hand::pack || a.hand == item_hand::main || a.hand == item_hand::off;
     if( !op_ok || !hand_ok || !ref_ok( a.item ) || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
         !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket ||
-        ( a.op == item_op::put && !ref_ok( a.container ) ) ||
+        ( ( a.op == item_op::put || a.op == item_op::reload ) && !ref_ok( a.container ) ) ||
         ( a.has_spot && ( a.spot_x >= spot_scale || a.spot_y >= spot_scale ) ) ) {
         return false;
     }

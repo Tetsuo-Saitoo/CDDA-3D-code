@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -142,6 +143,38 @@ bool replaceable_world( const std::string &world_name )
     return world_name.size() > 5 && world_name.compare( 0, 5, "fp3d-" ) == 0;
 }
 
+bool reserved_world_name( const std::string &world_name )
+{
+    return ascii_lower( world_name.substr( 0, 5 ) ) == "fp3d-";
+}
+
+std::string replacing_world_name( const std::string &world_name )
+{
+    // "<name>-99" at most: a folder full of others' fp3d- worlds is someone's choice, not FP3D's to clear.
+    for( int n = 1; n <= 99; n++ ) {
+        const std::string name = n == 1 ? world_name : world_name + "-" + std::to_string( n );
+        const std::optional<std::string> taken = world_name_taken( name );
+        if( !taken || ( *taken == name && world_generator->has_world( name ) && owned_world( name ) ) ) {
+            return name;
+        }
+    }
+    throw std::runtime_error( "no free world name like " + world_name );
+}
+
+bool owned_world( const std::string &world_name )
+{
+    namespace fs = std::filesystem;
+    if( !replaceable_world( world_name ) ) {
+        return false;
+    }
+    const fs::path dir = fs::u8path( PATH_INFO::savedir() ) / fs::u8path( world_name );
+    std::error_code ec;
+    if( fs::symlink_status( dir, ec ).type() != fs::file_type::directory || ec ) {
+        return false;
+    }
+    return fs::symlink_status( dir / owned_world_marker, ec ).type() == fs::file_type::regular && !ec;
+}
+
 void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless, bool world_setup,
                          bool replace )
 {
@@ -150,23 +183,41 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
     g->load_core_data();
     WORLD *world = nullptr;
     if( fresh_world ) {
-        // A new world gets a folder of its own; only FP3D's throwaway worlds are replaced, and only by exact name.
-        if( const std::optional<std::string> taken = world_name_taken( world_name ) ) {
-            if( !replace || !replaceable_world( world_name ) || *taken != world_name ||
-                !world_generator->has_world( world_name ) ) {
+        // A new world gets a folder of its own; only FP3D's throwaway worlds are replaced: by exact name, and
+        // only one this code made (owned_world).
+        const bool replacing = replace && replaceable_world( world_name );
+        if( reserved_world_name( world_name ) && !replacing ) {
+            throw std::runtime_error( "world names starting with fp3d- are kept for quick starts and tests" );
+        }
+        // A replacing start whose world someone else made (or an older FP3D, before the marker) leaves it alone
+        // and takes the next free or own "<name>-N".
+        const std::string name = replacing ? replacing_world_name( world_name ) : world_name;
+        if( const std::optional<std::string> taken = world_name_taken( name ) ) {
+            if( !replacing || *taken != name || !world_generator->has_world( name ) || !owned_world( name ) ) {
                 throw std::runtime_error( "world " + *taken + " exists" );
             }
-            world_generator->delete_world( world_name, true );
+            world_generator->delete_world( name, true );
         }
         if( world_setup ) {
-            world = run_world_setup( world_name );
+            world = run_world_setup( name );
             if( world == nullptr ) {
                 throw std::runtime_error( "world creation cancelled" );
             }
         } else {
-            world = world_generator->make_new_world( world_name, { mod_id( "dda" ) } );
+            world = world_generator->make_new_world( name, { mod_id( "dda" ) } );
             if( world == nullptr ) {
                 throw std::runtime_error( "make_new_world failed" );
+            }
+        }
+        if( replacing ) {
+            namespace fs = std::filesystem;
+            const fs::path dir = fs::u8path( PATH_INFO::savedir() ) / fs::u8path( name );
+            std::error_code ec;
+            fs::create_directories( dir, ec );
+            std::ofstream mark( dir / owned_world_marker, std::ios::binary | std::ios::trunc );
+            mark << "Made by an FP3D quick start or test: FP3D may delete and remake this world.\n";
+            if( !mark ) {
+                throw std::runtime_error( "cannot mark world " + name );
             }
         }
     } else {
