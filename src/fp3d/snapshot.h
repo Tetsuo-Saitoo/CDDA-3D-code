@@ -11,6 +11,7 @@
 #include <cstdint>
 #include <iosfwd>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -180,6 +181,16 @@ struct worn_view {
     std::vector<uint32_t> covers;                 // body_part indices
 };
 
+// The wielded gun, for the client's weapon view (combat block 2).
+constexpr size_t max_gun_faults = 16;
+constexpr size_t max_fault_id_bytes = 64;
+struct gun_view {
+    uint32_t type = 0;                   // itype index
+    int16_t dirt = -1;                   // CDDA's fouling 0..10000; -1 for a NON_FOULING gun
+    int32_t rounds = -1;                 // loaded rounds; -1 for a gun that takes no ammo
+    std::vector<std::string> faults;     // fault ids it has (cap max_gun_faults, ids up to max_fault_id_bytes)
+};
+
 struct player_view {
     uint64_t uid = 0;
     ui_point pos;
@@ -205,6 +216,7 @@ struct player_view {
     std::vector<uint8_t> infected;
     std::vector<worn_view> worn;                  // inner to outer (CDDA's worn order); cap 64
     std::vector<carried_view> items;              // wielded, then worn items and what's inside; cap 256
+    std::optional<gun_view> wielded_gun;          // when the wielded item is a gun
 };
 
 struct environment_view {

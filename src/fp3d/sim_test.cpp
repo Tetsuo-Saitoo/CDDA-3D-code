@@ -2114,7 +2114,7 @@ static bool run_combat_checks()
         std::optional<scene> sc;
         // Only at the main loop's request: a prompt inside an action (a grab's torn pocket, say) comes while CDDA
         // still holds references to the avatar's effects and items, which building a scene would clear.
-        if( fp3d::next_is_timed() ) {
+        if( fp3d::in_timed_hook() ) {
             std::lock_guard<std::mutex> lk( st->mx );
             sc.swap( st->want );
         }

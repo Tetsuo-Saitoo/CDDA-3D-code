@@ -396,6 +396,26 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
     pv.pain = clamp_i16( u.get_perceived_pain() );
     pv.morale = clamp_i16( u.get_morale_level() );
     pv.wielded = wielded_index( u );
+    if( const item_location w = u.get_wielded_item(); w && w->is_gun() ) {
+        gun_view g;
+        g.type = pv.wielded;
+        if( !w->has_flag( flag_NON_FOULING ) ) {
+            const double dirt = w->get_var( "dirt", 0.0 );
+            g.dirt = static_cast<int16_t>( std::isfinite( dirt ) ? std::clamp( dirt, 0.0, 10000.0 ) : 0.0 );
+        }
+        if( !w->ammo_types().empty() ) {
+            g.rounds = std::clamp( w->ammo_remaining(), 0, 100000 );
+        }
+        for( const fault_id &f : w->faults_potential() ) {
+            if( g.faults.size() >= max_gun_faults ) {
+                break;
+            }
+            if( w->has_fault( f ) && f.str().size() <= max_fault_id_bytes ) {
+                g.faults.push_back( f.str() );
+            }
+        }
+        pv.wielded_gun = std::move( g );
+    }
     for( const bodypart_id &bp : u.get_all_body_parts( get_body_part_flags::only_main ) ) {
         const auto eff = [&]( const char *id ) {
             return clamp_u8( u.get_effect_int( efftype_id( id ), bp ) );
@@ -783,6 +803,25 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     jo.member( "pain", static_cast<int>( pv.pain ) );
     jo.member( "morale", static_cast<int>( pv.morale ) );
     jo.member( "wielded", static_cast<int64_t>( pv.wielded ) );
+    if( pv.wielded_gun ) {
+        const gun_view &g = *pv.wielded_gun;
+        jo.member( "wielded_gun" );
+        jo.start_object();
+        jo.member( "type", static_cast<int64_t>( g.type ) );
+        if( g.dirt >= 0 ) {
+            jo.member( "dirt", static_cast<int>( g.dirt ) );
+        }
+        if( g.rounds >= 0 ) {
+            jo.member( "rounds", g.rounds );
+        }
+        jo.member( "faults" );
+        jo.start_array();
+        for( const std::string &f : g.faults ) {
+            jo.write( f );
+        }
+        jo.end_array();
+        jo.end_object();
+    }
     write_array( jo, "bleed", pv.bleed );
     write_array( jo, "bandaged", pv.bandaged );
     write_array( jo, "disinfected", pv.disinfected );

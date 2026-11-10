@@ -120,6 +120,7 @@ void set_before_ask_hook( std::function<void()> hook );
 // Sim side. Makes the next request timed (the main game loop's): in real time it expires at the end of
 // the current turn and comes back with `timed_out` set.
 void set_next_timed();
+// Whether the next ask() is timed. Inside the before-ask hook it's already taken: use in_timed_hook() there.
 bool next_is_timed();
 // Sim side. True while the before-ask hook runs for a main-loop (timed) request: between turns, nothing half done.
 // A request asked from inside the hook (a popup) is never the timed one.
