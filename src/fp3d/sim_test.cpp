@@ -4175,6 +4175,39 @@ static bool run_throw_pour_checks()
     return failed == 0;
 }
 
+// Boot progress and CDDA's debug messages in an FP3D game (fp3d/bridge.h, 2026-11-10): phases and steps count,
+// texts are cut on whole UTF-8 characters, and a debugmsg is kept, never a prompt (test_mode off for that one
+// message, the bridge active). Main thread, while the game thread waits for an answer.
+static bool run_boot_progress_checks()
+{
+    fp3d::begin_boot();
+    fp3d::note_boot_step( "Phase A", "file 1" );
+    fp3d::note_boot_step( "Phase A", "file 2" );
+    fp3d::note_boot_step( "Phase B" );
+    const fp3d::boot_progress p = fp3d::latest_boot_progress();
+    // 299 ASCII bytes, then a 2-byte character across the 300-byte cut: the whole character goes.
+    const std::string long_text = std::string( fp3d::max_boot_text - 1, 'x' ) + "\xC3\xA9 and more";
+    const bool was_test = test_mode;
+    const bool was_active = fp3d::active();
+    fp3d::set_active( true );
+    test_mode = false;
+    bool prompted = false;
+    try {
+        debugmsg( "%s", long_text );
+    } catch( ... ) {
+        prompted = true;
+    }
+    test_mode = was_test;
+    fp3d::set_active( was_active );
+    const fp3d::boot_progress q = fp3d::latest_boot_progress();
+    const bool ok = p.phase == "Phase B" && p.steps == 3 && p.errors == 0 && !prompted && q.errors == 1 &&
+                    q.last_error == std::string( fp3d::max_boot_text - 1, 'x' );
+    std::printf( "  boot progress: %s (phase \"%s\", %llu steps, %llu errors, last %zu bytes%s)\n", ok ? "PASS" : "FAIL",
+                 p.phase.c_str(), static_cast<unsigned long long>( p.steps ),
+                 static_cast<unsigned long long>( q.errors ), q.last_error.size(), prompted ? ", prompted" : "" );
+    return ok;
+}
+
 int main()
 {
     std::setvbuf( stdout, nullptr, _IONBF, 0 );
@@ -4277,6 +4310,8 @@ int main()
     const bool combat_ok = guns_ok && run_combat_checks();
     const bool range_ok = combat_ok && run_range_op_checks();
     const bool throw_pour_ok = range_ok && run_throw_pour_checks();
+    // While the game thread waits for its next answer (CDDA's log is still open).
+    const bool boot_ok = run_boot_progress_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -4320,9 +4355,10 @@ int main()
     std::printf( "throw/pour: %s\n", throw_pour_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
+    std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           throw_pour_ok && worlds_ok ?
+           throw_pour_ok && worlds_ok && boot_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -5,6 +5,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdio>
 #include <deque>
 #include <exception>
 #include <map>
@@ -708,6 +709,111 @@ std::string sanitize_text( const std::string &s, size_t max_len )
         }
     }
     return out;
+}
+
+namespace
+{
+struct boot_state {
+    std::chrono::steady_clock::time_point start = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point phase_start = start;
+    std::string phase;
+    std::string step;
+    uint64_t steps = 0;
+    std::string last_error;
+    uint64_t errors = 0;
+};
+std::mutex boot_mutex;
+boot_state boot;
+
+// sanitize_text to max_boot_text bytes, without a UTF-8 character cut in half at the end.
+std::string boot_text( const std::string &s )
+{
+    std::string out = sanitize_text( s, max_boot_text );
+    size_t lead = out.size();
+    while( lead > 0 && ( static_cast<unsigned char>( out[lead - 1] ) & 0xC0 ) == 0x80 ) {
+        lead--;
+    }
+    if( lead > 0 ) {
+        const unsigned char b = static_cast<unsigned char>( out[lead - 1] );
+        const size_t len = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+        if( lead - 1 + len > out.size() ) {
+            out.resize( lead - 1 );
+        }
+    }
+    return out;
+}
+
+double seconds_between( std::chrono::steady_clock::time_point a, std::chrono::steady_clock::time_point b )
+{
+    return std::chrono::duration<double>( b - a ).count();
+}
+
+void print_line( const std::string &line )
+{
+    std::fprintf( stdout, "%s\n", line.c_str() );
+    std::fflush( stdout );
+}
+} // namespace
+
+void begin_boot()
+{
+    std::lock_guard<std::mutex> lk( boot_mutex );
+    boot = boot_state();
+}
+
+void note_boot_step( const std::string &phase, const std::string &step )
+{
+    const auto now = std::chrono::steady_clock::now();
+    std::string line;
+    {
+        std::lock_guard<std::mutex> lk( boot_mutex );
+        boot.steps++;
+        boot.step = boot_text( step );
+        std::string p = boot_text( phase );
+        if( p != boot.phase ) {
+            char buf[64];
+            std::snprintf( buf, sizeof( buf ), "fp3d boot %7.1f s: ", seconds_between( boot.start, now ) );
+            line = buf + p;
+            if( !boot.phase.empty() ) {
+                std::snprintf( buf, sizeof( buf ), " (%.1f s)", seconds_between( boot.phase_start, now ) );
+                line += "   [after " + boot.phase + buf + "]";
+            }
+            boot.phase = std::move( p );
+            boot.phase_start = now;
+        }
+    }
+    if( !line.empty() ) {
+        print_line( line );
+    }
+}
+
+void note_debug_error( const std::string &text )
+{
+    std::string t = boot_text( text );
+    bool print = false;
+    {
+        std::lock_guard<std::mutex> lk( boot_mutex );
+        boot.errors++;
+        print = boot.errors <= max_printed_errors;
+        boot.last_error = t;
+    }
+    if( print ) {
+        print_line( "fp3d: CDDA error: " + t );
+    }
+}
+
+boot_progress latest_boot_progress()
+{
+    const auto now = std::chrono::steady_clock::now();
+    std::lock_guard<std::mutex> lk( boot_mutex );
+    boot_progress p;
+    p.phase = boot.step.empty() ? boot.phase : boot.phase + ": " + boot.step;
+    p.seconds = seconds_between( boot.start, now );
+    p.phase_seconds = seconds_between( boot.phase_start, now );
+    p.steps = boot.steps;
+    p.last_error = boot.last_error;
+    p.errors = boot.errors;
+    return p;
 }
 
 } // namespace fp3d
