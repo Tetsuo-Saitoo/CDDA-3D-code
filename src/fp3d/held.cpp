@@ -10,6 +10,7 @@
 #include "bodypart.h"
 #include "calendar.h"
 #include "enums.h"
+#include "fp3d/cheats.h"
 #include "fp3d/game_access.h"
 #include "fp3d/hands.h"
 #include "fp3d/item_hands.h"
@@ -491,6 +492,7 @@ void publish_held()
     if( u.activity ) {
         v.activity = capped( u.activity.id().str() );
     }
+    publish_cheats( u );   // the cheat state goes out at the same moments (cheats.h)
     std::lock_guard<std::mutex> lk( held_mutex );
     v.seq = ++held_seq;
     held_latest = std::move( v );

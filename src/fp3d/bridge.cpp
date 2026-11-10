@@ -31,6 +31,7 @@ struct channel {
     std::deque<queued_action> actions;   // queued main-loop actions (block B5)
     std::optional<item_action> item_now; // the item action last answered as `fp3d_item`, until the sim takes it
     bool save_wanted = false;            // request_save() until the sim takes it
+    bool job_wanted = false;             // want_job() until the main loop takes it
     bool save_if_changed = false;
     save_status saves;
     clock_state clock;
@@ -184,6 +185,16 @@ ui_answer ask( ui_request req )
             c.reply = std::move( save );
             break;
         }
+        // Cheats and the test kit (cheats.h), like a save: in the main loop, also while paused.
+        if( timed && c.job_wanted ) {
+            c.job_wanted = false;
+            ui_answer job;
+            job.id = id;
+            job.action = job_action;
+            job.queued = true;
+            c.reply = std::move( job );
+            break;
+        }
         // Checked under the same lock that posted the request, so a client never sees it as waiting while
         // a queued action is about to answer it.
         if( timed && !c.actions.empty() && !c.clock.paused ) {
@@ -306,8 +317,42 @@ void auto_pause( const std::string &reason )
     c.cv.notify_all();
 }
 
+bool want_job()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down ) {
+        return false;
+    }
+    c.job_wanted = true;
+    c.cv.notify_all();
+    return true;
+}
+
+void set_auto_pause_hostiles( bool on )
+{
+    std::lock_guard<std::mutex> lk( chan().m );
+    chan().clock.auto_pause_hostiles = on;
+}
+
+void hostile_spotted()
+{
+    bool on = false;
+    {
+        std::lock_guard<std::mutex> lk( chan().m );
+        on = chan().clock.auto_pause_hostiles;
+    }
+    if( on ) {
+        auto_pause( "hostile spotted" );
+    }
+}
+
 bool queue_action( const std::string &action )
 {
+    // The bridge's own answers (a save, cheats) only come from the bridge.
+    if( action == save_action || action == job_action || action == item_action_name ) {
+        return false;
+    }
     channel &c = chan();
     std::lock_guard<std::mutex> lk( c.m );
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {

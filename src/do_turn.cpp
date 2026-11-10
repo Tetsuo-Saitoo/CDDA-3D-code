@@ -19,6 +19,7 @@
 
 #include "action.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/cheats.h" // FP3D:
 #include "fp3d/events.h" // FP3D:
 #include "fp3d/held.h" // FP3D:
 #include "activity_type.h"
@@ -490,6 +491,7 @@ bool do_turn()
             const avatar &u = get_avatar();
             // A liquid fill runs one turn per second so the client can show it filling (fp3d/held.h)
             const bool watched = fp3d::watched_activity( u );
+            fp3d::cheats_turn( get_avatar() ); // FP3D: unlimited ammo refills the wielded gun
             fp3d::publish_held();
             fp3d::pace_turn( !watched && ( static_cast<bool>( u.activity ) || u.has_effect( effect_sleep ) ),
                              watched );

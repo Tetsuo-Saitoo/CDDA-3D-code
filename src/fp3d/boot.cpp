@@ -80,6 +80,13 @@ void boot_common( bool headless )
         get_options().init();
         get_options().load();
     }
+    // CDDA's safe mode is off in FP3D games (new and loaded: game::start_game and game::load read SAFEMODE);
+    // the `safemode` action (Shift+1) still toggles it. Set in memory only, like the options above.
+    for( const char *opt : { "SAFEMODE", "AUTOSAFEMODE" } ) {
+        if( get_options().has_option( opt ) ) {
+            get_options().get_option( opt ).setValue( "false" );
+        }
+    }
     init_colors();
 
     g = std::make_unique<game>();
