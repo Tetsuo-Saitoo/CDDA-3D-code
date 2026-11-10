@@ -1,6 +1,8 @@
 #include "fp3d/cheats.h"
 
 #include <array>
+#include <climits>
+#include <deque>
 #include <mutex>
 #include <utility>
 #include <vector>
@@ -9,6 +11,7 @@
 #include "avatar.h"
 #include "calendar.h"
 #include "fp3d/bridge.h"
+#include "fp3d/test_range.h"
 #include "item.h"
 #include "item_location.h"
 #include "itype.h"
@@ -82,6 +85,9 @@ struct requests {
     bool allowed = false;
     cheats_view latest;
     uint64_t kits_given = 0;
+    std::deque<std::pair<uint64_t, range_op>> range_ops;
+    uint64_t range_next_id = 0;
+    std::deque<range_op_result> range_results;
 };
 requests &reqs()
 {
@@ -247,6 +253,7 @@ void set_cheats_allowed( bool on )
     if( !on ) {
         r.want = {};
         r.kit = false;
+        r.range_ops.clear();
     }
 }
 
@@ -288,6 +295,79 @@ bool request_test_kit()
         r.kit = true;
     }
     return want_job();
+}
+
+uint64_t request_range_op( const range_op &op )
+{
+    if( is_shut_down() || op.monster.size() > max_monster_id ) {
+        return 0;
+    }
+    uint64_t id = 0;
+    {
+        requests &r = reqs();
+        std::lock_guard<std::mutex> lk( r.m );
+        if( !r.allowed || r.range_ops.size() >= max_range_ops_waiting ) {
+            return 0;
+        }
+        id = ++r.range_next_id;
+        r.range_ops.emplace_back( id, op );
+    }
+    return want_job() ? id : 0;
+}
+
+std::vector<range_op_result> latest_range_results()
+{
+    requests &r = reqs();
+    std::lock_guard<std::mutex> lk( r.m );
+    return std::vector<range_op_result>( r.range_results.begin(), r.range_results.end() );
+}
+
+namespace
+{
+std::string run_range_op( const range_op &op )
+{
+    // Out-of-range numbers become -1, which every operation refuses.
+    const int n = op.number < 0 || op.number > INT_MAX ? -1 : static_cast<int>( op.number );
+    switch( op.kind ) {
+        case range_op_kind::spawn_item:
+            return spawn_item( op.itype, n, op.square );
+        case range_op_kind::spawn_monster:
+            return spawn_monster( op.monster, op.square );
+        case range_op_kind::teleport:
+            return teleport_to_zone( n < 0 ? SIZE_MAX : static_cast<size_t>( n ) );
+        case range_op_kind::time_of_day:
+            return set_time_of_day( n );
+        case range_op_kind::advance:
+            return advance( n );
+        case range_op_kind::ai_frozen:
+            return set_ai_frozen( op.number != 0 );
+        case range_op_kind::heal:
+            return heal();
+    }
+    return "No such operation.";
+}
+} // namespace
+
+void run_range_requests()
+{
+    if( !in_timed_hook() ) {
+        return;
+    }
+    std::deque<std::pair<uint64_t, range_op>> ops;
+    {
+        requests &r = reqs();
+        std::lock_guard<std::mutex> lk( r.m );
+        ops.swap( r.range_ops );
+    }
+    for( const auto &[id, op] : ops ) {
+        std::string error = run_range_op( op );
+        requests &r = reqs();
+        std::lock_guard<std::mutex> lk( r.m );
+        r.range_results.push_back( { id, std::move( error ) } );
+        while( r.range_results.size() > max_range_results ) {
+            r.range_results.pop_front();
+        }
+    }
 }
 
 cheats_view latest_cheats()

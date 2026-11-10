@@ -77,9 +77,9 @@ constexpr size_t max_monster_id = 64;
 // the start date (spring, day 2, 10:00), creates a fixed avatar, marks the game as a range, starts it in the hub, builds
 // the hub and freezes the AI. Throws std::runtime_error on failure. Follow with do_turn().
 void boot_test_range( unsigned seed );
-// Forgets the zone registry and unfreezes the AI; every boot does it first (boot.cpp).
+// Forgets the zone registry, ends the range session and unfreezes the AI; every boot does it first (boot.cpp).
 void reset_test_range();
-// True when the avatar is a range game's (game thread).
+// True in a game boot_test_range started (game thread). The avatar value alone (a save, a mod) doesn't make one.
 bool range_active();
 
 // The zones (game thread), hub first, the rest sorted by id; built on first use from the loaded data, so a loaded
@@ -114,9 +114,10 @@ struct gallery_piece {
 std::vector<gallery_piece> gallery_pieces( size_t zone );
 constexpr range_offset gallery_stairs{ 1, 0, 0 };
 
-// Operations (game thread). Squares are absolute (tripoint_abs_ms), like the bridge's ui_point. All but
-// set_ai_frozen refuse ("Only between turns.") unless called from the before-ask hook of a main-loop (timed)
-// request: never in the middle of an action, never from another thread.
+// Operations (game thread). Squares are absolute (tripoint_abs_ms), like the bridge's ui_point. All refuse
+// ("Only between turns.") unless called from the before-ask hook of a main-loop (timed) request (in_timed_hook):
+// never in the middle of an action, never from another thread. They also refuse outside range games and once the
+// player is dead. The client asks for them through fp3d/cheats.h (request_range_op).
 // `count` copies (or charges) of the item with session itype index `itype` (snapshot / id tables) on `square`.
 std::string spawn_item( uint32_t itype, int count, const ui_point &square );
 // A monster `mtype` (id, at most 64 characters) on `square`: in the bubble, passable, nobody there.
@@ -128,7 +129,8 @@ std::string set_time_of_day( int minute );
 // Waits `minutes` (1..10080) as real turns: CDDA's wait activity, which the main loop runs turn by turn (fast-forward,
 // interrupted like any wait). Returns once it is started.
 std::string advance( int minutes );
-// Monsters and NPCs skip their turns (no plans, no moves, no attacks); they still take damage and die.
+// Monsters and NPCs skip their turns (no plans, no moves, no attacks); they still take damage and die. Not kept in
+// saves.
 std::string set_ai_frozen( bool on );
 // Full hit points, no pain, no bad effects, fed, watered, rested, full stamina.
 std::string heal();

@@ -40,10 +40,12 @@
 #include "fp3d/cheats.h"
 #include "fp3d/cooking.h"
 #include "fp3d/game_access.h"
+#include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
 #include "fp3d/item_hands.h"
 #include "fp3d/points.h"
 #include "fp3d/shot.h"
+#include "fp3d/test_range.h"
 #include "fp3d/events.h"
 #include "fp3d/snapshot.h"
 #include "game.h"
@@ -179,8 +181,62 @@ std::atomic<uint64_t> gun_far_glock_uid{ 0 };  // a loaded Glock 3 squares west
 std::atomic<uint64_t> gun_far_9mm_uid{ 0 };    // 5 9 mm 3 squares west
 std::atomic<uint64_t> gun_near_9mm_uid{ 0 };   // 5 9 mm 1 square west
 
+// Range op checks: 32 operations queued from inside the sim's hook (so none run before the queue is full), then one
+// more, which is refused. They run at the next main-loop request.
+std::atomic<bool> range_fill{ false };
+std::atomic<uint64_t> range_fill_last{ 0 };    // the last one's id
+std::atomic<bool> range_fill_ok{ false };      // ids 1 apart, 32 of them, the 33rd refused
+
+void fill_range_ops()
+{
+    fp3d::range_op heal;
+    heal.kind = fp3d::range_op_kind::heal;
+    std::vector<fp3d::range_op> ops( 25, heal );
+    fp3d::range_op op;
+    op.kind = fp3d::range_op_kind::ai_frozen;
+    op.number = 1;
+    ops.push_back( op );
+    op = {};
+    op.kind = fp3d::range_op_kind::spawn_monster;
+    op.monster = "mon_zombie";
+    ops.push_back( op );
+    op = {};
+    op.kind = fp3d::range_op_kind::spawn_item;
+    op.itype = 1;
+    op.number = 1;
+    ops.push_back( op );
+    op = {};
+    op.kind = fp3d::range_op_kind::teleport;
+    ops.push_back( op );
+    op = {};
+    op.kind = fp3d::range_op_kind::time_of_day;
+    ops.push_back( op );
+    op = {};
+    op.kind = fp3d::range_op_kind::advance;
+    op.number = 1;
+    ops.push_back( op );
+    op = {};
+    op.kind = fp3d::range_op_kind::advance;
+    op.number = int64_t{ 1 } << 40;
+    ops.push_back( op );
+    uint64_t last = 0;
+    bool queued = true;
+    for( const fp3d::range_op &o : ops ) {
+        const uint64_t id = fp3d::request_range_op( o );
+        queued = queued && id != 0 && ( last == 0 || id == last + 1 );
+        last = id;
+    }
+    range_fill_last.store( last );
+    range_fill_ok.store( queued && ops.size() == fp3d::max_range_ops_waiting && fp3d::request_range_op( heal ) == 0 );
+}
+
 void observe()
 {
+    // As the client's hook (bridge/src/sim_session.cpp).
+    fp3d::run_range_requests();
+    if( range_fill.exchange( false ) ) {
+        fill_range_ops();
+    }
     const avatar &u = get_avatar();
     map &here = get_map();
     const tripoint_bub_ms p = u.pos_bub();
@@ -2029,6 +2085,8 @@ static bool run_combat_checks()
         bool steady = true;         // recoil 0; else at its max (no aim yet)
         std::string gun = "glock_19";
         std::string mode;           // gun mode, "" = its default
+        std::string fault;          // a fault set on the gun ("" = none)
+        std::string ammo;           // the gun's ammo, "" = 9mm
         int moves = 0;              // moves left for the turn that fires (0 = a full turn)
         bool armed = true;          // wield a loaded `gun`; else empty hands (throwing wields the rock)
         bool rock = false;          // carry a rock to throw
@@ -2047,6 +2105,7 @@ static bool run_combat_checks()
         bool has_plan = false;
         int64_t turn = 0;
         std::vector<std::string> messages;   // since the scene was set
+        bool jammed = false;        // the wielded gun has a jam fault
     };
     struct state {
         std::mutex mx;
@@ -2059,7 +2118,7 @@ static bool run_combat_checks()
         std::optional<scene> sc;
         // Only at the main loop's request: a prompt inside an action (a grab's torn pocket, say) comes while CDDA
         // still holds references to the avatar's effects and items, which building a scene would clear.
-        if( fp3d::next_is_timed() ) {
+        if( fp3d::in_timed_hook() ) {
             std::lock_guard<std::mutex> lk( st->mx );
             sc.swap( st->want );
         }
@@ -2091,9 +2150,12 @@ static bool run_combat_checks()
             u.recoil = sc->steady ? 0.0 : MAX_RECOIL;
             if( sc->armed ) {
                 item gun( itype_id( sc->gun ) );
-                gun.ammo_set( itype_9mm, sc->rounds );
+                gun.ammo_set( sc->ammo.empty() ? itype_9mm : itype_id( sc->ammo ), sc->rounds );
                 if( !sc->mode.empty() ) {
                     gun.gun_set_mode( gun_mode_id( sc->mode ) );
+                }
+                if( !sc->fault.empty() ) {
+                    gun.set_fault( fault_id( sc->fault ), true, false );
                 }
                 u.set_wielded_item( gun );
             } else {
@@ -2138,6 +2200,7 @@ static bool run_combat_checks()
         seen o;
         if( const item_location w = u.get_wielded_item() ) {
             o.ammo = w->ammo_remaining();
+            o.jammed = !fp3d::jam_of( *w ).is_null();
         }
         o.uid = st->uids[0];
         o.side_uid = st->uids[1];
@@ -2909,6 +2972,80 @@ static bool run_combat_checks()
                std::to_string( after.ammo ) + ", " + std::to_string( asked ) + " requests, " +
                std::to_string( selects ) + " item_select" + ( back ? "" : ", stuck" ) );
     }
+    // Jams (block 3). A jammed gun isn't aimed: a message, no random quick fix at aim start, nothing fired.
+    const auto said = []( const seen & s, const char *text ) {
+        for( const std::string &m : s.messages ) {
+            if( m.find( text ) != std::string::npos ) {
+                return true;
+            }
+        }
+        return false;
+    };
+    {
+        scene jammed = point_blank;
+        jammed.fault = "fault_stovepipe";
+        const result r = run( jammed, "fire", answer_with::fire, head, true, head );
+        check( r.back && !r.target && r.before.jammed && r.after.jammed && r.after.ammo == r.before.ammo &&
+               r.after.hp == r.before.hp && said( r.after, "jammed" ), "jammed gun: aim refused, no quick fix",
+               counts( r ) + ( r.after.jammed ? ", still jammed" : ", cleared" ) );
+    }
+    // A burst stops at a jam from an earlier round: black-powder .300 BLK (recoil 1520) doesn't cycle a SIG MCX
+    // Rattler (1700 needed), so CDDA leaves the first round's case in the chamber on full auto; its loop fired on
+    // regardless, the avatar's now stops there.
+    {
+        scene burst = point_blank;
+        burst.gun = "sig_mcx_rattler_sbr";
+        burst.ammo = "bp_300blk";
+        burst.mode = "AUTO";
+        const result r = run( burst, "fire", answer_with::fire, head, true, std::nullopt );
+        check( fired( r, 1 ) && r.shots.size() == 1 && r.after.jammed && said( r.after, "fails to cycle" ) &&
+               said( r.after, "jammed" ), "burst stops at a jam", counts( r ) + ", " +
+               std::to_string( r.shots.size() ) + " shot requests" + ( r.after.jammed ? ", jammed" : "" ) );
+    }
+    // Reload (R) on a jammed gun clears it instead: CDDA's mend with the fault's fix and its time (10 s), no reload
+    // (3 rounds stay, a spare magazine carried), the jam gone. No zombie, so nothing interrupts it.
+    {
+        scene clear = point_blank;
+        clear.zx = 0;
+        clear.rounds = 3;
+        clear.spare_mag = true;
+        clear.fault = "fault_stovepipe";
+        seen before;
+        seen after;
+        bool back = false;
+        int asked = 0;
+        std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
+        if( q && q->timed ) {
+            {
+                std::lock_guard<std::mutex> lk( st->mx );
+                st->want = clear;
+            }
+            fp3d::queue_action( "pause" );
+            q = fp3d::wait_request( 20000, q->id );
+        }
+        if( q && q->timed ) {
+            before = seen_now();
+            fp3d::queue_action( "reload_weapon" );
+            std::optional<fp3d::ui_request> c = fp3d::wait_request( 30000, q->id );
+            while( c && !c->timed && asked++ < 10 ) {
+                fp3d::ui_answer a;
+                a.id = c->id;
+                a.cancel = true;
+                print_request( *c, "unexpected, cancel" );
+                fp3d::answer( a );
+                const uint64_t id = c->id;
+                c = fp3d::wait_request( 20000, id );
+            }
+            back = c && c->timed;
+            after = seen_now();
+        }
+        const int64_t took = after.turn - before.turn;
+        check( back && asked == 0 && before.jammed && !after.jammed && before.ammo == 3 && after.ammo == 3 &&
+               took >= 9 && took <= 15 && said( after, "You eject the spent casing" ),
+               "reload on a jammed gun: CDDA's mend, no reload", std::to_string( took ) + " turns, ammo " +
+               std::to_string( before.ammo ) + " -> " + std::to_string( after.ammo ) +
+               ( after.jammed ? ", jammed" : ", cleared" ) + ( back ? "" : ", stuck" ) );
+    }
     return failed == 0;
 }
 
@@ -3159,6 +3296,50 @@ static bool run_cheat_checks()
     check( !fp3d::request_cheat( fp3d::cheat::invincible, true ) && !fp3d::request_test_kit() &&
            !hurt.achievements, "refused again once disallowed", "" );
     return failed == 0;
+}
+
+// Test-range operations from the client (fp3d/cheats.h request_range_op, 2026-11-10): refused until cheats are
+// allowed, bounded, and refused by the game outside a range game (this one isn't) and outside the main loop's hook.
+static bool run_range_op_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "range ops: main loop waiting", "" );
+        return false;
+    }
+    fp3d::range_op heal;
+    heal.kind = fp3d::range_op_kind::heal;
+    check( !fp3d::cheats_allowed() && fp3d::request_range_op( heal ) == 0, "range ops refused until allowed", "" );
+    fp3d::set_cheats_allowed( true );
+    fp3d::range_op big;
+    big.kind = fp3d::range_op_kind::spawn_monster;
+    big.monster = std::string( fp3d::max_monster_id + 1, 'a' );
+    check( fp3d::request_range_op( big ) == 0, "range ops: overlong monster id refused", "" );
+    // Off the sim thread, or outside the main loop's hook: refused, nothing changed.
+    check( fp3d::heal() == "Only between turns." && fp3d::set_ai_frozen( true ) == "Only between turns." &&
+           !fp3d::ai_frozen(), "range ops: only in the main loop's hook", "" );
+
+    // They wait for the main loop's next request; 32 wait at most. The last 16 results are kept.
+    range_fill.store( true );
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const uint64_t last = range_fill_last.load();
+    check( r && range_fill_ok.load(), "range ops: 32 wait, the next is refused", std::to_string( last ) );
+    const std::vector<fp3d::range_op_result> res = fp3d::latest_range_results();
+    bool refused = res.size() == fp3d::max_range_results && res.back().id == last;
+    for( const fp3d::range_op_result &x : res ) {
+        refused = refused && x.error == "Only in the test range.";
+    }
+    check( r && refused && !fp3d::ai_frozen(),
+           "range ops: refused outside a range game", res.empty() ? "" : res.back().error );
+    fp3d::set_cheats_allowed( false );
+    check( fp3d::request_range_op( heal ) == 0, "range ops refused again once disallowed", "" );
+    return failed == 0 && r.has_value();
 }
 
 // Unload and reload by handle (fp3d/item_hands.h, 2026-11-10): a gun's magazine out into a hand, a magazine's rounds
@@ -3489,6 +3670,7 @@ int main()
     const bool stairs_ok = cheats_ok && run_stairs_checks();
     const bool guns_ok = stairs_ok && run_gun_item_checks();
     const bool combat_ok = guns_ok && run_combat_checks();
+    const bool range_ok = combat_ok && run_range_op_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -3528,10 +3710,12 @@ int main()
     std::printf( "stairs: %s\n", stairs_ok ? "ok" : "BAD" );
     std::printf( "guns: %s\n", guns_ok ? "ok" : "BAD" );
     std::printf( "combat: %s\n", combat_ok ? "ok" : "BAD" );
+    std::printf( "range ops: %s\n", range_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
-           shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && worlds_ok ?
+           shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
+           worlds_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }
