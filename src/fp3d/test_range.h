@@ -12,7 +12,8 @@
 // time; each uses at most 120x120 squares around its centre square (the north-west corner of its centre OMT),
 // z -1..+1. A zone is built the first time the player teleports there, or again on rebuild_zone (avatar value
 // `fp3d_range_built_<id>`): the area is cleared (floor, solid ground below, open air above, no furniture, items,
-// vehicles, traps, fields or creatures) and the content placed. A build runs with CDDA's RNG seeded from the boot
+// vehicles, traps, fields or creatures; creatures outside the area stay, though the loaded bubble reaches 12 squares
+// past it) and the content placed. A build runs with CDDA's RNG seeded from the boot
 // seed and the zone id (the game's own RNG stream put back after), so a zone comes out the same every time.
 //
 // Everything here runs on the game thread, except range info (latest_range_info) and ai_frozen(). Operations
@@ -85,8 +86,8 @@ constexpr size_t max_monster_id = 64;
 // The range clock stops this many days after the start of the game (about 10 years): set_time_of_day and advance
 // refuse to go past it, far from the end of CDDA's 32-bit turn counter.
 constexpr int max_range_days = 3650;
-// Teleport: when the zone centre is taken (a creature, a vehicle) or blocked, the player arrives on the nearest
-// free passable square at most this far from it.
+// Teleport: when the zone centre is taken or unsafe (see teleport_to_zone), the player arrives on the nearest free
+// square at most this far from it.
 constexpr int arrival_search_squares = 10;
 // Zone ids are at most max_zone_id characters; a halls zone's id is its base (hall_id_bases) plus "_NN".
 constexpr size_t max_zone_id = 64;
@@ -148,7 +149,8 @@ constexpr range_offset gallery_stairs{ 1, 0, 0 };
 //  - halls: one item type per display rack square.
 //  - lots: a vehicle prototype; `at` is its (0,0) mount (facing east), `min`..`max` its bay (inclusive), painted
 //    round; bays never overlap each other or the centre. A prototype that doesn't fit the zone gets no piece.
-//  - pens: a monster type standing on `at` in a reinforced glass cell whose inside is `min`..`max`; `what` names
+//  - pens: a monster type standing on `at` in a reinforced glass cell whose inside is `min`..`max`, a glass roof
+//    over the cell and its walls (z 1: flyers stay in, daylight comes through); `what` names
 //    the cell's floor when it isn't concrete: "water" (deep, for a monster that lives in water), "dirt" (for a
 //    digger) or "shade" (an indoor floor, for a monster the sun kills). Ordered by species, then id; large monsters
 //    get cells 2 squares wide, huge ones 3. Cells only south of the centre.
@@ -189,14 +191,17 @@ const std::vector<hub_prop> &kitchen_props();
 std::string spawn_item( uint32_t itype, int count, const ui_point &square );
 // A monster `mtype` (id, at most 64 characters) on `square`: in the bubble, passable, nobody there.
 std::string spawn_monster( const std::string &mtype, const ui_point &square );
-// Moves the player to zone `index` (range games only) and builds it the first time. The player lets go of what it
-// grabbed and stops hauling; its auto-move route and the client's queued actions are dropped. It arrives on the
-// zone centre, or when that is taken or blocked on the nearest free passable square (arrival_search_squares); with
-// none free it goes back where it was and the teleport is refused.
+// Moves the player to zone `index` (range games only) and builds it the first time. Refused while riding. The player
+// lets go of what it grabbed, stops hauling and leaves the vehicle it is in; its auto-move route and the client's
+// queued actions are dropped. It arrives on the zone centre, or when that isn't free on the nearest free square
+// (arrival_search_squares). Free: passable, a floor to stand on (not open air, not deep water), no field (fire,
+// smoke, ...), no trap, no vehicle part, nobody there. With none free it goes back where it was (in the vehicle it
+// was in) and the teleport is refused.
 std::string teleport_to_zone( size_t index );
 // Clears zone `index` and builds it again (range games only). Refused while the player is in that zone, rides or is
 // in a vehicle. The zone's area is loaded for the build and the player's surroundings again after it (like two
-// teleports, but the player stays on its square); its auto-move route is dropped.
+// teleports, but the player stays on its square): it lets go of what it grabbed and stops hauling, and its auto-move
+// route is dropped. Creatures outside the zone's area stay.
 std::string rebuild_zone( size_t index );
 // Jumps forward to the next `minute` of the day (0..1439): today if still ahead, else tomorrow; the current minute
 // (to the turn) changes nothing. Refused past max_range_days after the start.

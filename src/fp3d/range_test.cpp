@@ -1,7 +1,9 @@
 // K7 test range test: boots the range (fixed seed) with CDDA's game loop on a worker thread behind the bridge and
 // drives it like a client. Checks the zone registry (unique ids), every hub prop, the gallery (every terrain and
 // furniture id, working stairs), the range operations (and that bad input is refused, the clock's end, a full square),
-// teleport arrival next to a taken centre, rebuilding a zone, frozen AI (and that unfreezing lets the hub zombie act),
+// teleport arrival next to a taken or unsafe centre (fields, traps, deep water, open air) and with no free square (from
+// a car seat: back in it), teleport and rebuild refused in a vehicle or riding, rebuilding a zone (creatures just
+// outside it stay), frozen AI (and that unfreezing lets the hub zombie act),
 // the median turn time in the hub and the gallery, and one zone of each other kind (armory, halls, lots, pens, lanes,
 // kitchen: what is placed against the zone's slice, and that a rebuild gives the same zone). Range operations run on
 // the sim thread, in the hook that runs before each request. Exit code 0 only if every check passed.
@@ -52,10 +54,14 @@
 #include "monster.h"
 #include "mtype.h"
 #include "npc.h"
+#include "point.h"
 #include "string_formatter.h"
+#include "trap.h"
 #include "type_id.h"
+#include "veh_type.h"
 #include "vehicle.h"
 #include "vpart_position.h"
+#include "vpart_range.h"
 
 namespace
 {
@@ -1048,6 +1054,265 @@ void check_info( size_t gallery )
            std::to_string( info.zones.size() ) + " zones, " + std::to_string( built ) + " built" );
 }
 
+// Teleport onto a centre that isn't safe, with every square round it unsafe too but the last one arrival_square looks
+// at: fire on the centre, smoke, acid, deep water (still and flowing), open air and traps round it. The player lands on
+// that last square. The player is in the gallery (check_teleport_arrival); the squares are put back afterwards.
+void check_arrival_hazards( size_t gallery )
+{
+    std::printf( "arrival hazards:\n" );
+    const tripoint_abs_ms c = centre_of( gallery );
+    std::string setup;
+    std::string tp;
+    tripoint_abs_ms want;
+    tripoint_abs_ms at;
+    on_sim( [&] {
+        map &here = get_map();
+        // The order arrival_square tries them in: the centre, then ring 1.
+        std::vector<tripoint_abs_ms> order;
+        for( const tripoint_bub_ms &p : closest_points_first( here.get_bub( c ), 1 ) ) {
+            order.push_back( here.get_abs( p ) );
+        }
+        if( order.size() != 9 ) {
+            setup = "ring of " + std::to_string( order.size() );
+            return;
+        }
+        want = order.back();
+        std::vector<ter_id> before;
+        for( const tripoint_abs_ms &p : order ) {
+            before.push_back( here.ter( here.get_bub( p ) ) );
+        }
+        const tripoint_bub_ms air_below = here.get_bub( order[5] + tripoint_rel_ms::below );
+        const ter_id below_before = here.ter( air_below );
+        const auto field = [&]( size_t i, const char *id ) {
+            if( !here.add_field( here.get_bub( order[i] ), field_type_str_id( id ).id(), 1, 0_turns, false ) ) {
+                setup += std::string( "[no " ) + id + "]";
+            }
+        };
+        const auto ter = [&]( size_t i, const char *id ) {
+            here.ter_set( here.get_bub( order[i] ), ter_str_id( id ).id() );
+        };
+        field( 0, "fd_fire" );
+        field( 1, "fd_smoke" );
+        field( 2, "fd_acid" );
+        ter( 3, "t_water_dp" );
+        ter( 4, "t_water_moving_dp" );
+        // Open air over natural rock turns into a floor when the submap loads again: a wall under it.
+        here.ter_set( air_below, ter_str_id( "t_concrete_wall" ).id() );
+        ter( 5, "t_open_air" );
+        here.trap_set( here.get_bub( order[6] ), trap_str_id( "tr_bubblewrap" ).id() );
+        here.trap_set( here.get_bub( order[7] ), trap_str_id( "tr_beartrap" ).id() );
+        tp = fp3d::teleport_to_zone( gallery );
+        at = get_avatar().pos_abs();
+        map &now = get_map();
+        for( size_t i = 0; i < order.size(); i++ ) {
+            const tripoint_bub_ms b = now.get_bub( order[i] );
+            now.clear_fields( b );
+            now.remove_trap( b );
+            now.ter_set( b, before[i] );
+        }
+        now.ter_set( now.get_bub( order[5] + tripoint_rel_ms::below ), below_before );
+    } );
+    check( setup.empty() && tp.empty() && at == want,
+           "teleport: avoids fire, smoke, acid, deep water, open air, traps", ok_or( setup ) + " " + ok_or( tp ) +
+           " at centre+(" + std::to_string( at.x() - c.x() ) + "," + std::to_string( at.y() - c.y() ) + "), want (" +
+           std::to_string( want.x() - c.x() ) + "," + std::to_string( want.y() - c.y() ) + ")" );
+}
+
+// A boardable seat of the hub's car (sim thread); nullopt if there is none.
+std::optional<tripoint_abs_ms> car_seat( const tripoint_abs_ms &hub )
+{
+    map &here = get_map();
+    const optional_vpart_position vp = here.veh_at( here.get_bub( offset( hub, 6, 9 ) ) );
+    if( !vp ) {
+        return std::nullopt;
+    }
+    for( const vpart_reference &seat : vp->vehicle().get_avail_parts( VPFLAG_BOARDABLE ) ) {
+        return here.get_abs( seat.pos_bub( here ) );
+    }
+    return std::nullopt;
+}
+
+// Whether someone sits on the seat at `p` of a "car" (sim thread); nullopt if no car seat is there.
+std::optional<bool> seat_taken( const tripoint_abs_ms &p )
+{
+    map &here = get_map();
+    const std::optional<vpart_reference> seat = here.veh_at( here.get_bub( p ) ).part_with_feature( VPFLAG_BOARDABLE,
+            true );
+    if( !seat || seat->vehicle().type.str() != "car" ) {
+        return std::nullopt;
+    }
+    return seat->part().has_flag( vp_flag::passenger_flag );
+}
+
+// Teleport to a zone with no free square round its centre (walls over the whole search radius): refused, the player
+// back where it was. Done from a seat in the hub's car: rebuild_zone is refused there, the refused teleport puts the
+// player back in its seat, and a teleport that works leaves the car where it stands. The player starts in the gallery
+// and ends in the hub; the gallery keeps its walls until check_rebuild builds it again.
+void check_crowded_arrival( size_t gallery )
+{
+    std::printf( "crowded arrival, from a vehicle:\n" );
+    const tripoint_abs_ms c = centre_of( gallery );
+    const tripoint_abs_ms s = centre_of( 0 );
+    int walls = 0;
+    std::string to_hub;
+    on_sim( [&] {
+        map &here = get_map();
+        const int r = fp3d::arrival_search_squares;
+        for( int y = -r; y <= r; y++ ) {
+            for( int x = -r; x <= r; x++ ) {
+                const tripoint_bub_ms b = here.get_bub( offset( c, x, y ) );
+                here.ter_set( b, ter_str_id( "t_concrete_wall" ).id() );
+                walls += here.passable( b ) ? 0 : 1;
+            }
+        }
+        to_hub = fp3d::teleport_to_zone( 0 );
+    } );
+    const int side = 2 * fp3d::arrival_search_squares + 1;
+    check( walls == side * side && to_hub.empty(), "gallery walled round its centre, player to the hub",
+           std::to_string( walls ) + " walls " + ok_or( to_hub ) );
+
+    std::optional<tripoint_abs_ms> seat;
+    bool boarded = false;
+    std::string rebuild;
+    bool still_in = false;
+    std::string tp;
+    bool back_in = false;
+    std::optional<bool> taken_back;
+    tripoint_abs_ms back_at;
+    std::string out;
+    bool left = false;
+    std::optional<bool> taken_after;
+    int zone = -1;
+    on_sim( [&] {
+        avatar &u = get_avatar();
+        seat = car_seat( s );
+        if( !seat ) {
+            return;
+        }
+        get_map().board_vehicle( get_map().get_bub( *seat ), &u );
+        boarded = u.in_vehicle && u.pos_abs() == *seat && seat_taken( *seat ).value_or( false );
+        rebuild = fp3d::rebuild_zone( gallery );
+        still_in = u.in_vehicle && u.pos_abs() == *seat;
+        tp = fp3d::teleport_to_zone( gallery );
+        back_at = u.pos_abs();
+        back_in = u.in_vehicle;
+        taken_back = seat_taken( *seat );
+        out = fp3d::teleport_to_zone( 0 );
+        left = !u.in_vehicle && !get_map().veh_at( u.pos_bub() );
+        taken_after = seat_taken( *seat );
+        zone = fp3d::current_zone();
+    } );
+    check( seat && boarded, "hub: the player boards the car" );
+    check( rebuild == "Not while riding or in a vehicle." && still_in, "rebuild_zone: refused in a vehicle",
+           ok_or( rebuild ) );
+    check( tp == "No free square to arrive on there." && seat && back_at == *seat && back_in &&
+           taken_back.value_or( false ), "teleport: no free square, refused, back in the car seat", ok_or( tp ) +
+           ( back_in ? " in the car" : " not in the car" ) );
+    check( out.empty() && left && taken_after.has_value() && !*taken_after && zone == 0,
+           "teleport from the car: works, the car stays, the seat empty", ok_or( out ) );
+}
+
+// Riding: teleport_to_zone and rebuild_zone refused, the player and its mount stay. The mount: a horse next to the
+// player (mount_creature checks nothing; the menus that would). The player is in the hub; it gets off and the horse
+// is taken away afterwards.
+void check_riding( size_t gallery )
+{
+    std::printf( "riding:\n" );
+    bool mounted = false;
+    std::string tp;
+    std::string rebuild;
+    bool stayed = false;
+    bool off = false;
+    on_sim( [&] {
+        map &here = get_map();
+        avatar &u = get_avatar();
+        monster *horse = nullptr;
+        for( const tripoint_bub_ms &p : here.points_in_radius( u.pos_bub(), 1 ) ) {
+            if( p != u.pos_bub() && here.passable( p ) && !here.veh_at( p ) &&
+                get_creature_tracker().creature_at( p ) == nullptr ) {
+                horse = g->place_critter_at( mtype_id( "mon_horse" ), p );
+                if( horse != nullptr ) {
+                    break;
+                }
+            }
+        }
+        if( horse == nullptr ) {
+            return;
+        }
+        u.mount_creature( *horse );
+        const tripoint_abs_ms where = u.pos_abs();
+        mounted = u.is_mounted() && horse->pos_abs() == where;
+        tp = fp3d::teleport_to_zone( gallery );
+        rebuild = fp3d::rebuild_zone( gallery );
+        stayed = u.is_mounted() && u.pos_abs() == where && horse->pos_abs() == where;
+        // Off again (as Character::dismount, without its square menu), the horse gone.
+        u.remove_effect( efftype_id( "riding" ) );
+        horse->remove_effect( efftype_id( "ridden" ) );
+        horse->mounted_player_id = character_id();
+        horse->mounted_player = nullptr;
+        u.mounted_creature = nullptr;
+        g->remove_zombie( *horse );
+        off = !u.is_mounted();
+    } );
+    check( mounted && tp == "Not while riding." && stayed, "teleport: refused while riding", ok_or( tp ) );
+    check( rebuild == "Not while riding or in a vehicle." && stayed && off, "rebuild_zone: refused while riding",
+           ok_or( rebuild ) );
+}
+
+// A rebuild clears the zone's own area only: the bubble it loads reaches 12 squares further east and south. The
+// player stands just east of the gallery (in no zone) with a monster next to it, outside the gallery too: the
+// monster stays; one just inside the gallery is gone. The player is in the gallery (check_rebuild).
+void check_rebuild_edge( size_t gallery )
+{
+    std::printf( "rebuild edge:\n" );
+    const tripoint_abs_ms c = centre_of( gallery );
+    const int h = fp3d::zone_half_squares;
+    const tripoint_abs_ms stand = offset( c, h + 5, 0 );
+    const tripoint_abs_ms outside = offset( c, h + 6, 0 );
+    const tripoint_abs_ms inside = offset( c, h - 1, 0 );
+    std::string spawned;
+    int zone = -2;
+    std::string rebuild;
+    tripoint_abs_ms at;
+    std::string out_after = "?";
+    std::string in_after = "?";
+    on_sim( [&] {
+        avatar &u = get_avatar();
+        // Outside the zone is the generated world: a floor to stand on.
+        const auto pave = []( const tripoint_abs_ms & p ) {
+            map &here = get_map();
+            const tripoint_bub_ms b = here.get_bub( p );
+            if( here.inbounds( b ) ) {
+                here.ter_set( b, ter_str_id( "t_concrete" ).id() );
+                here.furn_set( b, furn_str_id::NULL_ID() );
+            }
+        };
+        pave( stand );
+        u.setpos( stand, false );
+        g->update_map( u );
+        pave( outside );
+        pave( inside );
+        spawned = ok_or( fp3d::spawn_monster( "mon_zombie", ui( outside ) ) ) + ok_or( fp3d::spawn_monster(
+                      "mon_zombie", ui( inside ) ) );
+        zone = fp3d::current_zone();
+        rebuild = fp3d::rebuild_zone( gallery );
+        at = u.pos_abs();
+        creature_tracker &tracker = get_creature_tracker();
+        const monster *mo = tracker.creature_at<monster>( outside );
+        const monster *mi = tracker.creature_at<monster>( inside );
+        out_after = mo != nullptr ? mo->type->id.str() : "nobody";
+        in_after = mi != nullptr ? mi->type->id.str() : "nobody";
+        if( mo != nullptr ) {
+            g->remove_zombie( *mo );
+        }
+    } );
+    check( spawned == "okok" && zone == -1 && rebuild.empty() && at == stand,
+           "rebuild_zone: from just outside the zone", spawned + " zone " + std::to_string( zone ) + " " +
+           ok_or( rebuild ) );
+    check( out_after == "mon_zombie" && in_after == "nobody",
+           "rebuild_zone: a monster just outside the zone stays", "outside: " + out_after + ", inside: " + in_after );
+}
+
 // ---- the other zone kinds ----
 
 bool in_zone( const tripoint_abs_ms &c, const tripoint_abs_ms &p )
@@ -1362,6 +1627,7 @@ kind_result verify_pens( size_t index, const fp3d::range_zone &z, const tripoint
                 if( x < p.min.x || x > p.max.x || y < p.min.y || y > p.max.y ) {
                     glass = glass && here.ter( here.get_bub( offset( c, x, y ) ) ).id().str() == "t_reinforced_glass";
                 }
+                glass = glass && here.ter( here.get_bub( offset( c, x, y, 1 ) ) ).id().str() == "t_glass_roof";
             }
         }
         water += p.what == "water" ? 1 : 0;
@@ -1385,7 +1651,7 @@ kind_result verify_pens( size_t index, const fp3d::range_zone &z, const tripoint
     out.checks.push_back( { "monsters placed + skipped == count, no strays", present == z.placed &&
                             present + z.skipped == z.count && present > 0 && in_zone_monsters == present,
                             std::to_string( present ) + " + " + std::to_string( z.skipped ) + " of " + std::to_string( z.count ) } );
-    out.checks.push_back( { "every monster inside reinforced glass", enclosed == present,
+    out.checks.push_back( { "every monster inside reinforced glass, under a glass roof", enclosed == present,
                             std::to_string( enclosed ) + " of " + std::to_string( present ) } );
     return out;
 }
@@ -1679,8 +1945,12 @@ int main( int argc, char **argv )
     check_teleport_arrival( gallery );
     check_turn_time( "gallery" );
     check_info( gallery );
+    check_arrival_hazards( gallery );
+    check_crowded_arrival( gallery );
+    check_riding( gallery );
     check_back_to_hub();
     check_rebuild( gallery );
+    check_rebuild_edge( gallery );
     check_zone_kinds();
     if( all_zones ) {
         check_all_zones();
