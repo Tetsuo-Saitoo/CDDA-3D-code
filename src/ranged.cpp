@@ -16,6 +16,7 @@
 
 #include "activity_actor_definitions.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/events.h" // FP3D:
 #include "fp3d/points.h" // FP3D:
 #include "avatar.h"
 #include "ballistics.h"
@@ -1102,6 +1103,8 @@ int Character::fire_gun( map &here, const tripoint_bub_ms &target, int shots, it
         itype_id projectile_use_ammo_id = gun.has_ammo_data() ? gun.ammo_data()->get_id() :
                                           itype_id::NULL_ID();
         projectile proj = make_gun_projectile( gun );
+        const fp3d::explosion_item_scope fp3d_item( projectile_use_ammo_id.is_null() ? std::string() :
+                projectile_use_ammo_id.str() ); // FP3D: rockets, 40 mm grenades
 
         for( damage_unit &elem : proj.impact.damage_units ) {
             elem.amount = enchantment_cache->modify_value( enchant_vals::mod::RANGED_DAMAGE, elem.amount );

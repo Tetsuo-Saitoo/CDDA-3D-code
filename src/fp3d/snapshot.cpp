@@ -21,6 +21,7 @@
 #include "fp3d/id_tables.h"
 #include "fp3d/points.h"
 #include "game.h"
+#include "flag.h"
 #include "item.h"
 #include "json.h"
 #include "lightmap.h"
@@ -171,6 +172,20 @@ void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile
         pile.count = static_cast<uint16_t>( std::min<size_t>( stack.size(), 65535 ) );
         for( size_t i = 0; i < n; i++ ) {
             pile.top[i] = intern_id( id_kind::itype, by_volume[i].second->typeId().str() );
+        }
+        units::volume biggest = -1_ml;
+        for( const auto &[vol, it] : by_volume ) {
+            if( it->is_corpse() && it->get_mtype() != nullptr && vol > biggest ) {
+                biggest = vol;
+                pile.corpse = intern_id( id_kind::mtype, it->get_mtype()->id.str() );
+                pile.corpse_state = ( it->has_flag( flag_BLED ) ? corpse_bled : 0 ) |
+                                    ( it->has_flag( flag_FIELD_DRESS ) ? corpse_field_dressed : 0 ) |
+                                    ( it->has_flag( flag_FIELD_DRESS_FAILED ) ? corpse_dress_failed : 0 ) |
+                                    ( it->has_flag( flag_SKINNED ) ? corpse_skinned : 0 ) |
+                                    ( it->has_flag( flag_QUARTERED ) ? corpse_quartered : 0 ) |
+                                    ( it->has_flag( flag_PULPED ) || it->damage() >= it->max_damage() ? corpse_pulped : 0 ) |
+                                    ( it->has_flag( flag_GIBBED ) ? corpse_gibbed : 0 );
+            }
         }
         sm.items.push_back( pile );
     }
@@ -424,7 +439,7 @@ void write_array( JsonOut &jo, const std::string &name, const Array &a )
 
 bool item_pile_view::operator==( const item_pile_view &o ) const
 {
-    return tile == o.tile && count == o.count && top == o.top;
+    return tile == o.tile && count == o.count && top == o.top && corpse == o.corpse && corpse_state == o.corpse_state;
 }
 
 bool field_view::operator==( const field_view &o ) const
@@ -666,6 +681,10 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
                 jo.write( static_cast<int64_t>( t ) );
             }
             jo.end_array();
+            if( p.corpse != 0 ) {
+                jo.write( static_cast<int64_t>( p.corpse ) );
+                jo.write( static_cast<int>( p.corpse_state ) );
+            }
             jo.end_array();
         }
         jo.end_array();

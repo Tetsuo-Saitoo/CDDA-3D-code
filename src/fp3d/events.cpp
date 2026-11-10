@@ -194,6 +194,21 @@ void on_projectile( const map &here, const Creature *shooter, const std::vector<
     push( std::move( e ) );
 }
 
+namespace
+{
+thread_local std::string explosion_item;
+} // namespace
+
+explosion_item_scope::explosion_item_scope( const std::string &itype ) : prev( explosion_item )
+{
+    explosion_item = itype;
+}
+
+explosion_item_scope::~explosion_item_scope()
+{
+    explosion_item = prev;
+}
+
 void on_explosion( const tripoint_bub_ms &centre, int radius, const std::vector<tripoint_bub_ms> &area,
                    const std::string &kind )
 {
@@ -214,6 +229,10 @@ void on_explosion( const tripoint_bub_ms &centre, int radius, const std::vector<
     e.pos = abs_of( centre );
     e.amount = radius;
     e.type = intern_id( id_kind::explosion, kind );
+    e.text = kind;
+    if( !explosion_item.empty() ) {
+        e.detail = intern_id( id_kind::itype, explosion_item );
+    }
     push( std::move( e ) );
 }
 

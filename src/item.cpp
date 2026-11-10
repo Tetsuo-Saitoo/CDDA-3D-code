@@ -56,6 +56,7 @@
 #include "field_type.h"
 #include "fire.h"
 #include "flag.h"
+#include "fp3d/events.h" // FP3D:
 #include "flat_set.h"
 #include "game.h"
 #include "game_constants.h"
@@ -13329,6 +13330,7 @@ bool item::detonate( const tripoint_bub_ms &p, std::vector<item> &drops )
     const Creature *source = get_player_character().get_faction()->id == owner
                              ? &get_player_character()
                              : nullptr;
+    const fp3d::explosion_item_scope fp3d_item( typeId().str() ); // FP3D:
     if( type->explosion.power >= 0 ) {
         explosion_handler::explosion( source, p, type->explosion );
         return true;

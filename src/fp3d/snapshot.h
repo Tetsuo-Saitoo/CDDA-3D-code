@@ -37,10 +37,16 @@ constexpr uint8_t vis_remembered = 1;
 constexpr uint8_t vis_seen_lit = 2;
 constexpr uint8_t vis_seen_dark = 3;              // in line of sight but too dark to make out
 
+// item_pile_view::corpse_state bits (CDDA's corpse flags).
+constexpr uint16_t corpse_bled = 1, corpse_field_dressed = 2, corpse_dress_failed = 4, corpse_skinned = 8,
+                   corpse_quartered = 16, corpse_pulped = 32, corpse_gibbed = 64;
+
 struct item_pile_view {
     uint8_t tile = 0;
     uint16_t count = 0;                           // items on the tile
     std::array<uint32_t, 4> top{};                // itype indices, largest volume first; 0 = none
+    uint32_t corpse = 0;                          // mtype index of the largest corpse here, 0 = none
+    uint16_t corpse_state = 0;                    // its butchery state, corpse_* bits below
     bool operator==( const item_pile_view &o ) const;
 };
 

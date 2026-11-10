@@ -235,6 +235,9 @@ void build_id_tables()
         d.color = color_name( it.color );
         d.looks_like = it.looks_like.str();
         d.category = it.category_force.str();
+        if( it.gun ) {
+            d.gun = it.gun->skill_used.str();
+        }
         d.volume_ml = static_cast<int>( units::to_milliliter( it.volume ) );
         d.weight_g = static_cast<int>( units::to_gram( it.weight ) );
     }
@@ -330,6 +333,9 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         jo.member( "color", d.color );
         jo.member( "looks_like", d.looks_like );
         jo.member( "category", d.category );
+        if( !d.gun.empty() ) {
+            jo.member( "gun", d.gun );
+        }
         jo.member( "volume_ml", d.volume_ml );
         jo.member( "weight_g", d.weight_g );
         jo.end_object();

@@ -57,6 +57,7 @@ struct item_def {
     std::string color;
     std::string looks_like;
     std::string category;
+    std::string gun;        // skill a gun uses (pistol, rifle, archery, launcher, ...), "" if not a gun
     int volume_ml = 0;
     int weight_g = 0;
 };

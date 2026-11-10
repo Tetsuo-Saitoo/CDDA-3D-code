@@ -90,15 +90,27 @@ void boot_common( bool headless )
 }
 } // namespace
 
-void boot_world( const std::string &world_name, bool headless )
+void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless )
 {
     boot_common( headless );
-    if( world_generator->has_world( world_name ) ) {
-        world_generator->delete_world( world_name, true );
-    }
-    WORLD *world = world_generator->make_new_world( world_name, { mod_id( "dda" ) } );
-    if( world == nullptr ) {
-        throw std::runtime_error( "make_new_world failed" );
+    WORLD *world = nullptr;
+    if( fresh_world ) {
+        if( world_generator->has_world( world_name ) ) {
+            world_generator->delete_world( world_name, true );
+        }
+        world = world_generator->make_new_world( world_name, { mod_id( "dda" ) } );
+        if( world == nullptr ) {
+            throw std::runtime_error( "make_new_world failed" );
+        }
+    } else {
+        // A new character in a world world_generator->init() found; ask for nothing it didn't find.
+        if( !world_generator->has_world( world_name ) ) {
+            throw std::runtime_error( "no world " + world_name );
+        }
+        world = world_generator->get_world( world_name );
+        if( world == nullptr ) {
+            throw std::runtime_error( "no world " + world_name );
+        }
     }
     world_generator->set_active_world( world );
     calendar::set_eternal_season( get_option<bool>( "ETERNAL_SEASON" ) );
@@ -109,6 +121,12 @@ void boot_world( const std::string &world_name, bool headless )
     build_id_tables();
 
     get_avatar() = avatar();
+    get_map() = map();
+}
+
+void boot_world( const std::string &world_name, bool headless )
+{
+    boot_new_game_data( world_name, true, headless );
     get_avatar().create( character_type::NOW );
     get_map() = map();
 }
