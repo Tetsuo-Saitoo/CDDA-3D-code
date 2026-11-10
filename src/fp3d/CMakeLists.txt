@@ -11,6 +11,7 @@ target_sources(cataclysm-tiles-common PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/shot.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/item_hands.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/worldgen.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/test_range.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cooking.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cheats.cpp)
 
@@ -43,6 +44,11 @@ target_compile_definitions(fp3d-ids-test PUBLIC SDL_MAIN_HANDLED)
 add_executable(fp3d-chargen-test chargen_test.cpp ${MESSAGES_CPP})
 target_link_libraries(fp3d-chargen-test PRIVATE cataclysm-tiles-common)
 target_compile_definitions(fp3d-chargen-test PUBLIC SDL_MAIN_HANDLED)
+
+# K7 test range: zones built and counted, range operations and their refusals, frozen AI, turn time per zone.
+add_executable(fp3d-range-test range_test.cpp ${MESSAGES_CPP})
+target_link_libraries(fp3d-range-test PRIVATE cataclysm-tiles-common)
+target_compile_definitions(fp3d-range-test PUBLIC SDL_MAIN_HANDLED)
 
 # The Godot GDExtension (repo root bridge/), built when it and bridge/godot-cpp are there. See docs/BUILD.md.
 set(FP3D_BRIDGE_DIR "${CMAKE_SOURCE_DIR}/../bridge" CACHE PATH "Folder of the Godot bridge (GDExtension)")

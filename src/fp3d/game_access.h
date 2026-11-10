@@ -15,6 +15,9 @@ class fp3d_game_access
         static bool start_game( game &g ) {
             return g.start_game();
         }
+        // The new-game half of start_game() on a given square, with no start location, NPCs, monsters or missions
+        // (the test range, fp3d/test_range.cpp). Set the calendar first.
+        static void start_game_at( game &g, const tripoint_abs_ms &start );
         // Loads a saved character into the active world; call g.setup() first (as the main menu does).
         static bool load_game( game &g, const save_t &save ) {
             return g.load( save );
