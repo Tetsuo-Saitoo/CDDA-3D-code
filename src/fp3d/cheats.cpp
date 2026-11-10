@@ -343,6 +343,8 @@ std::string run_range_op( const range_op &op )
             return set_ai_frozen( op.number != 0 );
         case range_op_kind::heal:
             return heal();
+        case range_op_kind::rebuild_zone:
+            return rebuild_zone( n < 0 ? SIZE_MAX : static_cast<size_t>( n ) );
     }
     return "No such operation.";
 }

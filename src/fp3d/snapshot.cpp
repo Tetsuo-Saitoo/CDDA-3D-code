@@ -702,6 +702,17 @@ std::vector<std::string> id_names( id_kind kind )
     return session_tables[static_cast<size_t>( kind )].names;
 }
 
+std::string id_name( id_kind kind, uint32_t index )
+{
+    const size_t k = static_cast<size_t>( kind );
+    std::lock_guard<std::mutex> lk( ids_mutex );
+    if( k >= session_tables.size() ) {
+        return "";
+    }
+    const std::vector<std::string> &names = session_tables[k].names;
+    return index > 0 && index < names.size() ? names[index] : std::string();
+}
+
 void reset_id_names()
 {
     std::lock_guard<std::mutex> lk( ids_mutex );
