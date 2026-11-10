@@ -209,6 +209,11 @@ explosion_item_scope::~explosion_item_scope()
     explosion_item = prev;
 }
 
+std::string current_explosion_item()
+{
+    return explosion_item;
+}
+
 void on_explosion( const tripoint_bub_ms &centre, int radius, const std::vector<tripoint_bub_ms> &area,
                    const std::string &kind )
 {

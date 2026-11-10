@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <map>
+#include <optional>
 #include <mutex>
 #include <ostream>
 #include <set>
@@ -19,6 +20,7 @@
 #include "enums.h"
 #include "type_id.h"
 #include "field.h"
+#include "fp3d/cooking.h"
 #include "fp3d/held.h"
 #include "fp3d/id_tables.h"
 #include "fp3d/item_hands.h"
@@ -160,6 +162,42 @@ size_t bubble_index( const tripoint_bub_ms &p )
 }
 
 // `items_seen`: CDDA's could_see_items (never inside sealed containers, others only from next to them).
+// What this square adds to CDDA's lightmap, as map::build_lightmap gathers it. Nothing when it adds none.
+std::optional<light_view> light_source_at( map &here, const tripoint_bub_ms &p, uint8_t tile )
+{
+    light_view best;
+    float lum = 0.0f;
+    const auto offer = [&]( float l, uint8_t kind ) {
+        if( l > lum ) {
+            lum = l;
+            best.kind = kind;
+        }
+    };
+    offer( static_cast<float>( here.ter( p ).obj().light_emitted ), light_fixed );
+    offer( static_cast<float>( here.furn( p ).obj().light_emitted ), light_fixed );
+    size_t n = 0;
+    for( const item &it : here.i_at( p ) ) {
+        if( n++ >= 64 ) {
+            break;
+        }
+        float l = 0.0f;
+        units::angle width = 0_degrees;
+        units::angle dir = 0_degrees;
+        if( it.getlight( l, width, dir ) ) {
+            offer( l, light_item );
+        }
+    }
+    for( const auto &fd : here.field_at( p ) ) {
+        offer( static_cast<float>( fd.second.get_intensity_level().light_emitted ), light_fire );
+    }
+    if( !( lum >= 0.5f ) ) {
+        return std::nullopt;
+    }
+    best.tile = tile;
+    best.luminance = static_cast<uint8_t>( std::min( 255.0f, std::round( lum ) ) );
+    return best;
+}
+
 void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile, submap_view &sm,
                                std::unordered_set<uint64_t> &seen, bool items_seen )
 {
@@ -288,9 +326,21 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
             if( vis == vis_seen_lit ) {
                 capture_items_and_fields( here, p, static_cast<uint8_t>( i ), *sm, seen,
                                           here.could_see_items( p, u.pos_bub() ) );
+                if( const std::optional<light_view> l = light_source_at( here, p, static_cast<uint8_t>( i ) ) ) {
+                    sm->lights.push_back( *l );
+                }
             }
         }
     }
+    // C6: brightest first, capped (ties by tile, so the order is stable).
+    std::sort( sm->lights.begin(), sm->lights.end(), []( const light_view & a, const light_view & b ) {
+        return a.luminance != b.luminance ? a.luminance > b.luminance : a.tile < b.tile;
+    } );
+    if( sm->lights.size() > max_lights_per_submap ) {
+        sm->lights.resize( max_lights_per_submap );
+    }
+    // L9: heat sources and the cookware on them, after the piles gave their items handles.
+    capture_heat_and_cookware( here, u, corner, *sm, seen );
     return sm;
 }
 
@@ -529,9 +579,31 @@ bool item_handle_view::operator==( const item_handle_view &o ) const
     return uid == o.uid && type == o.type && spot_x == o.spot_x && spot_y == o.spot_y;
 }
 
+bool light_view::operator==( const light_view &o ) const
+{
+    return tile == o.tile && luminance == o.luminance && kind == o.kind;
+}
+
 bool field_view::operator==( const field_view &o ) const
 {
     return tile == o.tile && type == o.type && intensity == o.intensity && age_turns == o.age_turns;
+}
+
+bool heat_view::operator==( const heat_view &o ) const
+{
+    return tile == o.tile && source == o.source && tool == o.tool && fire == o.fire && charges == o.charges &&
+           lit == o.lit;
+}
+
+bool cookware_item_view::operator==( const cookware_item_view &o ) const
+{
+    return uid == o.uid && type == o.type && count == o.count;
+}
+
+bool cookware_view::operator==( const cookware_view &o ) const
+{
+    return tile == o.tile && uid == o.uid && type == o.type && contents == o.contents &&
+           craft_result == o.craft_result && craft_recipe == o.craft_recipe && craft_progress == o.craft_progress;
 }
 
 bool submap_view::same_shape( const submap_view &o ) const
@@ -541,7 +613,8 @@ bool submap_view::same_shape( const submap_view &o ) const
 
 bool submap_view::same_detail( const submap_view &o ) const
 {
-    return light == o.light && vis == o.vis && items == o.items && fields == o.fields;
+    return light == o.light && vis == o.vis && items == o.items && fields == o.fields && heat == o.heat &&
+           cookware == o.cookware && lights == o.lights;
 }
 
 uint32_t intern_id( id_kind kind, const std::string &id )
@@ -682,6 +755,12 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     jo.member( "contract_version", static_cast<int64_t>( s.contract_version ) );
     jo.member( "turn", s.turn );
     jo.member( "seq", static_cast<int64_t>( s.seq ) );
+    // The z range CDDA has (constant per build).
+    jo.member( "z_levels" );
+    jo.start_array();
+    jo.write( -OVERMAP_DEPTH );
+    jo.write( OVERMAP_HEIGHT );
+    jo.end_array();
     jo.member( "bubble_origin" );
     write_point( jo, s.bubble_origin );
 
@@ -813,6 +892,54 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
             jo.write( static_cast<int>( f.intensity ) );
             jo.write( static_cast<int>( f.age_turns ) );
             jo.end_array();
+        }
+        jo.end_array();
+        // C6: [tile, luminance, kind (0 terrain/furniture, 1 item, 2 field)]
+        jo.member( "lights" );
+        jo.start_array();
+        for( const light_view &l : sm.lights ) {
+            jo.start_array();
+            jo.write( static_cast<int>( l.tile ) );
+            jo.write( static_cast<int>( l.luminance ) );
+            jo.write( static_cast<int>( l.kind ) );
+            jo.end_array();
+        }
+        jo.end_array();
+        // L9: [tile, source, tool, fire, charges, lit (0/1)]
+        jo.member( "heat" );
+        jo.start_array();
+        for( const heat_view &h : sm.heat ) {
+            jo.start_array();
+            jo.write( static_cast<int>( h.tile ) );
+            jo.write( static_cast<int>( h.source ) );
+            jo.write( static_cast<int64_t>( h.tool ) );
+            jo.write( static_cast<int>( h.fire ) );
+            jo.write( static_cast<int64_t>( h.charges ) );
+            jo.write( h.lit ? 1 : 0 );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "cookware" );
+        jo.start_array();
+        for( const cookware_view &cw : sm.cookware ) {
+            jo.start_object();
+            jo.member( "tile", static_cast<int>( cw.tile ) );
+            jo.member( "uid", static_cast<int64_t>( cw.uid ) );
+            jo.member( "type", static_cast<int64_t>( cw.type ) );
+            jo.member( "contents" );
+            jo.start_array();
+            for( const cookware_item_view &c : cw.contents ) {
+                jo.start_array();
+                jo.write( static_cast<int64_t>( c.uid ) );
+                jo.write( static_cast<int64_t>( c.type ) );
+                jo.write( static_cast<int64_t>( c.count ) );
+                jo.end_array();
+            }
+            jo.end_array();
+            jo.member( "craft_result", static_cast<int64_t>( cw.craft_result ) );
+            jo.member( "craft_recipe", cw.craft_recipe );
+            jo.member( "craft_progress", static_cast<int>( cw.craft_progress ) );
+            jo.end_object();
         }
         jo.end_array();
         jo.end_object();

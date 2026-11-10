@@ -81,6 +81,8 @@ class explosion_item_scope
     private:
         std::string prev;
 };
+// The innermost explosion_item_scope's itype ("" outside one): CDDA queues blasts and sets them off later.
+std::string current_explosion_item();
 void on_death( const Creature &c );
 void on_activity( const Character &ch, const std::string &activity );
 void on_turn_end();

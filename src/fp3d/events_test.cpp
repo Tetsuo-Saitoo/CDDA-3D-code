@@ -195,14 +195,22 @@ int main()
         u.cancel_activity();
 
         const tripoint_bub_ms blast_at = at + tripoint_rel_ms( -3, 2, 0 );
-        explosion_handler::explosion( nullptr, blast_at, 2.0f );
-        explosion_handler::process_explosions();
+        {
+            const fp3d::explosion_item_scope grenade( "grenade_act" );
+            explosion_handler::explosion( nullptr, blast_at, 2.0f );
+        }
+        {
+            // Set off later, inside another item's scope: still the grenade's blast.
+            const fp3d::explosion_item_scope other( "c4armed" );
+            explosion_handler::process_explosions();
+        }
         explosion_handler::flashbang( blast_at, true );
         std::vector<event> boom = drain( event_kind::explosion );
         check( boom.size() == 2 && name_of( fp3d::id_kind::explosion, boom[0].type ) == "blast" &&
                !boom[0].path.empty() && same( boom[0].pos, abs_of( blast_at ) ) &&
-               name_of( fp3d::id_kind::explosion, boom[1].type ) == "flashbang" && boom[1].amount == 8,
-               "explosions: blast area, flashbang radius", std::to_string( boom.size() ) + " events" +
+               name_of( fp3d::id_kind::explosion, boom[1].type ) == "flashbang" && boom[1].amount == 8 &&
+               name_of( fp3d::id_kind::itype, boom[0].detail ) == "grenade_act" && boom[1].detail == 0,
+               "explosions: blast area and item, flashbang radius", std::to_string( boom.size() ) + " events" +
                ( boom.empty() ? "" : ", blast covers " + std::to_string( boom[0].path.size() ) ) );
 
         // Overflow: 10 sounds then a full queue of messages. The sounds go first; every message stays.
