@@ -30,6 +30,7 @@
 #include "enums.h"
 #include "event.h"
 #include "event_bus.h"
+#include "field.h"
 #include "field_type.h"
 #include "flag.h"
 #include "fp3d/boot.h"
@@ -98,6 +99,8 @@ const ter_str_id ter_pen_glass( "t_reinforced_glass" );
 const ter_str_id ter_pen_water( "t_water_dp" );
 const ter_str_id ter_pen_dirt( "t_dirt" );
 const ter_str_id ter_pen_shade( "t_thconc_floor" );   // INDOORS: no sunlight
+// Over the pens: a floor to flyers (they can't rise through it) that lets the daylight in (TRANSPARENT_FLOOR).
+const ter_str_id ter_pen_roof( "t_glass_roof" );
 const item_category_id item_category_weapons_range( "weapons" );
 const flag_id flag_grenade_range( "GRENADE" );
 const damage_type_id damage_bash_range( "bash" );
@@ -441,18 +444,42 @@ tripoint_abs_ms at( const tripoint_abs_ms &centre, const fp3d::range_offset &o )
     return centre + tripoint_rel_ms( o.x, o.y, o.z );
 }
 
-// Clears the zone's area: creatures in the bubble gone, then per square from the top down: open air above z0, the
-// floor at z0, solid ground at z -1; no furniture, items, vehicles, traps, fields, graffiti or radiation.
+// Whether `p` is in the area of the zone round `centre` (the squares clear_area clears): x and y centre - 60 ..
+// centre + 59, z -1 and up.
+bool in_area( const tripoint_abs_ms &centre, const tripoint_abs_ms &p )
+{
+    const int h = fp3d::zone_half_squares;
+    const int dx = p.x() - centre.x();
+    const int dy = p.y() - centre.y();
+    return dx >= -h && dx < h && dy >= -h && dy < h && p.z() - centre.z() >= -1;
+}
+
+// Clears the zone's area: the NPCs and monsters in it gone (the loaded bubble reaches 12 squares further east and
+// south: whoever is there stays), then per square from the top down: open air above z0, the floor at z0, solid ground
+// at z -1; no furniture, items, vehicles, traps, fields, graffiti or radiation.
 void clear_area( const tripoint_abs_ms &centre )
 {
     map &here = get_map();
     g->reload_npcs();
     for( npc &guy : g->all_npcs() ) {
-        guy.die( &here, nullptr );
+        if( in_area( centre, guy.pos_abs() ) ) {
+            guy.die( &here, nullptr );
+        }
     }
     g->cleanup_dead();
-    g->clear_zombies();
-    // Mapgen's monster spawn points (the whole bubble) would spawn at the next update_map.
+    std::vector<monster *> gone;
+    for( monster &m : g->all_monsters() ) {
+        if( in_area( centre, m.pos_abs() ) ) {
+            gone.push_back( &m );
+        }
+    }
+    // The tracker keeps a removed monster alive until the turn ends: the other pointers stay good.
+    for( monster *m : gone ) {
+        g->remove_zombie( *m );
+    }
+    // Mapgen's monster spawn points would spawn at the next update_map. Loading the bubble spawned them already
+    // (place_player_overmap, update_map), so this drops at most a few new ones; map has no call for part of the
+    // bubble.
     here.clear_spawns();
 
     const int half = fp3d::zone_half_squares;
@@ -794,10 +821,10 @@ size_t build_lots( size_t index, const tripoint_abs_ms &s )
     return placed;
 }
 
-// Pens: each monster in its reinforced glass cell, on the floor it can stand on (water, dirt to dig in, an indoor
-// floor out of the sun). A new monster's timers start at the beginning of time, so the first reload would catch up
-// (dung on the floor, ...): caught up here, the cell swept. The cells are laid first and the map caches rebuilt, so a
-// monster the sun kills sees the indoor floor as shelter.
+// Pens: each monster in its reinforced glass cell under a glass roof, on the floor it can stand on (water, dirt to dig
+// in, an indoor floor out of the sun). A new monster's timers start at the beginning of time, so the first reload
+// would catch up (dung on the floor, ...): caught up here, the cell swept. The cells are laid first and the map caches
+// rebuilt, so a monster the sun kills sees the indoor floor as shelter.
 size_t build_pens( size_t index, const tripoint_abs_ms &s )
 {
     map &here = get_map();
@@ -810,6 +837,8 @@ size_t build_pens( size_t index, const tripoint_abs_ms &s )
             for( int x = piece.min.x - 1; x <= piece.max.x + 1; x++ ) {
                 const bool wall = x < piece.min.x || x > piece.max.x || y < piece.min.y || y > piece.max.y;
                 set_ter( at( s, { x, y, 0 } ), wall ? ter_pen_glass : inside );
+                // A glass roof over the cell and its walls: a flyer stays in once the AI runs.
+                set_ter( at( s, { x, y, 1 } ), ter_pen_roof );
             }
         }
     }
@@ -944,29 +973,39 @@ void settle_avatar()
     g->update_overmap_seen();
 }
 
-// Before the player is taken away from where it stands, as CDDA's own moves that put you elsewhere (game.cpp drops the
-// grab there): let go of what is grabbed (it stays behind), stop hauling, forget the auto-move route. The client's
-// queued actions were meant for the old place: dropped too.
-void leave_square( avatar &u )
+// Before the bubble is loaded elsewhere under the player, as CDDA's own moves that put you elsewhere (game.cpp drops
+// the grab there): let go of what is grabbed (it stays behind), stop hauling (the hauled items' references die with
+// the bubble), forget the auto-move route.
+void stop_moving( avatar &u )
 {
     if( u.get_grab_type() != object_type::NONE ) {
         u.grab( object_type::NONE );
     }
     u.stop_hauling();
     u.clear_destination();
+}
+
+// Before the player is taken away from where it stands: stop_moving, and the client's queued actions, meant for the
+// old place, dropped too.
+void leave_square( avatar &u )
+{
+    stop_moving( u );
     fp3d::clear_actions();
 }
 
 // Where the player arrives in a zone whose area is loaded: `centre` when it is free, else the nearest free square at
-// most arrival_search_squares from it (ring by ring). Free: in the bubble, passable, no vehicle part, no monster
-// or NPC (the avatar itself, the one moving, doesn't count). nullopt if there is none.
+// most arrival_search_squares from it (ring by ring). Free: in the bubble, passable, a floor to stand on (not open
+// air, not deep water), no field (fire, smoke, acid, ...), no trap, no vehicle part, no monster or NPC (the avatar
+// itself, the one moving, doesn't count). nullopt if there is none.
 std::optional<tripoint_abs_ms> arrival_square( const tripoint_abs_ms &centre )
 {
     map &here = get_map();
     creature_tracker &tracker = get_creature_tracker();
     for( const tripoint_bub_ms &p : closest_points_first( here.get_bub( centre ), fp3d::arrival_search_squares ) ) {
-        if( !here.inbounds( p ) || !here.passable( p ) || here.veh_at( p ) ||
-            tracker.creature_at<monster>( p, true ) != nullptr || tracker.creature_at<npc>( p ) != nullptr ) {
+        if( !here.inbounds( p ) || !here.passable( p ) || !here.has_floor( p ) ||
+            here.has_flag( ter_furn_flag::TFLAG_DEEP_WATER, p ) || here.field_at( p ).field_count() > 0 ||
+            !here.tr_at( p ).is_null() || here.veh_at( p ) || tracker.creature_at<monster>( p, true ) != nullptr ||
+            tracker.creature_at<npc>( p ) != nullptr ) {
             continue;
         }
         return here.get_abs( p );
@@ -1707,6 +1746,10 @@ std::string teleport_to_zone( size_t index )
         return "No such zone.";
     }
     avatar &u = get_avatar();
+    // The overmap teleport leaves the mount behind, and the way back below would put rider and mount on one square.
+    if( u.is_mounted() ) {
+        return "Not while riding.";
+    }
     leave_square( u );
     const tripoint_abs_ms back = u.pos_abs();
     const bool was_in_vehicle = u.in_vehicle;
@@ -1750,8 +1793,9 @@ std::string rebuild_zone( size_t index )
     if( u.in_vehicle || u.is_mounted() ) {
         return "Not while riding or in a vehicle.";
     }
-    // Bubble coordinates change on the way: the route would point elsewhere.
-    u.clear_destination();
+    // The bubble is loaded elsewhere and back: the route and the hauled items' references would point at nothing, and
+    // a grabbed thing in the zone is cleared away.
+    stop_moving( u );
     const tripoint_abs_ms back = u.pos_abs();
     load_bubble_at( zones[index].centre, zone_centre( zones[index] ) );
     build_zone( index );
