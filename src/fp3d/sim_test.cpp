@@ -592,7 +592,14 @@ int check_world_names()
         std::printf( "  worlds: %-38s %s\n", what, ok ? "PASS" : "FAIL" );
         failed += ok ? 0 : 1;
     };
-    check( fp3d::world_name_taken( "FP3D-SIM" ) == std::optional<std::string>( "fp3d-sim" ),
+    // The world boot used: fp3d-sim, or fp3d-sim-2, ... where an older unmarked fp3d-sim is left alone.
+    const std::string active = world_generator->active_world != nullptr ?
+                               world_generator->active_world->world_name : std::string();
+    std::string active_upper = active;
+    for( char &ch : active_upper ) {
+        ch = ch >= 'a' && ch <= 'z' ? static_cast<char>( ch - 'a' + 'A' ) : ch;
+    }
+    check( !active.empty() && fp3d::world_name_taken( active_upper ) == std::optional<std::string>( active ),
            "a listed world, other case" );
     check( !fp3d::world_name_taken( "fp3d-sim-free" ), "a free name" );
     const std::filesystem::path odd = std::filesystem::u8path( PATH_INFO::savedir() ) / "Unlisted-Fp3d";
@@ -608,8 +615,8 @@ int check_world_names()
            fp3d::reserved_world_name( "Fp3D-live" ) && !fp3d::reserved_world_name( "fp3d" ) &&
            !fp3d::reserved_world_name( "x-fp3d-" ) && !fp3d::reserved_world_name( "" ),
            "fp3d- names reserved, any case" );
-    check( fp3d::owned_world( "fp3d-sim" ) && fp3d::replacing_world_name( "fp3d-sim" ) == "fp3d-sim",
-           "the world boot made is its own to replace" );
+    check( fp3d::replaceable_world( active ) && fp3d::owned_world( active ) &&
+           fp3d::replacing_world_name( "fp3d-sim" ) == active, "the world boot made is its own to replace" );
     // An fp3d- folder FP3D didn't mark (a player's, or an older FP3D's): left alone, the next name is used.
     const std::filesystem::path blocked = std::filesystem::u8path( PATH_INFO::savedir() ) / "fp3d-blocked";
     std::filesystem::create_directories( blocked, ec );
