@@ -2090,6 +2090,7 @@ static bool run_combat_checks()
         std::string ammo;           // the gun's ammo, "" = 9mm
         bool spare_gun = false;     // also a jammed loaded `gun` in the pack
         bool ground_gun = false;    // and one lying a square west
+        bool turret_shot = false;   // fire 3 rounds from a jammed `gun` nobody holds, as a vehicle turret does
         int moves = 0;              // moves left for the turn that fires (0 = a full turn)
         bool armed = true;          // wield a loaded `gun`; else empty hands (throwing wields the rock)
         bool rock = false;          // carry a rock to throw
@@ -2112,12 +2113,14 @@ static bool run_combat_checks()
         int moves = 0;
         uint64_t mag_uid = 0;       // the wielded gun's magazine, given a handle (snapshots don't list it)
         uint32_t mag_type = 0;
+        int turret_fired = -1;      // rounds the turret_shot fired
     };
     struct state {
         std::mutex mx;
         std::optional<scene> want;  // the next scene to build
         seen last;                  // observed before the newest request
         uint64_t uids[3] = {};      // sim thread only
+        int turret_fired = -1;      // sim thread only
     };
     const std::shared_ptr<state> st = std::make_shared<state>();
     const auto hook = [st]() {
@@ -2211,6 +2214,15 @@ static bool run_combat_checks()
             if( sc->moves > 0 ) {
                 u.set_moves( sc->moves );
             }
+            st->turret_fired = -1;
+            if( sc->turret_shot ) {
+                // turret_data::fire: Character::fire_gun with the turret's own gun, not the wielded one
+                item base( itype_id( sc->gun ) );
+                base.ammo_set( itype_9mm );
+                base.set_fault( fault_id( "fault_stovepipe" ), true, false );
+                here.build_map_cache( p.z() );
+                st->turret_fired = u.fire_gun( here, p + tripoint_rel_ms( sc->zx, sc->zy, 0 ), 3, base );
+            }
             Messages::clear_messages();
             here.build_map_cache( p.z() );
         }
@@ -2225,6 +2237,7 @@ static bool run_combat_checks()
             }
         }
         o.moves = u.get_moves();
+        o.turret_fired = st->turret_fired;
         o.uid = st->uids[0];
         o.side_uid = st->uids[1];
         o.friendly_uid = st->uids[2];
@@ -3041,6 +3054,25 @@ static bool run_combat_checks()
         check( r.back && !r.target && r.before.jammed && r.after.jammed && r.after.ammo == r.before.ammo &&
                r.after.hp == r.before.hp && said( r.after, "jammed" ), "jammed gun: aim refused, no quick fix",
                counts( r ) + ( r.after.jammed ? ", still jammed" : ", cleared" ) );
+    }
+    // A turret's gun isn't the wielded one: a jam on it doesn't stop its fire (R and `clear` can't reach it), as in
+    // CDDA. Fired through Character::fire_gun as turret_data::fire does, 3 rounds from a jammed Glock nobody holds.
+    {
+        scene turret = point_blank;
+        turret.zx = -4;
+        turret.turret_shot = true;
+        std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
+        if( q && q->timed ) {
+            {
+                std::lock_guard<std::mutex> lk( st->mx );
+                st->want = turret;
+            }
+            fp3d::queue_action( "pause" );
+            q = fp3d::wait_request( 20000, q->id );
+        }
+        const seen t = seen_now();
+        check( q && q->timed && t.turret_fired == 3 && !said( t, "is jammed" ),
+               "turret's jammed gun fires on (not wielded)", "fired " + std::to_string( t.turret_fired ) );
     }
     // A burst stops at a jam from an earlier round: black-powder .300 BLK (recoil 1520) doesn't cycle a SIG MCX
     // Rattler (1700 needed), so CDDA leaves the first round's case in the chamber on full auto; its loop fired on

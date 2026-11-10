@@ -28,6 +28,35 @@ bool applies( const Character &who )
 {
     return who.is_avatar() && active();
 }
+
+// Only the gun in the avatar's hands: a vehicle turret's gun (turret_data::fire) or anything else fired through
+// fire_gun keeps CDDA's behaviour, since R and `clear` can't reach it.
+bool is_wielded( const Character &who, const item &gun )
+{
+    const item_location w = who.get_wielded_item();
+    return w && w.get_item() == &gun;
+}
+
+// The first fix of `jam` that `who` can do now (skills, tools, components), as Character::mend_item checks; null
+// for none (a mod's jam with no fixes, or tools or skills missing).
+const fault_fix *doable_fix( Character &who, const fault_id &jam )
+{
+    const inventory &inv = who.crafting_inventory();
+    for( const fault_fix_id &fix_id : jam->get_fixes() ) {
+        const fault_fix &fix = *fix_id;
+        bool doable = true;
+        for( const auto &[skill, level] : fix.skills ) {
+            if( who.get_greater_skill_or_knowledge_level( skill ) < level ) {
+                doable = false;
+                break;
+            }
+        }
+        if( doable && fix.get_requirements().can_make_with_inventory( inv, is_crafting_component ) ) {
+            return &fix;
+        }
+    }
+    return nullptr;
+}
 } // namespace
 
 fault_id jam_of( const item &gun )
@@ -40,11 +69,12 @@ fault_id jam_of( const item &gun )
 
 bool refuse_jammed_aim( Character &who, const item &gun )
 {
-    if( !applies( who ) ) {
+    if( !applies( who ) || !is_wielded( who, gun ) ) {
         return false;
     }
     const fault_id jam = jam_of( gun );
-    if( jam.is_null() ) {
+    // A jam R can't clear here keeps CDDA's quick fix, so the gun is never stuck for good.
+    if( jam.is_null() || doable_fix( who, jam ) == nullptr ) {
         return false;
     }
     //~ %1$s: gun name, %2$s: fault name (stovepipe, double feed...)
@@ -55,7 +85,7 @@ bool refuse_jammed_aim( Character &who, const item &gun )
 
 bool stop_jammed_burst( const Character &who, const item &gun )
 {
-    if( !applies( who ) || jam_of( gun ).is_null() ) {
+    if( !applies( who ) || !is_wielded( who, gun ) || jam_of( gun ).is_null() ) {
         return false;
     }
     who.add_msg_if_player( m_bad, _( "Your %s is jammed." ), gun.tname() );
@@ -80,19 +110,8 @@ std::string clear_jam( Character &who, const item_location &gun )
     }
     // No light check on purpose: CDDA's mend command refuses when it's too dark (fine_detail_vision_mod() > 4),
     // but its own quick fix at aim start never did; a stovepipe or a double feed is cleared by feel.
-    const inventory &inv = who.crafting_inventory();
-    for( const fault_fix_id &fix_id : jam->get_fixes() ) {
-        const fault_fix &fix = *fix_id;
-        bool doable = true;
-        for( const auto &[skill, level] : fix.skills ) {
-            if( who.get_greater_skill_or_knowledge_level( skill ) < level ) {
-                doable = false;
-                break;
-            }
-        }
-        if( !doable || !fix.get_requirements().can_make_with_inventory( inv, is_crafting_component ) ) {
-            continue;
-        }
+    if( const fault_fix *found = doable_fix( who, jam ) ) {
+        const fault_fix &fix = *found;
         // as Character::mend_item after its menu
         time_duration time = fix.time;
         for( const auto &[flag, mult] : fix.time_save_flags ) {
@@ -125,11 +144,8 @@ bool rack_jammed( Character &who )
     if( !gun || jam_of( *gun ).is_null() ) {
         return false;
     }
-    const std::string why = clear_jam( who, gun );
-    if( !why.empty() ) {
-        who.add_msg_if_player( m_info, why );
-    }
-    return true;
+    // Cleared, or reload as usual: a jam that can't be cleared here never keeps R from reloading.
+    return clear_jam( who, gun ).empty();
 }
 
 } // namespace fp3d
