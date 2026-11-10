@@ -161,8 +161,9 @@ void reset_to_scenario( avatar &u, const scenario &scen, const profession &prof 
 }
 
 constexpr size_t max_templates = 256;
-// Bigger template files are skipped (not listed, not loaded).
-constexpr std::uintmax_t max_template_bytes = 256 * 1024;
+// Bigger template files are skipped (not listed, not loaded). Transfer templates hold a played character with
+// all it carries, so this leaves room for those.
+constexpr std::uintmax_t max_template_bytes = 4 * 1024 * 1024;
 
 bool ascii_alnum( char ch )
 {
