@@ -42,12 +42,15 @@ bool firing = false;                    // in the avatar's fire_gun with its wie
 bool first_used = false;                // this trigger pull's first projectile has been decided
 int asks_this_pull = 0;                 // `shot` requests sent in this trigger pull
 int depth = 0;                          // projectile_attack nesting
-std::optional<shot_outcome> current;    // the outermost projectile's outcome
+std::optional<shot_outcome> current;    // the outermost projectile's outcome (a shell's: the current pellet's)
+std::vector<std::optional<shot_outcome>> pellet_outs;   // a shell's pellets the client flew one by one
+bool pellet_mode = false;               // ... and they are this projectile's outcomes
 
 std::atomic<uint64_t> n_asked{ 0 };
 std::atomic<uint64_t> n_accepted{ 0 };
 std::atomic<uint64_t> n_refused{ 0 };
 std::atomic<uint64_t> n_capped{ 0 };
+std::atomic<uint64_t> n_pellets{ 0 };
 std::atomic<int> asks_cap{ default_asks_per_pull };
 std::atomic<uint64_t> n_planned{ 0 };
 std::atomic<uint64_t> n_parts{ 0 };
@@ -187,6 +190,12 @@ shot_outcome outcome_of( const claim &c, double own )
     return o;
 }
 
+// CDDA's missed_by added per square past the first for a pellet's spread (ballistics.cpp: tan(arc / 2) * 2).
+double pellet_spread( const pellet &pel )
+{
+    return 2.0 * std::tan( units::to_radians( units::from_arcmin( std::clamp( pel.arcmin, 0.0, 1800.0 ) ) ) / 2.0 );
+}
+
 // The current projectile's client part for a hit on `target` by `source`, else null.
 const std::string *planned_part( const Creature &target, const Creature *source )
 {
@@ -274,13 +283,16 @@ firing_scope::~firing_scope()
 
 projectile_scope::projectile_scope( map &here, const Creature *origin, const tripoint_bub_ms &source,
                                     const tripoint_bub_ms &target, const projectile &proj,
-                                    const dispersion_sources &dispersion, const projectile_attack_aim &aim )
+                                    const dispersion_sources &dispersion, const projectile_attack_aim &aim,
+                                    const std::vector<pellet> &pellets )
 {
     if( ++depth != 1 ) {
         return;
     }
     outer_ = true;
     current.reset();
+    pellet_outs.clear();
+    pellet_mode = false;
     const shot_plan *p = plan_for( origin );
     if( p == nullptr || source == target || origin->as_character() == nullptr ) {
         return;
@@ -325,6 +337,12 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
             req.origin = to_ui_point( here.get_abs( source ) );
             req.cursor = to_ui_point( here.get_abs( target ) );
             req.range = p->range;
+            const bool shell = proj.count > 1 && !pellets.empty();
+            if( shell ) {
+                for( size_t j = 0; j < pellets.size() && j < max_shot_pellets; j++ ) {
+                    req.pellets.push_back( static_cast<float>( pellets[j].side * pellets[j].arcmin ) );
+                }
+            }
             std::optional<ui_answer> a;
             if( active() ) {
                 n_asked++;
@@ -338,14 +356,51 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
             const double vx = ux * std::cos( h ) - uy * std::sin( h );
             const double vy = uy * std::cos( h ) + ux * std::sin( h );
             side_ = h >= 0.0 ? 1 : -1;
+            // the error's vertical part, err * cos(angle), is known: the line itself is the horizontal part
+            const double vert = err * std::cos( units::to_radians( units::from_degrees( angle ) ) );
             bool used = false;
-            if( a && !a->cancel && a->shot ) {
+            if( a && !a->cancel && a->shot && shell && !a->shot->pellets.empty() ) {
+                // Each pellet a projectile of its own: checked against the line turned by its spread, rolled as
+                // CDDA rolls a pellet (the aimed square: its roll plus the spread over the distance). Pellets
+                // without a usable answer take CDDA's own path; the shell itself has no outcome.
+                std::vector<std::optional<shot_outcome>> outs( std::min( pellets.size(), max_shot_pellets ) );
+                uint64_t passed = 0;
+                for( size_t j = 0; j < outs.size() && j < a->shot->pellets.size(); j++ ) {
+                    const std::optional<pellet_answer> &pa = a->shot->pellets[j];
+                    if( !pa ) {
+                        continue;
+                    }
+                    const double t = units::to_radians( units::from_arcmin( pellets[j].side * pellets[j].arcmin ) );
+                    const double px = vx * std::cos( t ) - vy * std::sin( t );
+                    const double py = vy * std::cos( t ) + vx * std::sin( t );
+                    const std::optional<claim> c = check_claim( here, you, *p, source, px, py, shot_line_tiles,
+                                                   pa->hit_uid, to_abs_ms( pa->end ), pa->quality, pa->part );
+                    if( !c ) {
+                        continue;
+                    }
+                    passed++;
+                    double own = 1.0;
+                    if( c->hit != nullptr ) {
+                        own = c->end == target ?
+                              std::min( 1.0, aim.missed_by + pellet_spread( pellets[j] ) *
+                                        std::max( rl_dist( source, c->end ) - 1, 0 ) ) :
+                              own_missed_by( *c->hit, source, c->end, px, py, vert, 0.0, proj, dispersion,
+                                             aim.missed_by );
+                    }
+                    outs[j] = outcome_of( *c, own );
+                }
+                pellet_outs = std::move( outs );
+                pellet_mode = true;
+                n_pellets += passed;
+                if( passed > 0 ) {
+                    used = true;
+                    n_accepted++;
+                }
+            } else if( a && !a->cancel && a->shot ) {
                 const std::optional<claim> c = check_claim( here, you, *p, source, vx, vy, shot_line_tiles,
                                                a->shot->hit_uid, to_abs_ms( a->shot->end ), a->shot->quality,
                                                a->shot->part );
                 if( c ) {
-                    // the error's vertical part, err * cos(angle), is known: the line itself is the horizontal part
-                    const double vert = err * std::cos( units::to_radians( units::from_degrees( angle ) ) );
                     out = outcome_of( *c, c->hit != nullptr ? own_roll( *c, vx, vy, vert, 0.0 ) : 1.0 );
                     used = true;
                     n_accepted++;
@@ -367,6 +422,8 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
     } catch( ... ) {
         --depth;
         current.reset();
+        pellet_outs.clear();
+        pellet_mode = false;
         throw;
     }
 }
@@ -375,12 +432,26 @@ projectile_scope::~projectile_scope()
 {
     if( --depth == 0 ) {
         current.reset();
+        pellet_outs.clear();
+        pellet_mode = false;
     }
 }
 
 const shot_outcome *projectile_scope::outcome() const
 {
     return outer_ && current ? &*current : nullptr;
+}
+
+void projectile_scope::select_pellet( size_t j )
+{
+    if( outer_ && pellet_mode ) {
+        current = j < pellet_outs.size() ? pellet_outs[j] : std::nullopt;
+    }
+}
+
+bool projectile_scope::per_pellet() const
+{
+    return outer_ && pellet_mode;
 }
 
 std::optional<int> projectile_scope::wild_side() const
@@ -457,6 +528,21 @@ std::optional<bodypart_id> planned_body_part( const Creature &target, const Crea
     return id;
 }
 
+std::vector<pellet> roll_pellets( const projectile &proj )
+{
+    std::vector<pellet> out;
+    if( proj.shot_spread <= 0 || proj.count <= 0 ) {
+        return out;
+    }
+    out.reserve( proj.count );
+    for( int j = 0; j < proj.count; j++ ) {
+        // as ballistics.cpp's pellet loop rolled it: |normal|, at most 30 degrees, to either side
+        const double sample = std::abs( rng_normal( -proj.shot_spread, proj.shot_spread ) );
+        out.push_back( { std::min( sample, 1800.0 ), one_in( 2 ) ? 1 : -1 } );
+    }
+    return out;
+}
+
 void set_asks_per_pull( int n )
 {
     asks_cap = std::clamp( n, 1, 64 );
@@ -469,6 +555,7 @@ shot_counts get_shot_counts()
     c.accepted = n_accepted.load();
     c.refused = n_refused.load();
     c.capped = n_capped.load();
+    c.pellets = n_pellets.load();
     c.planned = n_planned.load();
     c.parts = n_parts.load();
     c.spared = n_spared.load();
