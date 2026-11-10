@@ -34,6 +34,16 @@ bool is_held_action( const std::string &action );
 bool held_action( avatar &u, const std::string &action );
 // The item held in the off hand, or an empty location.
 item_location offhand_item( avatar &u );
+// Why the off hand can't hold anything now ("" = it can): a two-handed weapon wielded, a broken left arm.
+std::string offhand_unavailable( avatar &u );
+// Holds the carried item `loc` in the off hand (what was held there is put away). Spends no moves.
+// "" when held, otherwise why not.
+std::string hold_carried( avatar &u, const item_location &loc );
+// Forgets an item copy's off-hand mark (the item moves into a container or onto the ground).
+void clear_offhand_mark( item &it );
+// Marks an item copy about to be held (never a valid token): it stays its own stack when it's put among
+// carried things it would otherwise merge with (ammo, rocks). hold_carried then marks it for real.
+void mark_offhand_pending( item &it );
 // True while the avatar runs an activity the client shows as it happens (a liquid fill): paced in real time.
 bool watched_activity( const avatar &u );
 

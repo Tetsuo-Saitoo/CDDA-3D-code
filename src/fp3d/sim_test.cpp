@@ -40,6 +40,7 @@
 #include "messages.h"
 #include "monster.h"
 #include "npc.h"
+#include "pocket_type.h"
 #include "rng.h"
 #include "type_id.h"
 #include "units.h"
@@ -60,6 +61,9 @@ const itype_id itype_jerrycan( "jerrycan" );
 const itype_id itype_water( "water" );
 const itype_id itype_glock_19( "glock_19" );
 const itype_id itype_9mm( "9mm" );
+const itype_id itype_bag_plastic( "bag_plastic" );
+const itype_id itype_bottle_plastic( "bottle_plastic" );
+const itype_id itype_1l_gold( "1l_gold" );
 const ter_str_id ter_t_water_sh( "t_water_sh" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
@@ -86,6 +90,9 @@ struct observed {
     int hoses = 0;           // hoses carried (wielded included)
     int ammo = -1;           // shoot check: rounds in the wielded gun (-1 nothing wielded)
     int zombie_hp = -1;      // hp of the first monster (-1 none)
+    int moves = 0;
+    int speed = 100;
+    int bag_rocks = 0;       // item checks: rocks inside a plastic bag lying west
     std::vector<std::string> messages;
 };
 std::mutex observed_mutex;
@@ -97,8 +104,9 @@ std::atomic<bool> spawn_zombie{ false };
 // an empty jerrycan carried and a one-tile vehicle north with 4 L of gasoline in a small tank, 4 = a zombie west,
 // 5 = zombies gone and a spare hose carried, 6 = the spare hose dropped here, 7 = picked up again, 8 = the jerrycan
 // wielded (the hose in hand gone), 9 = shallow water east and a puddle of 2 L of water south, 10 = a new empty
-// jerrycan wielded, 11 = a zombie 3 squares west and a loaded pistol in hand. Done on the sim thread right
-// before its next request.
+// jerrycan wielded, 11 = a zombie 3 squares west and a loaded pistol in hand, 12 = item checks: empty hands, two
+// rocks, a plastic bottle and a plastic bag west, a rock 3 squares west, a rock with a hostile save's handle and
+// spot north-west, 1 L of gold and a bottle of water carried. Done on the sim thread right before its next request.
 std::atomic<int> hand_setup{ 0 };
 
 void observe()
@@ -195,6 +203,31 @@ void observe()
             get_avatar().set_wielded_item( gun );
             break;
         }
+        case 12: {
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -4; dx <= 4; dx++ ) {
+                for( int dy = -4; dy <= 4; dy++ ) {
+                    here.i_clear( p + tripoint_rel_ms( dx, dy, 0 ) );
+                }
+            }
+            u.remove_weapon();
+            const tripoint_bub_ms w = p + tripoint_rel_ms( -1, 0, 0 );
+            here.add_item( w, item( itype_rock ) );
+            here.add_item( w, item( itype_rock ) );
+            here.add_item( w, item( itype_bottle_plastic ) );
+            here.add_item( w, item( itype_bag_plastic ) );
+            here.add_item( p + tripoint_rel_ms( -3, 0, 0 ), item( itype_rock ) );
+            item odd( itype_rock );
+            odd.set_var( "fp3d_uid", "12abc" );
+            odd.set_var( "fp3d_spot", "5000,-1" );
+            here.add_item( p + tripoint_rel_ms( -1, -1, 0 ), odd );
+            u.i_add( item( itype_1l_gold ) );
+            item bottle( itype_bottle_plastic );
+            bottle.put_in( item( itype_water, calendar::turn, 2 ), pocket_type::CONTAINER );
+            u.i_add( bottle );
+            break;
+        }
         default:
             break;
     }
@@ -242,6 +275,15 @@ void observe()
         break;
     }
     o.rocks_carried = u.amount_of( itype_rock );
+    o.moves = u.get_moves();
+    o.speed = u.get_speed();
+    for( const item &it : here.i_at( p + tripoint_rel_ms( -1, 0, 0 ) ) ) {
+        if( it.typeId() == itype_bag_plastic ) {
+            for( const item *in : it.all_items_top() ) {
+                o.bag_rocks += in->typeId() == itype_rock ? 1 : 0;
+            }
+        }
+    }
     o.loads = loads.load();
     for( const auto &m : Messages::recent_messages( 6 ) ) {
         o.messages.push_back( m.second );
@@ -886,6 +928,292 @@ static bool run_shoot_checks()
     return failed == 0;
 }
 
+// The handles listed on absolute square `p` in the newest snapshot.
+static std::vector<fp3d::item_handle_view> handles_at( const fp3d::ui_point &p )
+{
+    const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+    if( !s ) {
+        return {};
+    }
+    const auto floor_div = []( int a ) {
+        return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+    };
+    const int sx = floor_div( p.x );
+    const int sy = floor_div( p.y );
+    const int tile = ( p.y - sy * fp3d::sm_size ) * fp3d::sm_size + ( p.x - sx * fp3d::sm_size );
+    for( const std::shared_ptr<const fp3d::submap_view> &sm : s->submaps ) {
+        if( sm->pos.x != sx || sm->pos.y != sy || sm->pos.z != p.z ) {
+            continue;
+        }
+        for( const fp3d::item_pile_view &pile : sm->items ) {
+            if( pile.tile == tile ) {
+                return pile.handles;
+            }
+        }
+    }
+    return {};
+}
+
+static std::vector<fp3d::carried_view> carried_now()
+{
+    const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+    return s ? s->player.items : std::vector<fp3d::carried_view>();
+}
+
+// Single items by handle (fp3d/item_hands.h): take, put and drop with no menus, CDDA's rules and move costs, and
+// refusals that say why.
+static bool run_item_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  items: %-40s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct result {
+        bool queued = false;
+        bool back = false;       // in the main loop again
+        int spent = 0;           // moves
+        std::string msg;         // the last message
+    };
+    const auto run = [&]( const fp3d::item_action & ia ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            return res;
+        }
+        const observed o0 = snapshot();
+        fp3d::drain_events( evs );
+        evs.clear();
+        res.queued = fp3d::queue_item_action( ia );
+        if( !res.queued ) {
+            return res;
+        }
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 40000, r0->id );
+        fp3d::drain_events( evs );
+        const observed o1 = snapshot();
+        res.back = r1 && r1->timed;
+        res.spent = static_cast<int>( o1.turn - o0.turn ) * o0.speed + o0.moves - o1.moves;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msg = e.text;
+            }
+        }
+        return res;
+    };
+    const auto has = []( const std::string &s, const char *part ) {
+        return s.find( part ) != std::string::npos;
+    };
+    const auto show = []( const result & r ) {
+        return "[" + r.msg + "] " + std::to_string( r.spent ) + " moves";
+    };
+    const auto type_of = []( const char *id ) {
+        return fp3d::intern_id( fp3d::id_kind::itype, id );
+    };
+    const auto find_type = []( const std::vector<fp3d::item_handle_view> &hs, uint32_t type, size_t nth ) {
+        for( const fp3d::item_handle_view &h : hs ) {
+            if( h.type == type && nth-- == 0 ) {
+                return h;
+            }
+        }
+        return fp3d::item_handle_view();
+    };
+    const auto carried = []( uint64_t uid ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.uid == uid ) {
+                return c;
+            }
+        }
+        return fp3d::carried_view();
+    };
+    const auto carried_type = []( uint32_t type, uint8_t flags ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.type == type && ( c.flags & flags ) == flags ) {
+                return c;
+            }
+        }
+        return fp3d::carried_view();
+    };
+    const auto on = [&]( const fp3d::ui_point & p, uint64_t uid ) {
+        for( const fp3d::item_handle_view &h : handles_at( p ) ) {
+            if( h.uid == uid ) {
+                return h;
+            }
+        }
+        return fp3d::item_handle_view();
+    };
+
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 12;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    const fp3d::ui_point west{ here.x - 1, here.y, here.z };
+    const fp3d::ui_point far_west{ here.x - 3, here.y, here.z };
+    const fp3d::ui_point north_west{ here.x - 1, here.y - 1, here.z };
+    const uint32_t t_rock = type_of( "rock" );
+    const uint32_t t_bottle = type_of( "bottle_plastic" );
+    const uint32_t t_bag = type_of( "bag_plastic" );
+    const uint32_t t_gold = type_of( "1l_gold" );
+    const uint32_t t_water = type_of( "water" );
+    const uint32_t t_backpack = type_of( "backpack" );
+
+    // Every item on a square gets its own handle; uids read back from a save are checked, not trusted.
+    const std::vector<fp3d::item_handle_view> w0 = handles_at( west );
+    const fp3d::item_handle_view rock_a = find_type( w0, t_rock, 0 );
+    const fp3d::item_handle_view rock_b = find_type( w0, t_rock, 1 );
+    const fp3d::item_handle_view bottle = find_type( w0, t_bottle, 0 );
+    const fp3d::item_handle_view bag = find_type( w0, t_bag, 0 );
+    check( w0.size() == 4 && rock_a.uid != 0 && rock_b.uid != 0 && rock_a.uid != rock_b.uid && bottle.uid != 0 &&
+           bag.uid != 0 && rock_a.spot_x == -1, "a handle per item on a square", std::to_string( w0.size() ) +
+           " handles" );
+    const std::vector<fp3d::item_handle_view> nw = handles_at( north_west );
+    check( nw.size() == 1 && nw[0].uid != 0 && nw[0].uid != 12 && nw[0].spot_x == -1 && nw[0].spot_y == -1,
+           "a save's malformed handle and spot", nw.empty() ? "none" : std::to_string( nw[0].uid ) );
+    const fp3d::carried_view gold = carried_type( t_gold, 0 );
+    const fp3d::carried_view water = carried_type( t_water, 0 );
+    const fp3d::carried_view backpack = carried_type( t_backpack, fp3d::carried_worn );
+    const fp3d::carried_view water_bottle = carried( water.parent );
+    check( gold.uid != 0 && water.uid != 0 && water_bottle.type == t_bottle && water.pocket == 0 &&
+           backpack.uid != 0 && backpack.parent == 0, "carried items listed with their containers",
+           std::to_string( carried_now().size() ) + " carried" );
+
+    // The bridge refuses malformed requests before they reach the game.
+    fp3d::item_action bad;
+    bad.op = fp3d::item_op::take;
+    bad.item = { rock_a.uid, t_rock };
+    bad.pos = west;
+    fp3d::item_action spot_bad = bad;
+    spot_bad.op = fp3d::item_op::drop;
+    spot_bad.has_spot = true;
+    spot_bad.spot_x = 1000;
+    fp3d::item_action uid_zero = bad;
+    uid_zero.item.uid = 0;
+    fp3d::item_action uid_big = bad;
+    uid_big.item.uid = fp3d::max_item_uid + 1;
+    fp3d::item_action no_container = bad;
+    no_container.op = fp3d::item_op::put;
+    fp3d::item_action pocket_big = bad;
+    pocket_big.op = fp3d::item_op::put;
+    pocket_big.container = { bag.uid, t_bag };
+    pocket_big.pocket = fp3d::max_item_pocket + 1;
+    fp3d::item_action far_pos = bad;
+    far_pos.pos.x = 1 << 30;
+    check( !fp3d::queue_item_action( spot_bad ) && !fp3d::queue_item_action( uid_zero ) &&
+           !fp3d::queue_item_action( uid_big ) && !fp3d::queue_item_action( no_container ) &&
+           !fp3d::queue_item_action( pocket_big ) && !fp3d::queue_item_action( far_pos ),
+           "malformed requests refused by the bridge", "" );
+
+    // Take: out of reach, into the pack, the same handle again, into each hand.
+    fp3d::item_action take;
+    take.op = fp3d::item_op::take;
+    const std::vector<fp3d::item_handle_view> distant = handles_at( far_west );
+    take.item = { distant.empty() ? rock_a.uid : distant[0].uid, t_rock };
+    take.pos = far_west;
+    result res = run( take );
+    check( res.back && res.spent == 0 && has( res.msg, "can't reach" ), "take: out of reach", show( res ) );
+    take.item = { rock_a.uid, rock_a.type };
+    take.pos = west;
+    res = run( take );
+    check( res.back && res.spent > 0 && has( res.msg, "pick up" ) && carried( rock_a.uid ).uid != 0 &&
+           on( west, rock_a.uid ).uid == 0, "take into the pack", show( res ) );
+    res = run( take );
+    check( res.back && res.spent == 0 && has( res.msg, "isn't there" ), "take: stale handle", show( res ) );
+    take.item = { bottle.uid, bottle.type };
+    take.hand = fp3d::item_hand::main;
+    res = run( take );
+    check( res.back && res.spent > 0 && fp3d::latest_held().main.id == "bottle_plastic" &&
+           ( carried( bottle.uid ).flags & fp3d::carried_wielded ), "take into the main hand", show( res ) );
+    take.item = { bag.uid, bag.type };
+    res = run( take );
+    check( res.back && res.spent == 0 && has( res.msg, "hand is full" ), "take: main hand full", show( res ) );
+    take.item = { rock_b.uid, rock_b.type };
+    take.hand = fp3d::item_hand::off;
+    res = run( take );
+    check( res.back && res.spent > 0 && fp3d::latest_held().off.id == "rock" &&
+           ( carried( rock_b.uid ).flags & fp3d::carried_offhand ), "take into the off hand", show( res ) );
+
+    // Put: CDDA's pocket rules say no.
+    fp3d::item_action put;
+    put.op = fp3d::item_op::put;
+    put.item = { rock_a.uid, rock_a.type };
+    put.container = { bottle.uid, bottle.type };
+    put.pos = here;
+    res = run( put );
+    check( res.back && res.spent == 0 && has( res.msg, "too big" ), "put: too big (rock into a bottle)",
+           show( res ) );
+    put.item = { gold.uid, gold.type };
+    put.container = { bag.uid, bag.type };
+    put.pos = west;
+    res = run( put );
+    check( res.back && res.spent == 0 && has( res.msg, "too heavy" ), "put: too heavy (gold into a bag)",
+           show( res ) );
+    put.item = { water.uid, water.type };
+    put.container = { backpack.uid, backpack.type };
+    res = run( put );
+    check( res.back && res.spent == 0 && has( res.msg, "liquid" ), "put: not watertight (water into a pack)",
+           show( res ) );
+    put.item = { rock_a.uid, rock_a.type };
+    put.container = { 0x5eed, bag.type };
+    res = run( put );
+    check( res.back && res.spent == 0 && has( res.msg, "isn't there" ), "put: stale container handle",
+           show( res ) );
+    // Put: into a bag on the ground, into a pack pocket by index (from the off hand), into the held bottle.
+    put.container = { bag.uid, bag.type };
+    res = run( put );
+    check( res.back && res.spent > 0 && snapshot().bag_rocks == 1 && carried( rock_a.uid ).uid == 0,
+           "put into a bag on the ground", show( res ) );
+    put.item = { rock_b.uid, rock_b.type };
+    put.container = { backpack.uid, backpack.type };
+    put.pocket = 0;
+    res = run( put );
+    const fp3d::carried_view in_pack = carried( rock_b.uid );
+    check( res.back && res.spent > 0 && in_pack.parent == backpack.uid && in_pack.pocket == 0 &&
+           !fp3d::latest_held().off.held, "put into a worn pack's pocket 0", show( res ) );
+    put.pocket = -1;
+    put.item = { water.uid, water.type };
+    put.container = { bottle.uid, bottle.type };
+    res = run( put );
+    check( res.back && res.spent > 0 && carried( water.uid ).parent == bottle.uid, "put water into the held bottle",
+           show( res ) );
+
+    // Drop: placed with a spot (read back from the snapshot), dropped without one.
+    fp3d::item_action drop;
+    drop.op = fp3d::item_op::drop;
+    drop.item = { bottle.uid, bottle.type };
+    drop.pos = west;
+    drop.has_spot = true;
+    drop.spot_x = 250;
+    drop.spot_y = 750;
+    res = run( drop );
+    const fp3d::item_handle_view placed = on( west, bottle.uid );
+    check( res.back && res.spent > 0 && placed.spot_x == 250 && placed.spot_y == 750 &&
+           !fp3d::latest_held().main.held, "drop: placed on a spot", show( res ) );
+    drop.item = { gold.uid, gold.type };
+    drop.pos = here;
+    drop.has_spot = false;
+    res = run( drop );
+    const fp3d::item_handle_view dropped = on( here, gold.uid );
+    check( res.back && res.spent > 0 && dropped.uid == gold.uid && dropped.spot_x == -1, "drop: no spot",
+           show( res ) );
+    drop.item = { backpack.uid, backpack.type };
+    res = run( drop );
+    check( res.back && res.spent == 0 && has( res.msg, "Take off" ), "drop: worn item refused", show( res ) );
+    drop.item = { gold.uid, gold.type };
+    res = run( drop );
+    check( res.back && res.spent == 0 && has( res.msg, "don't have" ), "drop: not carried any more", show( res ) );
+    return failed == 0;
+}
+
 static bool run_queue_checks()
 {
     int failed = 0;
@@ -1040,6 +1368,7 @@ int main()
     const bool hands_ok = queue_ok && run_hand_checks();
     const bool siphon_ok = hands_ok && run_siphon_checks();
     const bool shoot_ok = siphon_ok && run_shoot_checks();
+    const bool items_ok = shoot_ok && run_item_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -1072,7 +1401,8 @@ int main()
     std::printf( "hands: %s\n", hands_ok ? "ok" : "BAD" );
     std::printf( "siphon: %s\n", siphon_ok ? "ok" : "BAD" );
     std::printf( "shoot: %s\n", shoot_ok ? "ok" : "BAD" );
+    std::printf( "items: %s\n", items_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && hands_ok && siphon_ok &&
-           shoot_ok ?
+           shoot_ok && items_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

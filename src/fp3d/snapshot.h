@@ -41,13 +41,35 @@ constexpr uint8_t vis_seen_dark = 3;              // in line of sight but too da
 constexpr uint16_t corpse_bled = 1, corpse_field_dressed = 2, corpse_dress_failed = 4, corpse_skinned = 8,
                    corpse_quartered = 16, corpse_pulped = 32, corpse_gibbed = 64;
 
+// One item a client can point at (fp3d/item_hands.h): its handle and itype, as an item action names it.
+struct item_handle_view {
+    uint64_t uid = 0;
+    uint32_t type = 0;                            // itype index
+    int16_t spot_x = -1;                          // where the client placed it, permille of the square; -1 none
+    int16_t spot_y = -1;
+    bool operator==( const item_handle_view &o ) const;
+};
+
 struct item_pile_view {
     uint8_t tile = 0;
     uint16_t count = 0;                           // items on the tile
     std::array<uint32_t, 4> top{};                // itype indices, largest volume first; 0 = none
     uint32_t corpse = 0;                          // mtype index of the largest corpse here, 0 = none
     uint16_t corpse_state = 0;                    // its butchery state, corpse_* bits below
+    std::vector<item_handle_view> handles;        // the first max_handles_per_tile items, CDDA's stack order
     bool operator==( const item_pile_view &o ) const;
+};
+
+// carried_view::flags
+constexpr uint8_t carried_worn = 1, carried_wielded = 2, carried_offhand = 4;
+
+// A carried item (worn, wielded or inside one of those), depth first.
+struct carried_view {
+    uint64_t uid = 0;
+    uint32_t type = 0;                            // itype index
+    uint64_t parent = 0;                          // the container's uid; 0 = on the body (worn or wielded)
+    int16_t pocket = -1;                          // index into the parent's pockets (as item actions take it)
+    uint8_t flags = 0;                            // carried_* bits
 };
 
 struct field_view {
@@ -135,6 +157,7 @@ struct player_view {
     std::vector<uint8_t> bite;                    // 1 bitten wound
     std::vector<uint8_t> infected;
     std::vector<worn_view> worn;                  // inner to outer (CDDA's worn order); cap 64
+    std::vector<carried_view> items;              // wielded, then worn items and what's inside; cap 256
 };
 
 struct environment_view {
