@@ -17,6 +17,7 @@
 #include "fp3d/bridge.h"
 #include "fp3d/game_access.h"
 #include "fp3d/id_tables.h"
+#include "fp3d/test_range.h"
 #include "game.h"
 #include "game_constants.h"
 #include "map.h"
@@ -81,6 +82,8 @@ void boot_common( bool headless )
         get_options().load();
     }
     init_colors();
+    // A range (and its AI freeze) belongs to the game booted with it, not to the next one.
+    reset_test_range();
 
     g = std::make_unique<game>();
     g->new_game = true;
