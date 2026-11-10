@@ -3,7 +3,8 @@
 // under <cdda>/gfx into <cdda>/cache/gfx, the places CDDA itself caches them.
 // CDDA uses a cache entry only while its JSON file still has the modification time it was cached with (to the
 // millisecond), so run this after the files have their final times (squashfs keeps whole seconds: round them first).
-// A stale or missing entry is parsed from the JSON as usual. Existing cache folders are replaced.
+// A stale or missing entry is parsed from the JSON as usual. Existing cache folders are replaced. Fails when any
+// file can't be cached.
 //
 // usage: fp3d-json-cache <cdda folder>      (the folder that holds data/ and gfx/)
 #include <cstdio>
@@ -72,8 +73,9 @@ int main( int argc, char **argv )
             return 1;
         }
     }
-    // Nothing is written outside <cdda>: the user folder is only named (CDDA's path setup wants one).
-    const fs::path user = fs::temp_directory_path( ec ) / "fp3d-json-cache-user";
+    // CDDA's path setup wants a user folder. Nothing is written there; it is inside <cdda> anyway and removed at
+    // the end, so nothing ever lands outside <cdda>.
+    const fs::path user = base / ".fp3d-json-cache-user";
     std::string base_s = base.generic_u8string();
     if( base_s.back() != '/' ) {
         base_s += '/';
@@ -107,6 +109,8 @@ int main( int argc, char **argv )
     for( const fs::path &f : gfx_files ) {
         cache( cata_path( cata_path::root_path::base, f ) );
     }
+    fs::remove_all( user, ec );
     std::printf( "fp3d-json-cache: %zu files cached, %zu not\n", cached, bad );
-    return cached > 0 ? EXIT_SUCCESS : EXIT_FAILURE;
+    // Every shipped JSON file should parse: one that doesn't is a data problem to fix before release.
+    return cached > 0 && bad == 0 ? EXIT_SUCCESS : EXIT_FAILURE;
 }
