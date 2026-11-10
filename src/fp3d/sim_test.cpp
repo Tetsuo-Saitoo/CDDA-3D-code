@@ -85,6 +85,8 @@ const vpart_id vpart_frame( "frame" );
 const vpart_id vpart_tank_small( "tank_small" );
 const ter_str_id ter_t_door_c( "t_door_c" );
 const ter_str_id ter_t_floor( "t_floor" );
+const ter_str_id ter_t_stairs_down( "t_stairs_down" );
+const ter_str_id ter_t_stairs_up( "t_stairs_up" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
 const itype_id itype_pot( "pot" );
 const itype_id itype_meat( "meat" );
@@ -337,6 +339,29 @@ void observe()
             size_t squares = 0;
             cook_heat_ms = fp3d::take_heat_capture_ms( &squares );
             cook_heat_squares = squares;
+            break;
+        }
+        case 15: {
+            // Stairs down north of the avatar, stairs up under them, floor around both (the siphon scene's
+            // vehicle gone).
+            g->clear_zombies();
+            const tripoint_bub_ms s = p + tripoint_rel_ms( 0, -1, 0 );
+            for( int dz = -1; dz <= 0; dz++ ) {
+                for( int dx = -1; dx <= 1; dx++ ) {
+                    for( int dy = -1; dy <= 1; dy++ ) {
+                        const tripoint_bub_ms q = s + tripoint_rel_ms( dx, dy, dz );
+                        if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                            here.destroy_vehicle( &vp->vehicle() );
+                        }
+                        here.ter_set( q, ter_t_floor );
+                        here.furn_set( q, furn_str_id::NULL_ID() );
+                        here.i_clear( q );
+                        here.clear_fields( q );
+                    }
+                }
+            }
+            here.ter_set( s, ter_t_stairs_down );
+            here.ter_set( s + tripoint_rel_ms( 0, 0, -1 ), ter_t_stairs_up );
             break;
         }
         default:
@@ -1918,6 +1943,89 @@ static bool run_safemode_checks()
 
 // Cheats and the test kit (fp3d/cheats.h, 2026-11-10): all off at first; names checked exactly; each one on, the
 // invincible / weight / ammo ones seen working; the kit handed out; all off again.
+// D2: the stairs action. Out-of-range fields are refused when queued; stairs too far, the wrong way or missing
+// are refused with a message and nothing happens; from next to the stairs the avatar goes down, then back up.
+static bool run_stairs_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  stairs: %-38s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    const auto pos_now = []() {
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        return s ? s->player.pos : fp3d::ui_point{ 0, 0, -999 };
+    };
+    const auto str = []( const fp3d::ui_point & q ) {
+        return std::to_string( q.x ) + "," + std::to_string( q.y ) + "," + std::to_string( q.z );
+    };
+    const auto same = []( const fp3d::ui_point & a, const fp3d::ui_point & b ) {
+        return a.x == b.x && a.y == b.y && a.z == b.z;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 15;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    if( !r || !r->timed ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point start = pos_now();
+    const fp3d::ui_point stairs{ start.x, start.y - 1, start.z };
+    // One action: queue it, wait for the main loop again, return the last message.
+    const auto run = [&]( const fp3d::ui_point & at, int dir ) {
+        std::vector<fp3d::event> evs;
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            return std::string( "<no main loop>" );
+        }
+        fp3d::drain_events( evs );
+        evs.clear();
+        if( !fp3d::queue_stairs_action( fp3d::stairs_action{ at, dir } ) ) {
+            return std::string( "<not queued>" );
+        }
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 40000, r0->id );
+        fp3d::drain_events( evs );
+        std::string msg = r1 && r1->timed ? "" : "<not back>";
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                msg = e.text;
+            }
+        }
+        return msg;
+    };
+    const auto has = []( const std::string & s, const char *part ) {
+        return s.find( part ) != std::string::npos;
+    };
+
+    check( !fp3d::queue_stairs_action( { stairs, 0 } ) && !fp3d::queue_stairs_action( { stairs, 2 } ) &&
+           !fp3d::queue_stairs_action( { stairs, -2 } ) &&
+           !fp3d::queue_stairs_action( { { stairs.x, stairs.y, 11 }, 1 } ) &&
+           !fp3d::queue_stairs_action( { { stairs.x, stairs.y, -11 }, -1 } ) &&
+           !fp3d::queue_stairs_action( { { 1 << 29, stairs.y, stairs.z }, -1 } ) &&
+           !fp3d::queue_stairs_action( { { stairs.x, -( 1 << 29 ), stairs.z }, -1 } ) &&
+           !fp3d::queue_action( fp3d::stairs_action_name ), "bad fields refused when queued", "" );
+    std::string m = run( { stairs.x, stairs.y - 1, stairs.z }, -1 );
+    check( has( m, "too far" ) && same( pos_now(), start ), "two squares away refused", m );
+    m = run( { stairs.x, stairs.y, stairs.z + 1 }, -1 );
+    check( has( m, "too far" ) && same( pos_now(), start ), "another level refused", m );
+    m = run( stairs, 1 );
+    check( has( m, "no stairs up" ) && same( pos_now(), start ), "wrong way refused", m );
+    m = run( { start.x - 1, start.y, start.z }, -1 );
+    check( has( m, "no stairs down" ) && same( pos_now(), start ), "no stairs refused", m );
+    m = run( stairs, -1 );
+    const fp3d::ui_point below{ stairs.x, stairs.y, stairs.z - 1 };
+    const bool down = same( pos_now(), below );
+    check( down, "from next to them, down", str( pos_now() ) + " [" + m + "]" );
+    m = down ? run( below, 1 ) : "<not below>";
+    check( down && same( pos_now(), stairs ), "standing on them, up", str( pos_now() ) + " [" + m + "]" );
+    return failed == 0;
+}
+
 static bool run_cheat_checks()
 {
     int failed = 0;
@@ -2105,6 +2213,7 @@ int main()
     const bool items_ok = shoot_ok && run_item_checks();
     const bool cooking_ok = items_ok && run_cooking_checks();
     const bool cheats_ok = cooking_ok && run_cheat_checks();
+    const bool stairs_ok = cheats_ok && run_stairs_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -2141,10 +2250,11 @@ int main()
     std::printf( "items: %s\n", items_ok ? "ok" : "BAD" );
     std::printf( "cooking: %s\n", cooking_ok ? "ok" : "BAD" );
     std::printf( "cheats: %s\n", cheats_ok ? "ok" : "BAD" );
+    std::printf( "stairs: %s\n", stairs_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
-           shoot_ok && items_ok && cooking_ok && cheats_ok && worlds_ok ?
+           shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && worlds_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

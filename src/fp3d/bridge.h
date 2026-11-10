@@ -194,6 +194,18 @@ constexpr const char *item_action_name = "fp3d_item";
 // Sim side: the item action the bridge just answered `fp3d_item` with (once), nullopt if none.
 std::optional<item_action> take_item_action();
 
+// D2: use the stairs at an absolute square, dir +1 up or -1 down. The player stands on that square or next to it
+// on the same level (next to it, they step onto it first); CDDA's vertical_move does the rest, with its messages.
+struct stairs_action {
+    ui_point pos;
+    int dir = 0;
+};
+// Client side. False if a field is out of range or the queue is full.
+bool queue_stairs_action( const stairs_action &a );
+constexpr const char *stairs_action_name = "fp3d_stairs";
+// Sim side: the stairs action the bridge just answered `fp3d_stairs` with (once), nullopt if none.
+std::optional<stairs_action> take_stairs_action();
+
 // Recipe queries (L9, fp3d/cooking.h): "what can this container's contents become, and how long?" without
 // blocking. The client posts a query and later takes its result (JSON text). The sim runs pending queries at the
 // main loop's request (right after the before-ask hook, and whenever one is posted while it waits there, paused

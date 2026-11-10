@@ -7,13 +7,18 @@
 #include <vector>
 
 #include "avatar.h"
+#include "avatar_action.h"
 #include "bodypart.h"
 #include "calendar.h"
+#include "coordinates.h"
+#include "creature_tracker.h"
 #include "enums.h"
+#include "fp3d/bridge.h"
 #include "fp3d/cheats.h"
 #include "fp3d/game_access.h"
 #include "fp3d/hands.h"
 #include "fp3d/item_hands.h"
+#include "fp3d/points.h"
 #include "game.h"
 #include "game_inventory.h"
 #include "handle_liquid.h"
@@ -22,7 +27,10 @@
 #include "item_location.h"
 #include "map.h"
 #include "map_selector.h"
+#include "mapdata.h"
 #include "math_parser_diag_value.h"
+#include "monster.h"
+#include "mtype.h"
 #include "output.h"
 #include "player_activity.h"
 #include "string_formatter.h"
@@ -392,11 +400,57 @@ hand_view view_of( const item_location &loc )
     }
     return h;
 }
+// D2: the stairs at a square the client names (fp3d::stairs_action). As CDDA's ACTION_MOVE_UP/DOWN once the player
+// stands on them, with those actions' riding check; not from inside a vehicle.
+bool use_stairs( avatar &u )
+{
+    const std::optional<stairs_action> a = take_stairs_action();
+    if( !a ) {
+        return false;
+    }
+    const auto refuse = [&u]( const std::string & why ) {
+        u.add_msg_if_player( m_info, "%s", why );
+        return false;
+    };
+    const bool up = a->dir > 0;
+    if( u.is_mounted() && !u.mounted_creature->has_flag( mon_flag_RIDEABLE_MECH ) ) {
+        return refuse( up ? _( "You can't go up stairs while you're riding." ) :
+                       _( "You can't go down stairs while you're riding." ) );
+    }
+    if( u.in_vehicle ) {
+        return refuse( _( "You can't use the stairs from inside a vehicle." ) );
+    }
+    map &here = get_map();
+    const tripoint_bub_ms at = u.pos_bub( here );
+    const tripoint_abs_ms target = to_abs_ms( a->pos );
+    const tripoint_bub_ms s = here.get_bub( target );
+    if( !here.inbounds( s ) || s.z() != at.z() || rl_dist( at, s ) > 1 ) {
+        return refuse( _( "Those stairs are too far away." ) );
+    }
+    if( !here.has_flag( up ? ter_furn_flag::TFLAG_GOES_UP : ter_furn_flag::TFLAG_GOES_DOWN, s ) ) {
+        return refuse( up ? _( "There are no stairs up there." ) : _( "There are no stairs down there." ) );
+    }
+    if( s != at ) {
+        if( get_creature_tracker().creature_at( s ) != nullptr ) {
+            return refuse( _( "Something is in the way." ) );
+        }
+        // CDDA's own step (its costs, fields and prompts); it may stop the player short. It may also shift
+        // the map, so compare absolute squares.
+        avatar_action::move( u, here, s - at );
+        if( u.pos_abs() != target || u.is_dead_state() ) {
+            return true;
+        }
+    }
+    g->vertical_move( a->dir, false );
+    return true;
+}
+
 } // namespace
 
 void register_held_actions( input_context &ctxt )
 {
     ctxt.register_action( hold_action, no_translation( "hold in the off hand" ) );
+    ctxt.register_action( stairs_action_name, no_translation( "use the stairs there" ) );
     ctxt.register_action( stow_action, no_translation( "put away what the off hand holds" ) );
     for( const std::string &d : hand_dir_names() ) {
         ctxt.register_action( use_prefix + d, no_translation( "use what you hold on what you face" ) );
@@ -407,13 +461,16 @@ void register_held_actions( input_context &ctxt )
 bool is_held_action( const std::string &action )
 {
     return action == hold_action || action == stow_action || starts_with( action, use_prefix ) ||
-           is_item_action( action );
+           is_item_action( action ) || action == stairs_action_name;
 }
 
 bool held_action( avatar &u, const std::string &action )
 {
     if( is_item_action( action ) ) {
         return run_item_action( u );
+    }
+    if( action == stairs_action_name ) {
+        return use_stairs( u );
     }
     if( action == hold_action ) {
         return hold( u );

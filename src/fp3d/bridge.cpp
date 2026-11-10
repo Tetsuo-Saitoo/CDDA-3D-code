@@ -12,6 +12,7 @@
 
 #include "calendar.h"
 #include "fp3d/cooking.h"
+#include "map_scale_constants.h"
 
 namespace fp3d
 {
@@ -21,6 +22,7 @@ namespace
 struct queued_action {
     std::string action;
     std::optional<item_action> item;
+    std::optional<stairs_action> stairs;
 };
 
 // A recipe query (L9) waiting for the sim.
@@ -44,6 +46,7 @@ struct channel {
     std::function<void()> before_ask;
     std::deque<queued_action> actions;   // queued main-loop actions (block B5)
     std::optional<item_action> item_now; // the item action last answered as `fp3d_item`, until the sim takes it
+    std::optional<stairs_action> stairs_now; // ... and the stairs action answered as `fp3d_stairs`
     bool save_wanted = false;            // request_save() until the sim takes it
     bool job_wanted = false;             // want_job() until the main loop takes it
     bool save_if_changed = false;
@@ -236,6 +239,7 @@ ui_answer ask( ui_request req )
     const uint64_t id = req.id;
     c.reply.reset();
     c.item_now.reset();   // only the answer to this request may carry one (a client can't send `fp3d_item` itself)
+    c.stairs_now.reset();
     c.pending = std::move( req );
     c.cv.notify_all();
     bool expired = false;
@@ -273,6 +277,7 @@ ui_answer ask( ui_request req )
             queued.id = id;
             queued.action = std::move( c.actions.front().action );
             c.item_now = std::move( c.actions.front().item );
+            c.stairs_now = std::move( c.actions.front().stairs );
             queued.queued = true;
             c.actions.pop_front();
             c.reply = std::move( queued );
@@ -427,7 +432,8 @@ void hostile_spotted()
 bool queue_action( const std::string &action )
 {
     // The bridge's own answers (a save, cheats) only come from the bridge.
-    if( action == save_action || action == job_action || action == item_action_name ) {
+    if( action == save_action || action == job_action || action == item_action_name ||
+        action == stairs_action_name ) {
         return false;
     }
     channel &c = chan();
@@ -435,7 +441,7 @@ bool queue_action( const std::string &action )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ sanitize_text( action, 128 ), std::nullopt } );
+    c.actions.push_back( queued_action{ sanitize_text( action, 128 ), std::nullopt, std::nullopt } );
     c.cv.notify_all();
     return true;
 }
@@ -458,7 +464,7 @@ bool queue_item_action( const item_action &a )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ item_action_name, a } );
+    c.actions.push_back( queued_action{ item_action_name, a, std::nullopt } );
     c.cv.notify_all();
     return true;
 }
@@ -469,6 +475,31 @@ std::optional<item_action> take_item_action()
     std::lock_guard<std::mutex> lk( c.m );
     std::optional<item_action> a = std::move( c.item_now );
     c.item_now.reset();
+    return a;
+}
+
+bool queue_stairs_action( const stairs_action &a )
+{
+    if( ( a.dir != 1 && a.dir != -1 ) || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
+        a.pos.z < -OVERMAP_DEPTH || a.pos.z > OVERMAP_HEIGHT ) {
+        return false;
+    }
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.actions.size() >= max_queued_actions ) {
+        return false;
+    }
+    c.actions.push_back( queued_action{ stairs_action_name, std::nullopt, a } );
+    c.cv.notify_all();
+    return true;
+}
+
+std::optional<stairs_action> take_stairs_action()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    std::optional<stairs_action> a = std::move( c.stairs_now );
+    c.stairs_now.reset();
     return a;
 }
 
