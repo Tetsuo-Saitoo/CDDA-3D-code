@@ -609,6 +609,8 @@ void observe()
             tp_bottle_d_uid = lay( p + tripoint_rel_ms( 0, -1, 0 ), bottle_of_water( false ) );
             tp_open_bag_uid = lay( p + tripoint_rel_ms( 0, -1, 0 ), item( itype_bag_plastic ) );
             tp_ground_rock_uid = lay( p + tripoint_rel_ms( 1, -1, 0 ), item( itype_rock ) );
+            // an earlier scene's walls and fields: the transparency cache must see the new floor before the throw
+            here.build_map_cache( p.z() );
             break;
         }
         default:
@@ -3588,14 +3590,38 @@ static bool run_combat_checks()
                                const seen & )>;
         const auto swing_run = [&]( const scene & sc, const std::string & action, const swing_answerer & reply ) {
             swung s;
-            std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
-            if( q && q->timed ) {
+            // A stray prompt is printed and answered, and the scene built again: the creature may have grabbed
+            // the avatar after the last strike, and struggling free on the pause can tear a pocket off (a popup).
+            const auto settle = []( std::optional<fp3d::ui_request> r ) {
+                for( int k = 0; k < 5 && r && !r->timed; k++ ) {
+                    fp3d::ui_answer a;
+                    a.id = r->id;
+                    if( r->kind == fp3d::request_kind::popup && !r->actions.empty() ) {
+                        a.action = r->actions.front();
+                    } else {
+                        a.cancel = true;
+                    }
+                    print_request( *r, "unexpected, " + ( a.cancel ? std::string( "cancel" ) : a.action ) );
+                    fp3d::answer( a );
+                    r = fp3d::wait_request( 20000, r->id );
+                }
+                return r;
+            };
+            std::optional<fp3d::ui_request> q = settle( fp3d::wait_request( 5000 ) );
+            for( int attempt = 0; attempt < 3; attempt++ ) {
+                if( !q || !q->timed ) {
+                    return s;
+                }
                 {
                     std::lock_guard<std::mutex> lk( st->mx );
                     st->want = sc;
                 }
                 fp3d::queue_action( "pause" );
-                q = fp3d::wait_request( 20000, q->id );
+                const std::optional<fp3d::ui_request> built = fp3d::wait_request( 20000, q->id );
+                q = settle( built );
+                if( built && built->timed ) {
+                    break;
+                }
             }
             if( !q || !q->timed ) {
                 return s;
