@@ -16,6 +16,12 @@
 #include "path_info.h"
 #include "string_formatter.h"
 
+#if defined(_WIN32)
+#include "platform_win.h"
+#else
+#include <dlfcn.h>
+#endif
+
 namespace fp3d
 {
 
@@ -33,6 +39,55 @@ constexpr size_t max_files = 100000;
 
 std::string pending;    // fingerprint to remember once the check has passed
 bool skipped = false;   // this boot skipped the check
+bool option_set = false;    // SKIP_VERIFICATION is "true" because of us, not the player
+
+void restore_option()
+{
+    if( option_set ) {
+        get_options().get_option( "SKIP_VERIFICATION" ).setValue( "false" );
+        option_set = false;
+    }
+}
+
+// Size and modification time of the file this code runs from (the bridge library or a test program), so a rebuilt
+// binary checks the data again: the version string doesn't change between development builds. Not the path: the
+// AppImage is mounted at a new place every run.
+std::optional<std::string> module_identity()
+{
+    static const char anchor = 0;
+    fs::path file;
+#if defined(_WIN32)
+    HMODULE module = nullptr;
+    if( !GetModuleHandleExW( GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                             reinterpret_cast<LPCWSTR>( &anchor ), &module ) ) {
+        return std::nullopt;
+    }
+    std::wstring name( 32768, L'\0' );
+    const DWORD n = GetModuleFileNameW( module, name.data(), static_cast<DWORD>( name.size() ) );
+    if( n == 0 || n >= name.size() ) {
+        return std::nullopt;
+    }
+    name.resize( n );
+    file = fs::path( name );
+#else
+    Dl_info info{};
+    if( dladdr( &anchor, &info ) == 0 || info.dli_fname == nullptr || info.dli_fname[0] == '\0' ) {
+        return std::nullopt;
+    }
+    file = fs::path( info.dli_fname );
+#endif
+    std::error_code ec;
+    const uintmax_t size = fs::file_size( file, ec );
+    if( ec ) {
+        return std::nullopt;
+    }
+    const fs::file_time_type mtime = fs::last_write_time( file, ec );
+    if( ec ) {
+        return std::nullopt;
+    }
+    return string_format( "%llu\t%lld", static_cast<unsigned long long>( size ),
+                          static_cast<long long>( mtime.time_since_epoch().count() ) );
+}
 
 uint64_t splitmix( uint64_t x )
 {
@@ -226,10 +281,16 @@ std::optional<std::string> data_fingerprint( const std::vector<mod_id> &mods_in 
             return std::nullopt;
         }
     }
+    const std::optional<std::string> binary = module_identity();
+    if( !binary ) {
+        return std::nullopt;
+    }
     hash128 h;
     h.add( marker_header );
     h.add( "\n" );
     h.add( getVersionString() );
+    h.add( "\n" );
+    h.add( *binary );
     h.add( "\n" );
     std::vector<std::string> files;
     if( !list_files( PATH_INFO::jsondir().get_unrelative_path(), data_root, files ) ) {
@@ -260,6 +321,7 @@ std::optional<std::string> data_fingerprint( const std::vector<mod_id> &mods_in 
 
 void prepare_data_check( const std::vector<mod_id> &mods )
 {
+    restore_option();   // left over when the last boot failed before finish_data_check
     pending.clear();
     skipped = false;
     if( get_option<bool>( "SKIP_VERIFICATION" ) ) {
@@ -273,6 +335,7 @@ void prepare_data_check( const std::vector<mod_id> &mods )
     const std::vector<std::string> passed = read_marker();
     if( std::find( passed.begin(), passed.end(), *fp ) != passed.end() ) {
         get_options().get_option( "SKIP_VERIFICATION" ).setValue( "true" );   // in memory only
+        option_set = true;
         skipped = true;
         DebugLog( D_INFO, DC_ALL ) << "[fp3d] data check: skipped, this data passed before";
         return;
@@ -282,10 +345,7 @@ void prepare_data_check( const std::vector<mod_id> &mods )
 
 void finish_data_check()
 {
-    if( skipped ) {
-        // Back to the player's setting for anything that loads data later in this game.
-        get_options().get_option( "SKIP_VERIFICATION" ).setValue( "false" );
-    }
+    restore_option();   // back to the player's setting for anything that loads data later in this game
     if( pending.empty() ) {
         return;
     }

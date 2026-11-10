@@ -64,11 +64,13 @@ int main( int argc, char **argv )
         return 2;
     }
     // A fresh cache: entries left from other file times would only be found stale and deleted at the next start.
-    fs::remove_all( base / "data" / "cache", ec );
-    fs::remove_all( base / "cache", ec );
-    if( ec ) {
-        std::fprintf( stderr, "fp3d-json-cache: cannot clear the old cache: %s\n", ec.message().c_str() );
-        return 1;
+    for( const fs::path &old : { base / "data" / "cache", base / "cache" } ) {
+        fs::remove_all( old, ec );
+        if( ec ) {
+            std::fprintf( stderr, "fp3d-json-cache: cannot clear the old cache %s: %s\n",
+                          old.generic_u8string().c_str(), ec.message().c_str() );
+            return 1;
+        }
     }
     // Nothing is written outside <cdda>: the user folder is only named (CDDA's path setup wants one).
     const fs::path user = fs::temp_directory_path( ec ) / "fp3d-json-cache-user";

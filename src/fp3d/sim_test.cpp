@@ -857,6 +857,32 @@ int check_data_check()
     fp3d::finish_data_check();
     check( errors ? !skipped : skipped, errors ? "CDDA reported errors: not remembered" : "passed: skipped the next time" );
     check( !get_option<bool>( "SKIP_VERIFICATION" ), "the option is back afterwards" );
+    if( skipped ) {
+        // A boot that failed between prepare and finish: the next prepare puts the option back first instead of
+        // taking it for the player's own choice.
+        fp3d::prepare_data_check( mods );
+        fp3d::prepare_data_check( mods );
+        const bool again = fp3d::data_check_skipped();
+        fp3d::finish_data_check();
+        check( again && !get_option<bool>( "SKIP_VERIFICATION" ), "failed boot: option back, skip kept" );
+    }
+    const fs::path marker = fs::u8path( fp3d::data_check_marker_path() );
+    fs::path kept = marker;
+    kept += ".sim";
+    const bool had_marker = fs::exists( marker, ec );
+    if( had_marker ) {
+        fs::rename( marker, kept, ec );
+    }
+    get_options().get_option( "SKIP_VERIFICATION" ).setValue( "true" );
+    fp3d::prepare_data_check( mods );
+    const bool left = !fp3d::data_check_skipped() && get_option<bool>( "SKIP_VERIFICATION" );
+    fp3d::finish_data_check();
+    check( left && get_option<bool>( "SKIP_VERIFICATION" ) && !fs::exists( marker, ec ),
+           "player's own skip: left alone, not remembered" );
+    get_options().get_option( "SKIP_VERIFICATION" ).setValue( "false" );
+    if( had_marker ) {
+        fs::rename( kept, marker, ec );
+    }
     return failed;
 }
 
