@@ -410,11 +410,12 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
         if( !w->ammo_types().empty() ) {
             g.rounds = std::clamp( w->ammo_remaining(), 0, 100000 );
         }
-        for( const fault_id &f : w->faults_potential() ) {
+        // Every fault it has, not only the type's potential ones (a save or a mod can add others).
+        for( const fault_id &f : w->faults ) {
             if( g.faults.size() >= max_gun_faults ) {
                 break;
             }
-            if( w->has_fault( f ) && f.str().size() <= max_fault_id_bytes ) {
+            if( !f.str().empty() && f.str().size() <= max_fault_id_bytes ) {
                 g.faults.push_back( f.str() );
             }
         }

@@ -198,6 +198,15 @@ int main()
             check( gun_json.str().find( "\"wielded_gun\":{\"type\":" ) != std::string::npos &&
                    gun_json.str().find( "\"dirt\":1234,\"rounds\":7,\"faults\":[\"" + fault + "\"]" ) !=
                    std::string::npos, "wielded_gun in the JSON" );
+            // A fault the gun type can't get (a save or a mod can add one) is listed too.
+            u.get_wielded_item()->set_fault( fault_id( "fault_engine_starter" ), true, false );
+            const std::shared_ptr<const fp3d::snapshot> odd = timed_capture( gun_ms );
+            const std::optional<fp3d::gun_view> &g2 = odd->player.wielded_gun;
+            const auto lists = [&]( const std::string & f ) {
+                return g2 && std::find( g2->faults.begin(), g2->faults.end(), f ) != g2->faults.end();
+            };
+            check( g2 && g2->faults.size() == 2 && lists( fault ) && lists( "fault_engine_starter" ),
+                   "wielded_gun lists every fault it has", g2 ? std::to_string( g2->faults.size() ) : "none" );
             u.remove_weapon();
         }
         {
