@@ -21,6 +21,8 @@ static const ammo_effect_str_id ammo_effect_LASER( "LASER" );
 static const ammo_effect_str_id ammo_effect_PLASMA( "PLASMA" );
 static const ammo_effect_str_id ammo_effect_SHATTER_SELF( "SHATTER_SELF" );
 
+static const damage_type_id damage_bullet( "bullet" );
+
 namespace fp3d
 {
 namespace
@@ -49,8 +51,22 @@ double body_stop( creature_size size )
 
 bool paths_apply( const projectile &proj, bool is_bullet, bool stream )
 {
-    if( !active() || !is_bullet || stream || proj.count != 1 || proj.get_custom_explosion().power > 0.0f ||
-        !proj.get_drop().is_null() ) {
+    if( !active() || !is_bullet || stream || proj.count != 1 || proj.get_custom_explosion().power > 0.0f ) {
+        return false;
+    }
+    // Bullet damage only: arrows and bolts (stab), lasers (heat), sling shot (bash) keep CDDA's path, whatever the
+    // recovery roll gave this one.
+    bool bullet_damage = false;
+    for( const damage_unit &du : proj.impact ) {
+        if( !( du.amount > 0.0f ) ) {
+            continue;
+        }
+        if( du.type != damage_bullet ) {
+            return false;
+        }
+        bullet_damage = true;
+    }
+    if( !bullet_damage ) {
         return false;
     }
     for( const ammo_effect_str_id &id : proj.proj_effects ) {
