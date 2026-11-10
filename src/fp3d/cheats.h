@@ -34,7 +34,12 @@ const char *cheat_name( cheat c );
 // The cheat with exactly this name; nullopt for anything else.
 std::optional<cheat> cheat_from_name( const std::string &name );
 
-// Client side. Ask for a change at the main loop's next request; false after shutdown.
+// Client side. Cheats and test kits are refused until the client allows them (the test range, or the player's
+// own debug switch); off at start. Turning it off drops requests not applied yet. Cheats already on stay on.
+void set_cheats_allowed( bool on );
+bool cheats_allowed();
+// Client side. Ask for a change at the main loop's next request; false when not allowed or after shutdown. The
+// first cheat turned on (or kit given) turns the game's achievements off, as CDDA's debug menu does.
 bool request_cheat( cheat c, bool on );
 bool request_test_kit();
 

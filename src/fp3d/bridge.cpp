@@ -458,11 +458,12 @@ bool queue_item_action( const item_action &a )
     const auto ref_ok = []( const item_ref & r ) {
         return r.uid >= 1 && r.uid <= max_item_uid && r.type >= 1 && r.type < ( 1u << 24 );
     };
-    const bool op_ok = a.op == item_op::take || a.op == item_op::put || a.op == item_op::drop;
+    const bool op_ok = a.op == item_op::take || a.op == item_op::put || a.op == item_op::drop ||
+                       a.op == item_op::unload || a.op == item_op::reload;
     const bool hand_ok = a.hand == item_hand::pack || a.hand == item_hand::main || a.hand == item_hand::off;
     if( !op_ok || !hand_ok || !ref_ok( a.item ) || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
         !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket ||
-        ( a.op == item_op::put && !ref_ok( a.container ) ) ||
+        ( ( a.op == item_op::put || a.op == item_op::reload ) && !ref_ok( a.container ) ) ||
         ( a.has_spot && ( a.spot_x >= spot_scale || a.spot_y >= spot_scale ) ) ) {
         return false;
     }

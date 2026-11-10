@@ -173,8 +173,13 @@ size_t queued_actions();
 // list (fp3d/item_hands.h): a uid plus the itype index from the same snapshot; the sim finds them again before
 // acting and refuses with a message when one is gone, out of reach or doesn't fit. Item actions go into the action
 // queue above (same order, same rules); the sim runs them as the main-loop action `fp3d_item`.
-enum class item_op : uint8_t { take, put, drop };
-enum class item_hand : uint8_t { pack, main, off };    // take: into the inventory, wielded, the off hand
+// unload: empty a gun or magazine (CDDA's unload): a gun's magazine comes out whole, a magazine's rounds come out.
+// reload: load a carried gun or magazine with the ammo or magazine `container` names (CDDA's reload with that ammo
+// chosen, as much as fits); a gun holding a magazine or a gunmod is loaded where CDDA's reload menu would load it.
+enum class item_op : uint8_t { take, put, drop, unload, reload };
+// take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
+// fit), wielded, the off hand.
+enum class item_hand : uint8_t { pack, main, off };
 struct item_ref {
     uint64_t uid = 0;                    // 1 .. max_item_uid
     uint32_t type = 0;                   // itype index (session table); 0 = invalid
@@ -183,12 +188,13 @@ constexpr uint64_t max_item_uid = ( uint64_t{ 1 } << 53 ) - 1;   // exact in a d
 constexpr uint16_t spot_scale = 1000;    // spots are permille of the square, 0 .. spot_scale - 1
 struct item_action {
     item_op op = item_op::take;
-    item_ref item;                       // the item to take, put or drop
+    item_ref item;                       // the item to take, put, drop, unload or reload
     // take: the square the item lies on. drop: the square to put it on. put: the container's square, used
-    // when the container isn't carried.
+    // when the container isn't carried. unload: the item's square, used when it isn't carried. reload: the ammo's
+    // square, used when the ammo isn't carried.
     ui_point pos;
-    item_hand hand = item_hand::pack;    // take
-    item_ref container;                  // put
+    item_hand hand = item_hand::pack;    // take, unload
+    item_ref container;                  // put: the container. reload: the ammo or magazine to load (required)
     int pocket = -1;                     // put: index into the container's pockets; -1 = CDDA's best pocket
     bool has_spot = false;               // drop: keep where on the square it was placed
     uint16_t spot_x = 0;                 // permille of the square, east
