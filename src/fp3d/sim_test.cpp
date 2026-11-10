@@ -964,7 +964,8 @@ bool realtime_checks( fp3d::ui_request &req )
 
     spawn_zombie = true; // placed by the sim right before its next request
     t = std::chrono::steady_clock::now();
-    while( !fp3d::get_clock().paused && ms_since( t ) < 3000 ) {
+    // Up to 10 s: on a loaded machine the game thread may be busy for seconds (an overmap loading, say).
+    while( !fp3d::get_clock().paused && ms_since( t ) < 10000 ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, req.id ) ) {
             req = *next;
         }
@@ -992,7 +993,7 @@ bool realtime_checks( fp3d::ui_request &req )
     ok = ok && while_paused <= 1;
 
     fp3d::set_paused( false );
-    const std::optional<fp3d::ui_request> resumed = fp3d::wait_request( 3000, req.id );
+    const std::optional<fp3d::ui_request> resumed = fp3d::wait_request( 10000, req.id );
     std::printf( "    resumed: %s\n", resumed && resumed->turn > turn_at_pause ? "turns advance" : "STUCK" );
     return ok && resumed && resumed->turn > turn_at_pause;
 }
@@ -1004,7 +1005,7 @@ bool run_realtime( fp3d::ui_request &req )
     const bool ok = realtime_checks( req );
     fp3d::set_clock_mode( fp3d::clock_mode::turn_based );
     fp3d::set_paused( false );
-    const std::optional<fp3d::ui_request> pending = fp3d::wait_request( 3000 );
+    const std::optional<fp3d::ui_request> pending = fp3d::wait_request( 10000 );
     if( !pending ) {
         return false;
     }
@@ -3449,19 +3450,36 @@ static bool run_safemode_checks()
     spawn_zombie = true;
     const int64_t turn0 = r->turn;
     const std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
-    // 2 s at 4x is 8 turns; a loaded machine (an overmap loading meanwhile) gets up to 10 s for 3 of them.
-    while( ms_since( t ) < 2000 || ( r->turn < turn0 + 3 && ms_since( t ) < 10000 ) ) {
+    // 2 s at 4x is 8 turns; a loaded machine gets up to 30 s for 3 of them (an overmap loading meanwhile took over
+    // 10 s with parallel builds running). A prompt (a request that doesn't expire) would stop the clock: noted,
+    // cancelled so the game goes on.
+    std::string prompts;
+    while( ms_since( t ) < 2000 || ( r->turn < turn0 + 3 && ms_since( t ) < 30000 ) ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, r->id ) ) {
             r = next;
+            if( !next->timed ) {
+                prompts += std::string( " [" ) + fp3d::kind_name( next->kind ) + " " + next->context + ": " +
+                           next->title.substr( 0, 60 ) + " | " + next->text.substr( 0, 120 ) + "]";
+                fp3d::ui_answer a;
+                a.id = next->id;
+                a.cancel = true;
+                fp3d::answer( a );
+            }
         }
     }
     const fp3d::clock_state c = fp3d::get_clock();
     const observed o = snapshot();
+    // What the game thread is on now: a pending request, or none (busy elsewhere).
+    const std::optional<fp3d::ui_request> now = fp3d::wait_request( 0 );
+    const std::string state = now ? std::string( ", now " ) + fp3d::kind_name( now->kind ) +
+                              ( now->timed ? " timed" : " untimed" ) + " turn " + std::to_string( now->turn ) :
+                              ", no request pending";
     check( o.zombies_placed > placed_before && o.visible > 0, "a new zombie in view", "seen " +
            std::to_string( o.visible ) );
-    check( !c.paused && r->turn >= turn0 + 3 && !c.auto_pause_hostiles, "auto-pause off: real time runs on",
-           "turns +" + std::to_string( r->turn - turn0 ) + " in " + std::to_string( static_cast<int64_t>( ms_since( t ) ) ) + " ms" +
-           ( c.paused ? ", paused: " + c.pause_reason : "" ) );
+    check( !c.paused && r->turn >= turn0 + 3 && !c.auto_pause_hostiles && prompts.empty(),
+           "auto-pause off: real time runs on", "turns +" + std::to_string( r->turn - turn0 ) + " in " +
+           std::to_string( static_cast<int64_t>( ms_since( t ) ) ) + " ms" + ( c.paused ? ", paused: " +
+                   c.pause_reason : "" ) + state + prompts );
     fp3d::set_auto_pause_hostiles( true );
     fp3d::set_clock_mode( fp3d::clock_mode::turn_based );
     fp3d::set_paused( false );
