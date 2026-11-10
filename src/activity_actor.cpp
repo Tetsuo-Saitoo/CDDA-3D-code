@@ -48,6 +48,7 @@
 #include "field_type.h"
 #include "flag.h"
 #include "flexbuffer_json.h"
+#include "fp3d/gun_faults.h" // FP3D:
 #include "fp3d/shot.h" // FP3D:
 #include "game.h"
 #include "game_constants.h"
@@ -357,6 +358,11 @@ bool aim_activity_actor::check_gun_ability_to_shoot( Character &who, item &it )
 
     if( it.has_fault_flag( "RUINED_GUN" ) ) {
         who.add_msg_if_player( m_bad, _( "Your %s is little more than an awkward club now." ), it.tname() );
+        return false;
+    }
+
+    // FP3D: the avatar clears a jam itself (fp3d::clear_jam), no random quick fix
+    if( fp3d::refuse_jammed_aim( who, it ) ) {
         return false;
     }
 

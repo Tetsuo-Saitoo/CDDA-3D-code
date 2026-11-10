@@ -11,6 +11,7 @@
 
 #include "action.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/gun_faults.h" // FP3D:
 #include "fp3d/hands.h" // FP3D:
 #include "fp3d/held.h" // FP3D:
 #include "activity_actor_definitions.h"
@@ -2659,6 +2660,10 @@ bool game::do_regular_action( action_id &act, avatar &player_character,
             break;
 
         case ACTION_RELOAD_WEAPON:
+            // FP3D: on a jammed wielded gun, reload clears the jam instead (fp3d::rack_jammed)
+            if( fp3d::rack_jammed( player_character ) ) {
+                break;
+            }
             reload_weapon();
             break;
 

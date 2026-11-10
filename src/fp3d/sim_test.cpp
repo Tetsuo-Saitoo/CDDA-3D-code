@@ -39,6 +39,7 @@
 #include "fp3d/cheats.h"
 #include "fp3d/cooking.h"
 #include "fp3d/game_access.h"
+#include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
 #include "fp3d/item_hands.h"
 #include "fp3d/points.h"
@@ -1916,6 +1917,8 @@ static bool run_combat_checks()
         bool steady = true;         // recoil 0; else at its max (no aim yet)
         std::string gun = "glock_19";
         std::string mode;           // gun mode, "" = its default
+        std::string fault;          // a fault set on the gun ("" = none)
+        std::string ammo;           // the gun's ammo, "" = 9mm
         int moves = 0;              // moves left for the turn that fires (0 = a full turn)
         bool armed = true;          // wield a loaded `gun`; else empty hands (throwing wields the rock)
         bool rock = false;          // carry a rock to throw
@@ -1934,6 +1937,7 @@ static bool run_combat_checks()
         bool has_plan = false;
         int64_t turn = 0;
         std::vector<std::string> messages;   // since the scene was set
+        bool jammed = false;        // the wielded gun has a jam fault
     };
     struct state {
         std::mutex mx;
@@ -1978,9 +1982,12 @@ static bool run_combat_checks()
             u.recoil = sc->steady ? 0.0 : MAX_RECOIL;
             if( sc->armed ) {
                 item gun( itype_id( sc->gun ) );
-                gun.ammo_set( itype_9mm, sc->rounds );
+                gun.ammo_set( sc->ammo.empty() ? itype_9mm : itype_id( sc->ammo ), sc->rounds );
                 if( !sc->mode.empty() ) {
                     gun.gun_set_mode( gun_mode_id( sc->mode ) );
+                }
+                if( !sc->fault.empty() ) {
+                    gun.set_fault( fault_id( sc->fault ), true, false );
                 }
                 u.set_wielded_item( gun );
             } else {
@@ -2025,6 +2032,7 @@ static bool run_combat_checks()
         seen o;
         if( const item_location w = u.get_wielded_item() ) {
             o.ammo = w->ammo_remaining();
+            o.jammed = !fp3d::jam_of( *w ).is_null();
         }
         o.uid = st->uids[0];
         o.side_uid = st->uids[1];
@@ -2795,6 +2803,80 @@ static bool run_combat_checks()
                "main-loop reload_weapon: ammo asked, rounds go up", "ammo " + std::to_string( before.ammo ) + " -> " +
                std::to_string( after.ammo ) + ", " + std::to_string( asked ) + " requests, " +
                std::to_string( selects ) + " item_select" + ( back ? "" : ", stuck" ) );
+    }
+    // Jams (block 3). A jammed gun isn't aimed: a message, no random quick fix at aim start, nothing fired.
+    const auto said = []( const seen & s, const char *text ) {
+        for( const std::string &m : s.messages ) {
+            if( m.find( text ) != std::string::npos ) {
+                return true;
+            }
+        }
+        return false;
+    };
+    {
+        scene jammed = point_blank;
+        jammed.fault = "fault_stovepipe";
+        const result r = run( jammed, "fire", answer_with::fire, head, true, head );
+        check( r.back && !r.target && r.before.jammed && r.after.jammed && r.after.ammo == r.before.ammo &&
+               r.after.hp == r.before.hp && said( r.after, "jammed" ), "jammed gun: aim refused, no quick fix",
+               counts( r ) + ( r.after.jammed ? ", still jammed" : ", cleared" ) );
+    }
+    // A burst stops at a jam from an earlier round: black-powder .300 BLK (recoil 1520) doesn't cycle a SIG MCX
+    // Rattler (1700 needed), so CDDA leaves the first round's case in the chamber on full auto; its loop fired on
+    // regardless, the avatar's now stops there.
+    {
+        scene burst = point_blank;
+        burst.gun = "sig_mcx_rattler_sbr";
+        burst.ammo = "bp_300blk";
+        burst.mode = "AUTO";
+        const result r = run( burst, "fire", answer_with::fire, head, true, std::nullopt );
+        check( fired( r, 1 ) && r.shots.size() == 1 && r.after.jammed && said( r.after, "fails to cycle" ) &&
+               said( r.after, "jammed" ), "burst stops at a jam", counts( r ) + ", " +
+               std::to_string( r.shots.size() ) + " shot requests" + ( r.after.jammed ? ", jammed" : "" ) );
+    }
+    // Reload (R) on a jammed gun clears it instead: CDDA's mend with the fault's fix and its time (10 s), no reload
+    // (3 rounds stay, a spare magazine carried), the jam gone. No zombie, so nothing interrupts it.
+    {
+        scene clear = point_blank;
+        clear.zx = 0;
+        clear.rounds = 3;
+        clear.spare_mag = true;
+        clear.fault = "fault_stovepipe";
+        seen before;
+        seen after;
+        bool back = false;
+        int asked = 0;
+        std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
+        if( q && q->timed ) {
+            {
+                std::lock_guard<std::mutex> lk( st->mx );
+                st->want = clear;
+            }
+            fp3d::queue_action( "pause" );
+            q = fp3d::wait_request( 20000, q->id );
+        }
+        if( q && q->timed ) {
+            before = seen_now();
+            fp3d::queue_action( "reload_weapon" );
+            std::optional<fp3d::ui_request> c = fp3d::wait_request( 30000, q->id );
+            while( c && !c->timed && asked++ < 10 ) {
+                fp3d::ui_answer a;
+                a.id = c->id;
+                a.cancel = true;
+                print_request( *c, "unexpected, cancel" );
+                fp3d::answer( a );
+                const uint64_t id = c->id;
+                c = fp3d::wait_request( 20000, id );
+            }
+            back = c && c->timed;
+            after = seen_now();
+        }
+        const int64_t took = after.turn - before.turn;
+        check( back && asked == 0 && before.jammed && !after.jammed && before.ammo == 3 && after.ammo == 3 &&
+               took >= 9 && took <= 15 && said( after, "You eject the spent casing" ),
+               "reload on a jammed gun: CDDA's mend, no reload", std::to_string( took ) + " turns, ammo " +
+               std::to_string( before.ammo ) + " -> " + std::to_string( after.ammo ) +
+               ( after.jammed ? ", jammed" : ", cleared" ) + ( back ? "" : ", stuck" ) );
     }
     return failed == 0;
 }
