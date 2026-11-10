@@ -1,6 +1,7 @@
 #include "fp3d/item_hands.h"
 
 #include <charconv>
+#include <cmath>
 #include <mutex>
 #include <optional>
 #include <random>
@@ -12,6 +13,7 @@
 #include "calendar.h"
 #include "contents_change_handler.h"
 #include "coordinates.h"
+#include "creature_tracker.h"
 #include "enums.h"
 #include "flag.h"
 #include "fp3d/bridge.h"
@@ -24,12 +26,18 @@
 #include "item_location.h"
 #include "item_pocket.h"
 #include "itype.h"
+#include "line.h"
 #include "map.h"
 #include "map_selector.h"
+#include "mapdata.h"
 #include "math_parser_diag_value.h"
+#include "monster.h"
+#include "mtype.h"
+#include "npc.h"
 #include "output.h"
 #include "pickup.h"
 #include "pocket_type.h"
+#include "projectile.h"
 #include "ret_val.h"
 #include "type_id.h"
 #include "string_formatter.h"
@@ -40,6 +48,7 @@
 static const ammotype ammo_plutonium( "plutonium" );
 
 static const efftype_id effect_incorporeal( "incorporeal" );
+static const json_character_flag json_flag_CANNOT_ATTACK( "CANNOT_ATTACK" );
 static const trait_id trait_SHELL2( "SHELL2" );
 static const trait_id trait_SHELL3( "SHELL3" );
 
@@ -916,6 +925,378 @@ bool reload( avatar &u, const item_action &a )
     u.assign_activity( reload_activity_actor( std::move( opt ), extra_moves ) );
     return true;
 }
+
+// CDDA's throw (avatar_action::plthrow) at a given square, with no target menu. CDDA's checks: what can be wielded,
+// throw_range (too heavy at 0), a wielded part of the body, a mech's batteries, relax gas. Worn items aren't thrown
+// (take them off first); nor is what sits in a sealed pocket or inside a gun or magazine. Blind throws (CDDA's throw
+// from a peeking position) aren't offered: the target is a square the avatar sees, on its own level, in the bubble,
+// not its own square, within throw_range by the target menu's distance. A non-hostile NPC there is never thrown at
+// (CDDA asks first).
+// The item flies from the hand holding it. Anything else carried is thrown from the main hand when it is empty, else
+// from a free off hand, for the moves CDDA's wield charges to get it out (item_handling_cost); it is never wielded,
+// so what the main hand holds stays there (CDDA puts it away first, asking where when it doesn't fit). One unit of a
+// stack counted by charges flies, as CDDA throws one; the rest stays where it was, and the unit thrown gets a handle
+// of its own. Character::throw_item does the rest: its moves, stamina, dispersion and practice.
+bool throw_at( avatar &u, const item_action &a )
+{
+    map &here = get_map();
+    item_location src = find_carried( u, a.item );
+    if( !src ) {
+        return refuse( u, _( "You don't have that any more." ) );
+    }
+    if( u.has_flag( json_flag_CANNOT_ATTACK ) ) {
+        return refuse( u, _( "You are incapable of throwing anything!" ) );
+    }
+    bool in_mech = false;
+    if( u.is_mounted() ) {
+        const monster *mount = u.mounted_creature.get();
+        if( mount != nullptr && mount->has_flag( mon_flag_RIDEABLE_MECH ) ) {
+            if( !mount->check_mech_powered() ) {
+                return refuse( u, string_format( _( "Your %s refuses to move as its batteries have been drained." ),
+                                                 mount->get_name() ) );
+            }
+            in_mech = true;
+        }
+    }
+    item &it = *src;
+    const std::string name = it.tname();
+    if( u.is_worn( it ) ) {
+        return refuse( u, string_format( _( "Take off your %s first." ), name ) );
+    }
+    std::string why = pocket_block( src );
+    if( !why.empty() ) {
+        return refuse( u, why );
+    }
+    if( src.has_parent() && !src.parent_pocket()->is_type( pocket_type::CONTAINER ) ) {
+        //~ %1$s: an item, %2$s: the gun, magazine or tool it is part of
+        return refuse( u, string_format( _( "Take the %1$s out of the %2$s first." ), name,
+                                         src.parent_item()->tname() ) );
+    }
+    // CDDA asks before using someone else's things; with no menu, they aren't thrown.
+    if( !it.is_owned_by( u, true ) ) {
+        return refuse( u, string_format( _( "The %s isn't yours." ), name ) );
+    }
+    if( !in_mech ) {
+        const ret_val<void> can = u.can_wield( it );
+        if( !can.success() ) {
+            return refuse( u, can.str() );
+        }
+    }
+    const int range = u.throw_range( it );
+    if( range < 0 ) {
+        return refuse( u, _( "You don't have that item." ) );
+    }
+    if( range == 0 ) {
+        return refuse( u, _( "That is too heavy to throw." ) );
+    }
+    const item_location weapon = u.get_wielded_item();
+    const bool wielded = weapon && weapon.get_item() == src.get_item();
+    if( wielded && it.has_flag( flag_NO_UNWIELD ) ) {
+        return refuse( u, _( "That's part of your body, you can't throw that!" ) );
+    }
+    const item_location off = offhand_item( u );
+    const bool from_pack = !in_mech && !wielded && !( off && off.get_item() == src.get_item() );
+    if( from_pack && weapon ) {
+        why = offhand_unavailable( u );
+        if( why.empty() && off ) {
+            //~ %1$s: wielded item, %2$s: item held in the off hand
+            why = string_format( _( "Your hands are full: you're holding your %1$s and your %2$s." ), weapon->tname(),
+                                 off->tname() );
+        }
+        if( why.empty() && it.is_two_handed( u ) ) {
+            why = string_format( _( "Your %s is too heavy to hold in one hand." ), name );
+        }
+        if( !why.empty() ) {
+            return refuse( u, why );
+        }
+    }
+    const std::optional<tripoint_bub_ms> target = bubble_square( here, a.pos );
+    if( !target ) {
+        return refuse( u, _( "That's too far away." ) );
+    }
+    const tripoint_bub_ms from = u.pos_bub();
+    if( target->z() != from.z() ) {
+        return refuse( u, _( "You can only throw at something on your own level." ) );
+    }
+    if( *target == from ) {
+        return refuse( u, _( "Pick a square to throw at." ) );
+    }
+    // target_ui::dist_fn, as CDDA's throw menu measures its range.
+    const int dist = static_cast<int>( std::round( rl_dist_exact( from, *target ) ) );
+    if( dist > range ) {
+        return refuse( u, string_format( _( "You can't throw your %s that far." ), name ) );
+    }
+    if( !u.sees( here, *target ) ) {
+        return refuse( u, _( "You can't see where you're throwing." ) );
+    }
+    if( const npc *who = get_creature_tracker().creature_at<npc>( *target ); who != nullptr &&
+        !who->guaranteed_hostile() && u.sees( here, *who ) ) {
+        return refuse( u, string_format( _( "You don't want to hit %s." ), who->get_name() ) );
+    }
+    // CDDA's roll: a failure costs what CDDA says, with its message.
+    if( !u.try_break_relax_gas( _( "You concentrate mightily, and your body obeys!" ),
+                                _( "You can't muster up the effort to throw anything…" ) ) ) {
+        return false;
+    }
+    const int handling = from_pack ? u.item_handling_cost( it, true, INVENTORY_HANDLING_PENALTY ) : 0;
+    item thrown = it;
+    clear_offhand_mark( thrown );
+    thrown.erase_var( spot_var );
+    if( it.count_by_charges() && it.charges > 1 ) {
+        thrown.charges = 1;
+        thrown.erase_var( uid_var );
+        it.mod_charges( -1 );
+        src.on_contents_changed();
+    } else if( wielded ) {
+        u.remove_weapon();
+    } else {
+        contents_change_handler handler;
+        handler.unseal_pocket_containing( src );
+        src.remove_item();
+        handler.handle_by( u );
+    }
+    u.mod_moves( -handling );
+    u.throw_item( *target, thrown );
+    after_inventory_change( u );
+    return true;
+}
+
+// The container `r` names for a pour: carried (not in a sealed or forbidden pocket), else lying on the avatar's
+// square or one next to it where `take` could get at it (not ridden past, in sight, not someone else's). A pour
+// gives no square for it: all nine are searched, and a handle found twice names nothing.
+item_location find_near( avatar &u, const item_ref &r, std::string &why )
+{
+    item_location loc = find_carried( u, r );
+    if( loc ) {
+        why = pocket_block( loc );
+        return why.empty() ? loc : item_location();
+    }
+    if( u.is_mounted() ) {
+        why = _( "You can't reach that while you're riding." );
+        return item_location();
+    }
+    map &here = get_map();
+    const tripoint_bub_ms at = u.pos_bub();
+    item_location found;
+    for( const tripoint_bub_ms &p : here.points_in_radius( at, 1 ) ) {
+        if( !here.inbounds( p ) || !here.accessible_items( p ) || !here.could_see_items( p, at ) ) {
+            continue;
+        }
+        for( item &it : here.i_at( p ) ) {
+            if( !matches( it, r ) ) {
+                continue;
+            }
+            if( found ) {
+                why = _( "That isn't within reach." );
+                return item_location();
+            }
+            found = item_location( map_cursor( p ), &it );
+        }
+    }
+    if( !found ) {
+        why = _( "That isn't within reach." );
+        return item_location();
+    }
+    if( !found->is_owned_by( u, true ) ) {
+        why = string_format( _( "The %s isn't yours." ), found->tname() );
+        return item_location();
+    }
+    return found;
+}
+
+// Character::pour_into for one given pocket of `dst` (CDDA's fill picks the best pocket itself): the pocket's rules
+// (watertight, ammo and flag restrictions, room, what a carried bucket holds) and the room its parents leave.
+// The charges of `liquid` moved; 0 with `why` set when none can go. What goes in gets a handle of its own.
+int pour_into_pocket( avatar &u, item_location dst, item_pocket &pk, const item &liquid, std::string &why )
+{
+    item unit = liquid;
+    unit.charges = 1;
+    const ret_val<item_pocket::contain_code> can = pk.can_contain( unit );
+    if( !can.success() ) {
+        //~ %1$s: liquid, %2$s: container, %3$s: reason it failed
+        why = string_format( _( "Could not pour %1$s into %2$s, %3$s." ), liquid.tname(), dst->tname(), can.str() );
+        return 0;
+    }
+    const item_location weapon = u.get_wielded_item();
+    const bool held_or_ground = ( weapon && weapon.get_item() == dst.get_item() ) || !u.has_item( *dst );
+    if( !pk.can_contain_liquid( held_or_ground ) ) {
+        why = string_format( _( "That %s must be on the ground or held to hold contents!" ), dst->tname() );
+        return 0;
+    }
+    int amount = std::min( liquid.charges, pk.remaining_capacity_for_item( liquid ) );
+    if( !dst->all_pockets_rigid() ) {
+        amount = std::min( amount, dst.max_charges_by_parent_recursive( liquid ).value() );
+    }
+    if( amount <= 0 ) {
+        why = string_format( _( "Your %1$s can't hold any more %2$s." ), dst->tname(), liquid.tname() );
+        return 0;
+    }
+    item part = liquid;
+    part.charges = amount;
+    part.erase_var( uid_var );
+    const ret_val<item *> in = pk.insert_item( part );
+    if( !in.success() ) {
+        why = string_format( _( "Could not pour %1$s into %2$s, %3$s." ), liquid.tname(), dst->tname(), in.str() );
+        return 0;
+    }
+    dst.on_contents_changed();
+    return amount;
+}
+
+// Character::pour_into (CDDA's best pocket): the charges of `liquid` moved. 0 when none can go, with `why` set,
+// or empty when CDDA said why itself. What goes in gets a handle of its own (the source keeps its).
+int pour_into_best( avatar &u, item_location dst, const item &liquid, std::string &why )
+{
+    item rest = liquid;
+    rest.erase_var( uid_var );
+    if( !u.pour_into( dst, rest, /*ignore_settings=*/true, /*silent=*/true ) ) {
+        return 0;
+    }
+    const int moved = liquid.charges - rest.charges;
+    if( moved > 0 ) {
+        return moved;
+    }
+    // CDDA's fill passes over sealed pockets without a word.
+    bool sealed = false;
+    for( const item_pocket *pk : dst->get_all_contained_pockets() ) {
+        sealed = sealed || pk->sealed();
+    }
+    why = sealed ? string_format( _( "The %s is sealed.  Open it first." ), dst->tname() ) :
+          string_format( _( "Your %1$s can't hold any more %2$s." ), dst->tname(), liquid.tname() );
+    return 0;
+}
+
+// The liquid out of the carried container `a.item` (or, when `a.item` is a liquid, that liquid out of its container),
+// with CDDA's liquid rules and no menu, onto the square `a.pos` or into the container `a.container` (one or the other,
+// bridge.h). Only liquids pour: frozen ones and solids stay, and a container holding none is refused, as is one sealed
+// or in a sealed pocket, or a liquid in a gun, magazine or tool.
+// Onto the ground (CDDA's "pour on the ground"): the avatar's square or one next to it that takes items; all of it,
+// map::add_item_or_charges spilling onto the next squares when that one is full; into deep water it's gone.
+// Into a container (carried or in reach, never the source or something inside it): CDDA's Character::pour_into (its
+// best pocket) or the given pocket; as much as fits moves and the rest stays in the source container ("There's some
+// left over!", where CDDA's liquid menu would ask again).
+// 100 moves for each liquid moved, as CDDA's liquid handling.
+bool pour( avatar &u, const item_action &a )
+{
+    map &here = get_map();
+    item_location src = find_carried( u, a.item );
+    if( !src ) {
+        return refuse( u, _( "You don't have that any more." ) );
+    }
+    item_location cont = src;
+    std::vector<item_location> liquids;
+    if( src->made_of( phase_id::LIQUID ) ) {
+        if( !src.has_parent() || !src.parent_pocket()->is_type( pocket_type::CONTAINER ) ) {
+            return refuse( u, string_format( _( "You can't pour out your %s by hand." ), src->tname() ) );
+        }
+        cont = src.parent_item();
+        liquids.push_back( src );
+    } else {
+        bool frozen = false;
+        bool solid = false;
+        for( item *c : src->all_items_top( pocket_type::CONTAINER ) ) {
+            if( c->made_of( phase_id::LIQUID ) ) {
+                liquids.emplace_back( src, c );
+            } else if( c->is_frozen_liquid() ) {
+                frozen = true;
+            } else {
+                solid = true;
+            }
+        }
+        if( liquids.empty() ) {
+            const std::string nm = src->type->nname( 1 );
+            return refuse( u, string_format( frozen ? _( "What's in your %s is frozen solid." ) : solid ?
+                                             _( "There's no liquid in your %s to pour." ) : _( "Your %s is empty." ), nm ) );
+        }
+    }
+    for( const item_location &l : liquids ) {
+        const std::string why = pocket_block( l );
+        if( !why.empty() ) {
+            return refuse( u, why );
+        }
+    }
+    const std::string cont_name = cont->type->nname( 1 );
+    const std::string liquid_name = liquids.front()->tname();
+    int moved_stacks = 0;
+    bool left_over = false;
+    if( a.container.uid != 0 ) {
+        std::string why;
+        item_location dst = find_near( u, a.container, why );
+        if( !dst ) {
+            return refuse( u, why );
+        }
+        if( dst.get_item() == cont.get_item() || cont.eventually_contains( dst ) ) {
+            return refuse( u, string_format( _( "You can't pour your %s into itself." ), cont_name ) );
+        }
+        item_pocket *pocket = nullptr;
+        if( a.pocket >= 0 ) {
+            std::vector<item_pocket *> pockets = dst->get_all_contained_pockets();
+            if( static_cast<size_t>( a.pocket ) >= pockets.size() || pockets[a.pocket]->is_forbidden() ) {
+                return refuse( u, string_format( _( "The %s has no such pocket." ), dst->tname() ) );
+            }
+            pocket = pockets[a.pocket];
+            if( pocket->sealed() ) {
+                return refuse( u, string_format( _( "The %s is sealed.  Open it first." ), dst->tname() ) );
+            }
+        }
+        const std::string dst_name = dst->type->nname( 1 );
+        for( item_location &l : liquids ) {
+            const int moved = pocket != nullptr ? pour_into_pocket( u, dst, *pocket, *l, why ) :
+                              pour_into_best( u, dst, *l, why );
+            if( moved <= 0 ) {
+                if( moved_stacks == 0 ) {
+                    if( !why.empty() ) {
+                        refuse( u, why );
+                    }
+                    return false;
+                }
+                left_over = true;
+                break;
+            }
+            moved_stacks++;
+            l->charges -= moved;
+            if( l->charges <= 0 ) {
+                l.remove_item();
+            } else {
+                l.on_contents_changed();
+                left_over = true;
+            }
+        }
+        dst.make_active();
+        u.add_msg_if_player( _( "You pour %1$s into the %2$s." ), liquid_name, dst_name );
+    } else {
+        const std::optional<tripoint_bub_ms> p = bubble_square( here, a.pos );
+        if( !p || !within_reach( u, *p ) ) {
+            return refuse( u, _( "You can't reach that from here." ) );
+        }
+        if( !here.can_put_items_ter_furn( *p ) ) {
+            return refuse( u, _( "You can't pour there!" ) );
+        }
+        const bool into_water = here.has_flag( ter_furn_flag::TFLAG_SWIMMABLE, *p );
+        for( item_location &l : liquids ) {
+            item spilt = *l;
+            spilt.erase_var( spot_var );
+            // map::add_item_or_charges never keeps a liquid on a square of liquid: it is gone, as CDDA pours it.
+            if( !into_water && here.add_item_or_charges( *p, spilt ).is_null() ) {
+                if( moved_stacks == 0 ) {
+                    return refuse( u, string_format( _( "There's no room to pour your %s there." ), cont_name ) );
+                }
+                left_over = true;
+                break;
+            }
+            moved_stacks++;
+            l.remove_item();
+        }
+        //~ %1$s: liquid, %2$s: its container
+        u.add_msg_if_player( _( "You pour the %1$s out of your %2$s." ), liquid_name, cont_name );
+    }
+    if( left_over ) {
+        u.add_msg_if_player( _( "There's some left over!" ) );
+    }
+    u.mod_moves( -100 * moved_stacks );
+    after_inventory_change( u );
+    return true;
+}
 } // namespace
 
 uint64_t read_item_handle( const item &it )
@@ -963,7 +1344,7 @@ bool item_spot( const item &it, uint16_t &x, uint16_t &y )
 
 void register_item_actions( input_context &ctxt )
 {
-    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload or reload one item" ) );
+    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw or pour one item" ) );
 }
 
 bool is_item_action( const std::string &action )
@@ -997,6 +1378,10 @@ bool run_item_action( avatar &u )
             return reload( u, *a );
         case item_op::clear:
             return clear( u, *a );
+        case item_op::throw_:
+            return throw_at( u, *a );
+        case item_op::pour:
+            return pour( u, *a );
     }
     return false;
 }

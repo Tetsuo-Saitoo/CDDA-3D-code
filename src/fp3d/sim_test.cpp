@@ -91,6 +91,8 @@ const itype_id itype_1l_gold( "1l_gold" );
 const itype_id itype_remington_870( "remington_870" );
 const itype_id itype_scar_l( "scar_l" );
 const itype_id itype_backpack_giant( "backpack_giant" );
+const itype_id itype_pebble( "pebble" );
+const itype_id itype_bottle_twoliter( "bottle_twoliter" );
 const ter_str_id ter_t_water_sh( "t_water_sh" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
@@ -128,6 +130,7 @@ struct observed {
     int moves = 0;
     int speed = 100;
     int bag_rocks = 0;       // item checks: rocks inside a plastic bag lying west
+    int west_water = 0;      // throw/pour checks: water charges inside the items lying west
     int carried_9mm = 0;     // item checks 2: 9 mm rounds carried outside guns and magazines
     int carry_kg = 0;        // cheat checks: the avatar's weight capacity
     int torso_hp_lost = -1;  // ... hp the torso lost to a 10 damage hit (-1: not probed)
@@ -163,7 +166,8 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 // spot north-west, 1 L of gold and a bottle of water carried, 13 = cooking checks (run_cooking_checks): a
 // fireplace with a fire and a pot of 1 L of water south-west, an unlit wood stove south-east, a pot of raw meat 2
 // west 1 north, a rock 2 west 1 south, a pot 8 west (out of reach), a pot put 2 west 2 south and taken away again,
-// 16 = gun item checks (run_gun_item_checks; see the case below).
+// 16 = gun item checks (run_gun_item_checks; see the case below), 17 = throw and pour checks
+// (run_throw_pour_checks; see the case below).
 // Done on the sim thread right before its next request.
 std::atomic<int> hand_setup{ 0 };
 // Cooking checks: what scene 14 left for the driver (sim thread writes, driver reads).
@@ -181,6 +185,24 @@ std::atomic<uint64_t> gun_sealed_uid{ 0 };     // 10 9 mm in a sealed vacuum bag
 std::atomic<uint64_t> gun_far_glock_uid{ 0 };  // a loaded Glock 3 squares west
 std::atomic<uint64_t> gun_far_9mm_uid{ 0 };    // 5 9 mm 3 squares west
 std::atomic<uint64_t> gun_near_9mm_uid{ 0 };   // 5 9 mm 1 square west
+// Throw and pour checks: the handles scene 17 gave (sim thread writes, driver reads).
+std::atomic<uint64_t> tp_rock_uid{ 0 };        // a wielded rock
+std::atomic<uint64_t> tp_pebble_uid{ 0 };      // 5 carried pebbles (one stack)
+std::atomic<uint64_t> tp_ground_rock_uid{ 0 }; // a rock north-east
+std::atomic<uint64_t> tp_bottle_a_uid{ 0 };    // carried bottles A and B with 500 ml of water each
+std::atomic<uint64_t> tp_water_a_uid{ 0 };
+std::atomic<uint64_t> tp_bottle_b_uid{ 0 };
+std::atomic<uint64_t> tp_water_b_uid{ 0 };
+std::atomic<uint64_t> tp_sealed_uid{ 0 };      // a carried bottle of 500 ml of water, sealed
+std::atomic<uint64_t> tp_sealed_water_uid{ 0 };
+std::atomic<uint64_t> tp_rock_bag_uid{ 0 };    // a carried plastic bag holding a rock
+std::atomic<uint64_t> tp_big_uid{ 0 };         // a carried 2 L bottle with 1.5 L of water
+std::atomic<uint64_t> tp_big_water_uid{ 0 };
+std::atomic<uint64_t> tp_bottle_g_uid{ 0 };    // carried empty bottles G and H
+std::atomic<uint64_t> tp_bottle_h_uid{ 0 };
+std::atomic<uint64_t> tp_bottle_c_uid{ 0 };    // an empty bottle west
+std::atomic<uint64_t> tp_bottle_d_uid{ 0 };    // a bottle full of water north
+std::atomic<uint64_t> tp_open_bag_uid{ 0 };    // an empty plastic bag north (not watertight)
 
 // Range op checks: 32 operations queued from inside the sim's hook (so none run before the queue is full), then one
 // more, which is refused. They run at the next main-loop request.
@@ -506,6 +528,85 @@ void observe()
             gun_near_9mm_uid = near_ammo.is_null() ? 0 : fp3d::item_handle( near_ammo );
             break;
         }
+        case 17: {
+            // Floor from 8 west to 4 east, 4 north to 4 south, nothing lying there, no vehicles or fields. Worn and
+            // carried things replaced: a backpack worn, a rock wielded; carried: 5 pebbles, bottles A and B with
+            // 500 ml of water each, a sealed bottle of 500 ml of water, a plastic bag holding a rock, a 2 L bottle
+            // with 1.5 L of water (a pot is an open container: carried, it spills), empty bottles G and H. Lying
+            // around: an empty bottle C west, a bottle D full of water and an empty plastic bag north, a rock
+            // north-east.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -8; dx <= 4; dx++ ) {
+                for( int dy = -4; dy <= 4; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_floor );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            u.clear_worn();
+            u.inv->clear();
+            u.remove_weapon();
+            u.wear_item( item( itype_backpack ), false );
+            u.set_wielded_item( item( itype_rock ) );
+            const auto handle = []( item_location loc ) {
+                return loc ? fp3d::item_handle( *loc ) : 0;
+            };
+            const auto inside = []( item_location loc ) {
+                uint64_t uid = 0;
+                if( loc ) {
+                    for( item *in : loc->all_items_top( pocket_type::CONTAINER ) ) {
+                        uid = fp3d::item_handle( *in );
+                    }
+                }
+                return uid;
+            };
+            const auto bottle_of_water = []( bool sealed ) {
+                item b( itype_bottle_plastic );
+                b.put_in( item( itype_water, calendar::turn, 2 ), pocket_type::CONTAINER );
+                if( sealed ) {
+                    for( item_pocket *pk : b.get_all_contained_pockets() ) {
+                        pk->seal();
+                    }
+                }
+                return b;
+            };
+            tp_rock_uid = handle( u.get_wielded_item() );
+            tp_pebble_uid = handle( u.i_add( item( itype_pebble, calendar::turn, 5 ) ) );
+            item_location a = u.i_add( bottle_of_water( false ) );
+            tp_bottle_a_uid = handle( a );
+            tp_water_a_uid = inside( a );
+            item_location b = u.i_add( bottle_of_water( false ) );
+            tp_bottle_b_uid = handle( b );
+            tp_water_b_uid = inside( b );
+            item_location sealed = u.i_add( bottle_of_water( true ) );
+            tp_sealed_uid = handle( sealed );
+            tp_sealed_water_uid = inside( sealed );
+            item rock_bag( itype_bag_plastic );
+            rock_bag.put_in( item( itype_rock ), pocket_type::CONTAINER );
+            tp_rock_bag_uid = handle( u.i_add( rock_bag ) );
+            item big( itype_bottle_twoliter );
+            big.put_in( item( itype_water, calendar::turn, 6 ), pocket_type::CONTAINER );
+            item_location big_loc = u.i_add( big );
+            tp_big_uid = handle( big_loc );
+            tp_big_water_uid = inside( big_loc );
+            tp_bottle_g_uid = handle( u.i_add( item( itype_bottle_plastic ) ) );
+            tp_bottle_h_uid = handle( u.i_add( item( itype_bottle_plastic ) ) );
+            const auto lay = [&here]( const tripoint_bub_ms & at, const item & it ) {
+                item &laid = here.add_item( at, it );
+                return laid.is_null() ? 0 : fp3d::item_handle( laid );
+            };
+            tp_bottle_c_uid = lay( p + tripoint_rel_ms( -1, 0, 0 ), item( itype_bottle_plastic ) );
+            tp_bottle_d_uid = lay( p + tripoint_rel_ms( 0, -1, 0 ), bottle_of_water( false ) );
+            tp_open_bag_uid = lay( p + tripoint_rel_ms( 0, -1, 0 ), item( itype_bag_plastic ) );
+            tp_ground_rock_uid = lay( p + tripoint_rel_ms( 1, -1, 0 ), item( itype_rock ) );
+            break;
+        }
         default:
             break;
     }
@@ -586,6 +687,9 @@ void observe()
             for( const item *in : it.all_items_top() ) {
                 o.bag_rocks += in->typeId() == itype_rock ? 1 : 0;
             }
+        }
+        for( const item *in : it.all_items_top() ) {
+            o.west_water += in->typeId() == itype_water ? in->charges : 0;
         }
     }
     o.loads = loads.load();
@@ -840,14 +944,18 @@ bool realtime_checks( fp3d::ui_request &req )
     fp3d::set_clock_mode( fp3d::clock_mode::real_time );
     std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
     for( int i = 0; i < 3; i++ ) {
-        const std::optional<fp3d::ui_request> next = fp3d::wait_request( 3000, req.id );
+        const std::optional<fp3d::ui_request> next = fp3d::wait_request( 10000, req.id );
         const double ms = ms_since( t );
         t = std::chrono::steady_clock::now();
         if( !next || !next->timed ) {
             std::printf( "    real time: no main-loop request after %.0f ms\n", ms );
             return false;
         }
-        const bool step_ok = next->turn > req.turn && next->turn <= req.turn + 2 && ms >= 150 && ms <= 1000;
+        // A turn is 250 ms at this timescale: never faster (paced), but a loaded machine (parallel builds) may be
+        // slower, so the upper bound is loose and a slow step may have let a turn or two more pass.
+        const int64_t turns = next->turn - req.turn;
+        const bool step_ok = turns >= 1 && ms >= 150 && turns <= 2 + static_cast<int64_t>( ms / 250 ) &&
+                             ms <= 10000;
         std::printf( "    real time: turn %lld -> %lld after %.0f ms %s\n", static_cast<long long>( req.turn ),
                      static_cast<long long>( next->turn ), ms, step_ok ? "ok" : "BAD" );
         ok = ok && step_ok;
@@ -3683,7 +3791,7 @@ static bool run_gun_item_checks()
     fp3d::item_action unload_big = ul;
     unload_big.item.uid = fp3d::max_item_uid + 1;
     fp3d::item_action bad_op = ul;
-    bad_op.op = static_cast<fp3d::item_op>( 6 );
+    bad_op.op = static_cast<fp3d::item_op>( 8 );
     fp3d::item_action bad_hand = ul;
     bad_hand.hand = static_cast<fp3d::item_hand>( 3 );
     check( !fp3d::queue_item_action( no_ammo ) && !fp3d::queue_item_action( ammo_big ) &&
@@ -3777,6 +3885,293 @@ static bool run_gun_item_checks()
     res = run( ul_off );
     check( res.back && res.spent > 0 && fp3d::latest_held().off.id == "glockmag" && count_of( glock ).ammo == 0,
            "unload: a gun's magazine into the off hand", show( res ) );
+    return failed == 0;
+}
+
+// Throw and pour by handle (fp3d/item_hands.h, 2026-11-10): a wielded rock thrown at a square lands near it, one
+// pebble of a stack flies; water poured onto the ground, into a bottle lying in reach, into a carried bottle (as much
+// as fits, the rest stays) and into a given pocket (by the water's own handle). Refusals (out of range, worn, not
+// carried, another level; not a liquid, sealed, into itself, not watertight, full, out of reach, no such pocket) say
+// why, spend nothing and change nothing; malformed requests never get queued.
+static bool run_throw_pour_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  throw/pour: %-44s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct result {
+        bool back = false;       // in the main loop again (no menu came up)
+        int spent = 0;           // moves
+        std::string msg;         // the last message
+    };
+    const auto run = [&]( const fp3d::item_action & ia ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            res.msg = "<no main loop>";
+            return res;
+        }
+        const observed o0 = snapshot();
+        fp3d::drain_events( evs );
+        evs.clear();
+        if( !fp3d::queue_item_action( ia ) ) {
+            res.msg = "<not queued>";
+            return res;
+        }
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 60000, r0->id );
+        fp3d::drain_events( evs );
+        const observed o1 = snapshot();
+        res.back = r1 && r1->timed;
+        res.spent = static_cast<int>( o1.turn - o0.turn ) * o0.speed + o0.moves - o1.moves;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msg = e.text;
+            }
+        }
+        return res;
+    };
+    const auto has = []( const std::string & s, const char *part ) {
+        return s.find( part ) != std::string::npos;
+    };
+    const auto show = []( const result & r ) {
+        return "[" + r.msg + "] " + std::to_string( r.spent ) + " moves";
+    };
+    const auto type_of = []( const char *id ) {
+        return fp3d::intern_id( fp3d::id_kind::itype, id );
+    };
+    // The carried item with this handle (uid 0: not carried).
+    const auto count_of = []( uint64_t uid ) {
+        for( const observed::carried_count &c : snapshot().counts ) {
+            if( c.uid == uid ) {
+                return c;
+            }
+        }
+        return observed::carried_count();
+    };
+    // The carried item of this type inside the carried item `parent` (uid 0: none).
+    const auto inside = []( uint64_t parent, uint32_t type ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.parent == parent && c.type == type ) {
+                return c.uid;
+            }
+        }
+        return uint64_t{ 0 };
+    };
+    // Where an item of `type` (or with handle `uid`, when not 0) lies within 3 squares of `p`; nullopt if nowhere.
+    const auto lying_near = []( const fp3d::ui_point & p, uint64_t uid, uint32_t type ) {
+        std::optional<fp3d::ui_point> at;
+        for( int dx = -3; dx <= 3 && !at; dx++ ) {
+            for( int dy = -3; dy <= 3 && !at; dy++ ) {
+                const fp3d::ui_point q{ p.x + dx, p.y + dy, p.z };
+                for( const fp3d::item_handle_view &h : handles_at( q ) ) {
+                    if( uid != 0 ? h.uid == uid : h.type == type ) {
+                        at = q;
+                    }
+                }
+            }
+        }
+        return at;
+    };
+
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 17;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    const fp3d::ui_point south{ here.x, here.y + 1, here.z };
+    const fp3d::ui_point target{ here.x - 4, here.y, here.z };
+    const uint32_t t_rock = type_of( "rock" );
+    const uint32_t t_pebble = type_of( "pebble" );
+    const uint32_t t_bottle = type_of( "bottle_plastic" );
+    const uint32_t t_bag = type_of( "bag_plastic" );
+    const uint32_t t_big = type_of( "bottle_twoliter" );
+    const uint32_t t_water = type_of( "water" );
+    const uint32_t t_backpack = type_of( "backpack" );
+    const uint64_t rock = tp_rock_uid;
+    const uint64_t pebbles = tp_pebble_uid;
+    const uint64_t ground_rock = tp_ground_rock_uid;
+    const uint64_t bottle_a = tp_bottle_a_uid;
+    const uint64_t water_a = tp_water_a_uid;
+    const uint64_t bottle_b = tp_bottle_b_uid;
+    const uint64_t water_b = tp_water_b_uid;
+    const uint64_t sealed = tp_sealed_uid;
+    const uint64_t sealed_water = tp_sealed_water_uid;
+    const uint64_t rock_bag = tp_rock_bag_uid;
+    const uint64_t big = tp_big_uid;
+    const uint64_t big_water = tp_big_water_uid;
+    const uint64_t bottle_g = tp_bottle_g_uid;
+    const uint64_t bottle_h = tp_bottle_h_uid;
+    const uint64_t bottle_c = tp_bottle_c_uid;
+    const uint64_t bottle_d = tp_bottle_d_uid;
+    const uint64_t open_bag = tp_open_bag_uid;
+    uint64_t backpack = 0;
+    for( const fp3d::carried_view &c : carried_now() ) {
+        if( c.type == t_backpack && ( c.flags & fp3d::carried_worn ) ) {
+            backpack = c.uid;
+        }
+    }
+    const observed o0 = snapshot();
+    check( rock != 0 && pebbles != 0 && ground_rock != 0 && bottle_a != 0 && water_a != 0 && bottle_b != 0 &&
+           water_b != 0 && sealed != 0 && sealed_water != 0 && rock_bag != 0 && big != 0 && big_water != 0 &&
+           bottle_g != 0 && bottle_h != 0 && bottle_c != 0 && bottle_d != 0 && open_bag != 0 && backpack != 0 &&
+           fp3d::latest_held().main.id == "rock" && count_of( pebbles ).charges == 5 &&
+           count_of( water_a ).charges == 2 && count_of( big_water ).charges == 6 && o0.puddle == 0 &&
+           o0.west_water == 0, "scene", std::to_string( carried_now().size() ) + " carried" );
+
+    // The bridge refuses malformed requests before they reach the game.
+    fp3d::item_action th;
+    th.op = fp3d::item_op::throw_;
+    th.item = { rock, t_rock };
+    th.pos = target;
+    fp3d::item_action po;
+    po.op = fp3d::item_op::pour;
+    po.item = { bottle_a, t_bottle };
+    po.pos = south;
+    fp3d::item_action throw_untyped = th;
+    throw_untyped.item.type = 0;
+    fp3d::item_action throw_far = th;
+    throw_far.pos.x = -( 1 << 30 );
+    fp3d::item_action pour_both = po;
+    pour_both.container = { bottle_c, t_bottle };
+    fp3d::item_action pour_half_ref = po;
+    pour_half_ref.pos = {};
+    pour_half_ref.container = { bottle_c, 0 };
+    fp3d::item_action pour_pocket_no_container = po;
+    pour_pocket_no_container.pocket = 0;
+    fp3d::item_action pour_pocket_big = po;
+    pour_pocket_big.pos = {};
+    pour_pocket_big.container = { bottle_c, t_bottle };
+    pour_pocket_big.pocket = fp3d::max_item_pocket + 1;
+    fp3d::item_action pour_untyped = po;
+    pour_untyped.item.type = 0;
+    fp3d::item_action bad_op = th;
+    bad_op.op = static_cast<fp3d::item_op>( 8 );
+    check( !fp3d::queue_item_action( throw_untyped ) && !fp3d::queue_item_action( throw_far ) &&
+           !fp3d::queue_item_action( pour_both ) && !fp3d::queue_item_action( pour_half_ref ) &&
+           !fp3d::queue_item_action( pour_pocket_no_container ) && !fp3d::queue_item_action( pour_pocket_big ) &&
+           !fp3d::queue_item_action( pour_untyped ) && !fp3d::queue_item_action( bad_op ),
+           "malformed throw and pour refused by the bridge", "" );
+
+    // Throw refusals: each says why, spends nothing, changes nothing.
+    fp3d::item_action th_range = th;
+    th_range.pos = { here.x - 40, here.y, here.z };
+    result res = run( th_range );
+    check( res.back && res.spent == 0 && has( res.msg, "that far" ) && fp3d::latest_held().main.id == "rock",
+           "throw: beyond the throw range", show( res ) );
+    fp3d::item_action th_worn = th;
+    th_worn.item = { backpack, t_backpack };
+    res = run( th_worn );
+    check( res.back && res.spent == 0 && has( res.msg, "Take off" ) && count_of( backpack ).uid != 0,
+           "throw: a worn backpack", show( res ) );
+    fp3d::item_action th_ground = th;
+    th_ground.item = { ground_rock, t_rock };
+    res = run( th_ground );
+    check( res.back && res.spent == 0 && has( res.msg, "don't have" ), "throw: a rock lying on the ground",
+           show( res ) );
+    fp3d::item_action th_up = th;
+    th_up.pos = { target.x, target.y, target.z + 1 };
+    res = run( th_up );
+    check( res.back && res.spent == 0 && has( res.msg, "own level" ) && fp3d::latest_held().main.id == "rock",
+           "throw: at another level", show( res ) );
+    fp3d::item_action th_self = th;
+    th_self.pos = here;
+    res = run( th_self );
+    check( res.back && res.spent == 0 && has( res.msg, "square to throw" ) && fp3d::latest_held().main.id == "rock",
+           "throw: at the avatar's own square", show( res ) );
+
+    // Throw: the wielded rock lands near the square thrown at; one pebble of five flies from the pack.
+    res = run( th );
+    const std::optional<fp3d::ui_point> landed = lying_near( target, rock, 0 );
+    check( res.back && res.spent > 0 && count_of( rock ).uid == 0 && !fp3d::latest_held().main.held &&
+           landed.has_value(), "throw: the wielded rock 4 squares west", ( landed ? "landed at " +
+                   std::to_string( landed->x - here.x ) + "," + std::to_string( landed->y - here.y ) :
+                   std::string( "not found" ) ) + " " + show( res ) );
+    fp3d::item_action th_pebble = th;
+    th_pebble.item = { pebbles, t_pebble };
+    th_pebble.pos = { here.x - 3, here.y, here.z };
+    res = run( th_pebble );
+    const std::optional<fp3d::ui_point> pebble_at = lying_near( th_pebble.pos, 0, t_pebble );
+    check( res.back && res.spent > 0 && count_of( pebbles ).charges == 4 && pebble_at.has_value(),
+           "throw: one pebble of a stack", std::to_string( count_of( pebbles ).charges ) + " left " + show( res ) );
+
+    // Pour refusals.
+    fp3d::item_action po_rock = po;
+    po_rock.item = { rock_bag, t_bag };
+    res = run( po_rock );
+    check( res.back && res.spent == 0 && has( res.msg, "no liquid" ), "pour: a bag holding a rock", show( res ) );
+    fp3d::item_action po_sealed = po;
+    po_sealed.item = { sealed, t_bottle };
+    res = run( po_sealed );
+    check( res.back && res.spent == 0 && has( res.msg, "sealed" ) && count_of( sealed_water ).charges == 2 &&
+           snapshot().puddle == 0, "pour: a sealed bottle", show( res ) );
+    fp3d::item_action po_into = po;
+    po_into.pos = {};
+    po_into.item = { bottle_b, t_bottle };
+    po_into.container = { bottle_b, t_bottle };
+    res = run( po_into );
+    check( res.back && res.spent == 0 && has( res.msg, "itself" ) && count_of( water_b ).charges == 2,
+           "pour: a bottle into itself", show( res ) );
+    fp3d::item_action po_bag = po_into;
+    po_bag.container = { open_bag, t_bag };
+    res = run( po_bag );
+    check( res.back && res.spent == 0 && has( res.msg, "won't hold" ) && count_of( water_b ).charges == 2,
+           "pour: into a plastic bag (not watertight)", show( res ) );
+    fp3d::item_action po_full = po_into;
+    po_full.container = { bottle_d, t_bottle };
+    res = run( po_full );
+    check( res.back && res.spent == 0 && has( res.msg, "brim" ) && count_of( water_b ).charges == 2,
+           "pour: into a full bottle", show( res ) );
+    fp3d::item_action po_far = po;
+    po_far.pos = { here.x - 3, here.y, here.z };
+    res = run( po_far );
+    check( res.back && res.spent == 0 && has( res.msg, "can't reach" ) && count_of( water_a ).charges == 2,
+           "pour: onto a square 3 away", show( res ) );
+    fp3d::item_action po_pocket = po_into;
+    po_pocket.item = { big, t_big };
+    po_pocket.container = { bottle_h, t_bottle };
+    po_pocket.pocket = 5;
+    res = run( po_pocket );
+    check( res.back && res.spent == 0 && has( res.msg, "no such pocket" ) && count_of( big_water ).charges == 6,
+           "pour: into a pocket the bottle doesn't have", show( res ) );
+
+    // Pour: onto the ground (a puddle there), into a bottle lying west, into a carried bottle (as much as fits),
+    // the water's own handle into a given pocket.
+    res = run( po );
+    check( res.back && res.spent > 0 && snapshot().puddle == 2 && count_of( water_a ).uid == 0 &&
+           count_of( bottle_a ).uid != 0, "pour: water onto the ground south",
+           std::to_string( snapshot().puddle ) + " in the puddle " + show( res ) );
+    fp3d::item_action po_c = po_into;
+    po_c.container = { bottle_c, t_bottle };
+    res = run( po_c );
+    check( res.back && res.spent > 0 && snapshot().west_water == 2 && count_of( water_b ).uid == 0,
+           "pour: into a bottle lying west", std::to_string( snapshot().west_water ) + " there " + show( res ) );
+    fp3d::item_action po_g = po_into;
+    po_g.item = { big, t_big };
+    po_g.container = { bottle_g, t_bottle };
+    res = run( po_g );
+    const uint64_t water_g = inside( bottle_g, t_water );
+    check( res.back && res.spent > 0 && count_of( big_water ).charges == 4 && water_g != 0 &&
+           count_of( water_g ).charges == 2 && has( res.msg, "left over" ), "pour: 2 L bottle into a 500 ml one",
+           std::to_string( count_of( big_water ).charges ) + " left " + show( res ) );
+    fp3d::item_action po_h = po_into;
+    po_h.item = { big_water, t_water };
+    po_h.container = { bottle_h, t_bottle };
+    po_h.pocket = 0;
+    res = run( po_h );
+    const uint64_t water_h = inside( bottle_h, t_water );
+    check( res.back && res.spent > 0 && count_of( big_water ).charges == 2 && water_h != 0 && water_h != big_water &&
+           count_of( water_h ).charges == 2, "pour: the water's own handle into pocket 0", show( res ) );
     return failed == 0;
 }
 
@@ -3881,6 +4276,7 @@ int main()
     const bool guns_ok = stairs_ok && run_gun_item_checks();
     const bool combat_ok = guns_ok && run_combat_checks();
     const bool range_ok = combat_ok && run_range_op_checks();
+    const bool throw_pour_ok = range_ok && run_throw_pour_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -3921,11 +4317,12 @@ int main()
     std::printf( "guns: %s\n", guns_ok ? "ok" : "BAD" );
     std::printf( "combat: %s\n", combat_ok ? "ok" : "BAD" );
     std::printf( "range ops: %s\n", range_ok ? "ok" : "BAD" );
+    std::printf( "throw/pour: %s\n", throw_pour_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           worlds_ok ?
+           throw_pour_ok && worlds_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

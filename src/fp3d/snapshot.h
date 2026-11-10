@@ -191,6 +191,19 @@ struct gun_view {
     std::vector<std::string> faults;     // fault ids it has (cap max_gun_faults, ids up to max_fault_id_bytes)
 };
 
+// An effect on the player, for the HUD: what CDDA's @ screen lists (effects with no display name are left out).
+constexpr size_t max_player_effects = 64;
+constexpr size_t max_effect_id_bytes = 64;
+constexpr size_t max_effect_name_columns = 40;
+struct effect_view {
+    std::string id;                      // effect_type id, e.g. "drunk", "bleed"; up to max_effect_id_bytes
+    std::string name;                    // CDDA's display name, color tags removed; up to max_effect_name_columns
+    uint32_t body_part = 0;              // body_part index; 0 = the whole body
+    uint8_t intensity = 1;
+    int8_t rating = 0;                   // -1 bad, 0 neutral, 1 good, 2 mixed
+    int32_t seconds_left = -1;           // -1 permanent
+};
+
 struct player_view {
     uint64_t uid = 0;
     ui_point pos;
@@ -217,6 +230,7 @@ struct player_view {
     std::vector<worn_view> worn;                  // inner to outer (CDDA's worn order); cap 64
     std::vector<carried_view> items;              // wielded, then worn items and what's inside; cap 256
     std::optional<gun_view> wielded_gun;          // when the wielded item is a gun
+    std::vector<effect_view> effects;             // cap max_player_effects
 };
 
 struct environment_view {

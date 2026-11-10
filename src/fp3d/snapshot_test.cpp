@@ -198,7 +198,37 @@ int main()
             check( gun_json.str().find( "\"wielded_gun\":{\"type\":" ) != std::string::npos &&
                    gun_json.str().find( "\"dirt\":1234,\"rounds\":7,\"faults\":[\"" + fault + "\"]" ) !=
                    std::string::npos, "wielded_gun in the JSON" );
+            // A fault the gun type can't get (a save or a mod can add one) is listed too.
+            u.get_wielded_item()->set_fault( fault_id( "fault_engine_starter" ), true, false );
+            const std::shared_ptr<const fp3d::snapshot> odd = timed_capture( gun_ms );
+            const std::optional<fp3d::gun_view> &g2 = odd->player.wielded_gun;
+            const auto lists = [&]( const std::string & f ) {
+                return g2 && std::find( g2->faults.begin(), g2->faults.end(), f ) != g2->faults.end();
+            };
+            check( g2 && g2->faults.size() == 2 && lists( fault ) && lists( "fault_engine_starter" ),
+                   "wielded_gun lists every fault it has", g2 ? std::to_string( g2->faults.size() ) : "none" );
             u.remove_weapon();
+        }
+        {
+            // Effects on the player: id, display name, body part (0 = whole body), rating, time left.
+            const efftype_id stunned( "stunned" );
+            u.add_effect( stunned, 5_minutes );
+            double eff_ms = 0;
+            const std::shared_ptr<const fp3d::snapshot> dazed = timed_capture( eff_ms );
+            const fp3d::effect_view *found = nullptr;
+            for( const fp3d::effect_view &e : dazed->player.effects ) {
+                found = e.id == "stunned" ? &e : found;
+            }
+            check( found && found->name == "Stunned" && found->body_part == 0 && found->rating == -1 &&
+                   found->intensity == 1 && found->seconds_left > 0 && found->seconds_left <= 300,
+                   "stunned effect in the player view", found ? found->name + " " +
+                   std::to_string( found->seconds_left ) + " s" : "none" );
+            std::ostringstream eff_json;
+            fp3d::write_snapshot_json( eff_json, *dazed, u.posz(), u.posz() );
+            check( eff_json.str().find( "{\"id\":\"stunned\",\"name\":\"Stunned\",\"body_part\":0,\"intensity\":1,"
+                                        "\"rating\":-1,\"seconds_left\":" ) != std::string::npos,
+                   "effects in the JSON" );
+            u.remove_effect( stunned );
         }
 
         // One wall 3 squares east of the player: exactly one submap's shape revision moves.
