@@ -1,6 +1,7 @@
 #include "loading_ui.h"
 
 #include "cached_options.h"
+#include "fp3d/bridge.h"
 #include "options.h"
 #include "input.h"
 #include "output.h"
@@ -153,6 +154,10 @@ void loading_ui::show( const std::string &context, const std::string &step )
 {
     if( test_mode ) {
         return;
+    }
+    // FP3D: the boot's progress for the console and the client (fp3d/bridge.h)
+    if( fp3d::active() ) {
+        fp3d::note_boot_step( context, step );
     }
     update_state( context, step );
     ui_manager::redraw();

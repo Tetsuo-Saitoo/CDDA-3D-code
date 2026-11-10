@@ -1,4 +1,5 @@
 #include "debug.h"
+#include "fp3d/bridge.h"
 
 #include <cctype>
 // IWYU pragma: no_include <sys/errno.h>
@@ -530,6 +531,12 @@ void realDebugmsg( const char *filename, const char *line, const char *funcname,
     }
 
     if( test_mode ) {
+        return;
+    }
+    // FP3D: never a prompt in an FP3D game: the window is hidden, and during a boot nobody could answer it (the
+    // game thread would wait forever). Logged above; kept for the console and the client (fp3d/bridge.h).
+    if( fp3d::active() ) {
+        fp3d::note_debug_error( text );
         return;
     }
 

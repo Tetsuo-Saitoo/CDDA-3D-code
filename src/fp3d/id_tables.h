@@ -50,6 +50,29 @@ struct field_def {
     std::vector<std::string> level_colors;
 };
 
+// An item type's own container pockets, in the order item actions number them (`pocket`). An item can gain more
+// at run time (attached pouches); those come after these.
+constexpr size_t max_itype_pockets = 32;
+constexpr size_t max_pocket_name_columns = 40;
+enum pocket_flag : uint16_t {
+    pocket_rigid = 1,          // size doesn't change with contents
+    pocket_watertight = 2,     // holds liquids
+    pocket_airtight = 4,       // holds gases
+    pocket_holster = 8,        // holds one item
+    pocket_open = 16,          // open container: liquids spill when it moves
+    pocket_sealable = 32,      // comes sealed / can be sealed
+    pocket_ammo_only = 64,     // only some ammo types (quivers, ammo boxes)
+    pocket_restricted = 128,   // only some items, flags or materials
+    pocket_forbidden = 256,    // the player can't use it
+};
+struct pocket_def {
+    std::string name;          // CDDA's pocket name ("Torso compartment"); often empty
+    int64_t volume_ml = 0;
+    int64_t max_weight_g = 0;
+    int64_t max_item_ml = -1;  // largest single item; -1 = only the pocket's volume
+    uint16_t flags = 0;        // pocket_flag bits
+};
+
 struct item_def {
     std::string id;
     std::string name;
@@ -61,6 +84,7 @@ struct item_def {
     std::string gun;        // skill a gun uses (pistol, rifle, archery, launcher, ...), "" if not a gun
     int volume_ml = 0;
     int weight_g = 0;
+    std::vector<pocket_def> pockets;   // cap max_itype_pockets
 };
 
 struct monster_def {

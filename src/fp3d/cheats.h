@@ -48,11 +48,14 @@ bool request_test_kit();
 
 // The test range's operations (fp3d/test_range.h), asked for like cheats. They run in the before-ask hook of the
 // main loop's next request (run_range_requests), also while paused; the game refuses them outside range games.
-enum class range_op_kind : uint8_t { spawn_item, spawn_monster, teleport, time_of_day, advance, ai_frozen, heal };
+enum class range_op_kind : uint8_t {
+    spawn_item, spawn_monster, teleport, time_of_day, advance, ai_frozen, heal, rebuild_zone
+};
 struct range_op {
     range_op_kind kind = range_op_kind::heal;
     uint32_t itype = 0;      // spawn_item: session itype index (id tables)
-    int64_t number = 0;      // spawn_item count, teleport zone index, time_of_day minute, advance minutes, ai_frozen 0/1
+    // spawn_item count, teleport and rebuild_zone zone index, time_of_day minute, advance minutes, ai_frozen 0/1
+    int64_t number = 0;
     ui_point square;         // spawn_item, spawn_monster
     std::string monster;     // spawn_monster: mtype id
 };
