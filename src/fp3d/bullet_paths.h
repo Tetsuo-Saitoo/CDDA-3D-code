@@ -25,7 +25,7 @@ namespace fp3d
 // Whether bullet paths apply to `proj`: an FP3D game and a single plain bullet (`is_bullet` as ballistics.cpp has
 // it: speed 200 or more, not NO_PENETRATE_OBSTACLES), not a stream, nothing that explodes or spreads an effect
 // (custom explosion, an effect's blast, EMP, flashbang or area field), not a laser, plasma, BOUNCE or
-// SHATTER_SELF, and nothing dropped or embedded (arrows, bolts).
+// SHATTER_SELF, and only bullet damage (not arrows or bolts, whose damage is stab, whether recovered or not).
 bool paths_apply( const projectile &proj, bool is_bullet, bool stream );
 
 // What a body stops of a bullet going through it, in damage, by its size (tiny .. huge).

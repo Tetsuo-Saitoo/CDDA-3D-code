@@ -34,6 +34,7 @@
 #include "coordinates.h"
 #include "debug.h"
 #include "do_turn.h"
+#include "field.h"
 #include "field_type.h"
 #include "flexbuffer_json.h"
 #include "fp3d/boot.h"
@@ -2081,8 +2082,7 @@ static bool run_combat_checks()
         int ay = 0;
         int wx = 0;                 // a wall square (0, 0 = none)
         int wy = 0;
-        int wall_row = 0;           // a concrete wall along this row, across the scene's width, and one along
-                                    // its west edge (11 west) so nothing flies out of the scene (0 = none)
+        int wall_row = 0;           // a concrete wall along this row, across the scene's width (0 = none)
         int rounds = -1;            // rounds in the gun (-1 = full)
         bool spare_mag = false;     // carry a full spare magazine
         bool second_mag = false;    // and a second one with 5 rounds (two stacks, so CDDA asks which)
@@ -2140,12 +2140,25 @@ static bool run_combat_checks()
         const tripoint_bub_ms p = u.pos_bub();
         if( sc ) {
             g->clear_zombies();
+            // Seeing in the dark, so what the avatar sees doesn't hang on light left by an earlier test (a fire
+            // burning on indoors, say, which the field clearing below puts out)
+            if( !u.has_trait( trait_DEBUG_NIGHTVISION ) ) {
+                u.set_mutation( trait_DEBUG_NIGHTVISION );
+            }
             for( int dx = -10; dx <= 2; dx++ ) {
                 for( int dy = -5; dy <= 5; dy++ ) {
                     const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
                     if( here.inbounds( q ) && !here.veh_at( q ) ) {
                         here.ter_set( q, ter_t_floor );
                         here.furn_set( q, furn_str_id::NULL_ID() );
+                        // an earlier test's fire and its smoke, say (remove_field keeps the caches right)
+                        std::vector<field_type_id> fields;
+                        for( const auto &fd : here.field_at( q ) ) {
+                            fields.push_back( fd.first );
+                        }
+                        for( const field_type_id &fd : fields ) {
+                            here.remove_field( q, fd );
+                        }
                         if( q != p ) {
                             here.i_clear( q );
                         }
@@ -2162,8 +2175,15 @@ static bool run_combat_checks()
                         here.ter_set( q, ter_t_concrete_wall );
                     }
                 }
-                for( int dy = -5; dy <= 5; dy++ ) {
-                    const tripoint_bub_ms q = p + tripoint_rel_ms( -11, dy, 0 );
+            }
+            // Walled in all round, so no bullet going on through a body, overshooting or glancing off a wall
+            // leaves the scene to hurt someone outside it (who might then come for the avatar in a later scene).
+            for( int dx = -11; dx <= 3; dx++ ) {
+                for( int dy = -6; dy <= 6; dy++ ) {
+                    if( dx != -11 && dx != 3 && dy != -6 && dy != 6 ) {
+                        continue;
+                    }
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
                     if( here.inbounds( q ) && !here.veh_at( q ) ) {
                         here.furn_set( q, furn_str_id::NULL_ID() );
                         here.ter_set( q, ter_t_concrete_wall );
@@ -2750,9 +2770,12 @@ static bool run_combat_checks()
                t.shots.empty() && !t.after.has_plan && delta( t.c0.planned, t.c1.planned ) == 0,
                "throw with a shot: ignored", "rocks lying " + std::to_string( t.before.rocks ) + " -> " +
                std::to_string( t.after.rocks ) + ", " + counts( t ) );
-        scene with_friend = point_blank;     // a friendly zombie on the line behind the hostile one
+        // a friendly zombie a square beside the line behind the hostile one: near enough for the claim, but out of
+        // the way of a bullet going on through the hostile
+        scene with_friend = point_blank;
         with_friend.zx = -3;
         with_friend.fx = -5;
+        with_friend.fy = 1;
         claim friend_hit = head;
         friend_hit.hit = who::friendly;
         const result f = run( with_friend, "fire", answer_with::fire, friend_hit, true, friend_hit );
@@ -2790,9 +2813,17 @@ static bool run_combat_checks()
         int shots = 0;
         int crits = 0;
         int hits = 0;
+        int malfunctions = 0;
         for( int i = 0; i < 20; i++ ) {
             const result r = run( far_zombie, "fire", answer_with::fire, dead_centre, false, std::nullopt );
             if( !fired( r, 1 ) ) {
+                // an unskilled shooter's gun malfunctions now and then (CDDA's roll): that shot doesn't count
+                for( const std::string &m : r.after.messages ) {
+                    if( m.find( "malfunctions" ) != std::string::npos ) {
+                        malfunctions++;
+                        break;
+                    }
+                }
                 continue;
             }
             shots++;
@@ -2803,9 +2834,9 @@ static bool run_combat_checks()
             }
             crits += crit ? 1 : 0;
         }
-        check( shots == 20 && crits < shots, "20 claimed head shots: CDDA's roll decides",
-               std::to_string( shots ) + " fired, " + std::to_string( hits ) + " hit, " + std::to_string( crits ) +
-               " critical / head" );
+        check( shots + malfunctions == 20 && shots >= 15 && crits < shots, "20 claimed head shots: CDDA's roll decides",
+               std::to_string( shots ) + " fired, " + std::to_string( malfunctions ) + " malfunctioned, " +
+               std::to_string( hits ) + " hit, " + std::to_string( crits ) + " critical / head" );
     }
     const auto outcomes = [&]( const result & r ) {
         return delta( r.c0.accepted, r.c1.accepted ) + delta( r.c0.planned, r.c1.planned );
