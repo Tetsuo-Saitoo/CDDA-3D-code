@@ -14,6 +14,7 @@
 #include <exception>
 #include <filesystem>
 #include <memory>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <sstream>
@@ -2091,6 +2092,9 @@ static bool run_combat_checks()
         std::string mode;           // gun mode, "" = its default
         std::string fault;          // a fault set on the gun ("" = none)
         std::string ammo;           // the gun's ammo, "" = 9mm
+        bool spare_gun = false;     // also a jammed loaded `gun` in the pack
+        bool ground_gun = false;    // and one lying a square west
+        bool turret_shot = false;   // fire 3 rounds from a jammed `gun` nobody holds, as a vehicle turret does
         int moves = 0;              // moves left for the turn that fires (0 = a full turn)
         bool armed = true;          // wield a loaded `gun`; else empty hands (throwing wields the rock)
         bool rock = false;          // carry a rock to throw
@@ -2110,12 +2114,17 @@ static bool run_combat_checks()
         int64_t turn = 0;
         std::vector<std::string> messages;   // since the scene was set
         bool jammed = false;        // the wielded gun has a jam fault
+        int moves = 0;
+        uint64_t mag_uid = 0;       // the wielded gun's magazine, given a handle (snapshots don't list it)
+        uint32_t mag_type = 0;
+        int turret_fired = -1;      // rounds the turret_shot fired
     };
     struct state {
         std::mutex mx;
         std::optional<scene> want;  // the next scene to build
         seen last;                  // observed before the newest request
         uint64_t uids[3] = {};      // sim thread only
+        int turret_fired = -1;      // sim thread only
     };
     const std::shared_ptr<state> st = std::make_shared<state>();
     const auto hook = [st]() {
@@ -2178,6 +2187,18 @@ static bool run_combat_checks()
                 mag.ammo_set( itype_9mm, 5 );
                 u.i_add( mag );
             }
+            const auto jammed_gun = [&]() {
+                item gun( itype_id( sc->gun ) );
+                gun.ammo_set( itype_9mm );
+                gun.set_fault( fault_id( "fault_stovepipe" ), true, false );
+                return gun;
+            };
+            if( sc->spare_gun ) {
+                u.i_add( jammed_gun() );
+            }
+            if( sc->ground_gun ) {
+                here.add_item( p + tripoint_rel_ms( -1, 0, 0 ), jammed_gun() );
+            }
             const auto place = [&]( int x, int y, bool friendly ) -> uint64_t {
                 if( x == 0 && y == 0 ) {
                     return 0;
@@ -2197,15 +2218,30 @@ static bool run_combat_checks()
             if( sc->moves > 0 ) {
                 u.set_moves( sc->moves );
             }
+            st->turret_fired = -1;
+            if( sc->turret_shot ) {
+                // turret_data::fire: Character::fire_gun with the turret's own gun, not the wielded one
+                item base( itype_id( sc->gun ) );
+                base.ammo_set( itype_9mm );
+                base.set_fault( fault_id( "fault_stovepipe" ), true, false );
+                here.build_map_cache( p.z() );
+                st->turret_fired = u.fire_gun( here, p + tripoint_rel_ms( sc->zx, sc->zy, 0 ), 3, base );
+            }
             Messages::clear_messages();
             here.build_map_cache( p.z() );
         }
         observe();
         seen o;
-        if( const item_location w = u.get_wielded_item() ) {
+        if( item_location w = u.get_wielded_item() ) {
             o.ammo = w->ammo_remaining();
             o.jammed = !fp3d::jam_of( *w ).is_null();
+            if( item *mag = w->magazine_current() ) {
+                o.mag_uid = fp3d::item_handle( *mag );
+                o.mag_type = fp3d::intern_id( fp3d::id_kind::itype, mag->typeId().str() );
+            }
         }
+        o.moves = u.get_moves();
+        o.turret_fired = st->turret_fired;
         o.uid = st->uids[0];
         o.side_uid = st->uids[1];
         o.friendly_uid = st->uids[2];
@@ -2508,6 +2544,36 @@ static bool run_combat_checks()
         const result n = run( burst, "fire", answer_with::fire, head, false, std::nullopt );
         check( fired( n, 3 ) && n.shots.empty() && delta( n.c0.planned, n.c1.planned ) == 1,
                "burst without fly: plan for the first round only", counts( n ) );
+    }
+    // A trigger pull asks for its first rounds only (the cap: 8 in play, 2 here): an MP5's 3-round burst with `fly`
+    // sends 2 shot requests; the third round takes CDDA's own path, unasked.
+    {
+        scene burst = point_blank;
+        burst.gun = "hk_mp5";
+        burst.mode = "BURST";
+        fp3d::set_asks_per_pull( 2 );
+        const result r = run( burst, "fire", answer_with::fire, head, true, std::nullopt );
+        fp3d::set_asks_per_pull( fp3d::default_asks_per_pull );
+        check( fired( r, 3 ) && r.shots.size() == 2 && delta( r.c0.asked, r.c1.asked ) == 2 &&
+               delta( r.c0.capped, r.c1.capped ) == 1, "burst past the request cap: CDDA's own path",
+               counts( r ) + ", " + std::to_string( r.shots.size() ) + " shot requests" );
+    }
+    // The client's part only weights CDDA's pick (QA): point blank, skilled, every hit claimed on the head dead
+    // centre; the head lands on some of them, not on all (a roll against its chance times 4).
+    {
+        const claim dead_head = { who::zombie, 0, 0, "head", 0.0f };
+        int hits = 0;
+        int landed = 0;
+        for( int i = 0; i < 16; i++ ) {
+            const result r = run( point_blank, "fire", answer_with::fire, dead_head, true, dead_head );
+            if( !fired( r, 1 ) || delta( r.c0.accepted, r.c1.accepted ) != 1 ) {
+                continue;
+            }
+            hits++;
+            landed += delta( r.c0.parts, r.c1.parts ) > 0 ? 1 : 0;
+        }
+        check( hits >= 10 && landed > 0 && landed < hits, "client part weights CDDA's pick",
+               "head landed on " + std::to_string( landed ) + " of " + std::to_string( hits ) + " claimed hits" );
     }
     // Parts: unknown or junk ids are ignored (CDDA picks), the hit still counts.
     {
@@ -2993,6 +3059,25 @@ static bool run_combat_checks()
                r.after.hp == r.before.hp && said( r.after, "jammed" ), "jammed gun: aim refused, no quick fix",
                counts( r ) + ( r.after.jammed ? ", still jammed" : ", cleared" ) );
     }
+    // A turret's gun isn't the wielded one: a jam on it doesn't stop its fire (R and `clear` can't reach it), as in
+    // CDDA. Fired through Character::fire_gun as turret_data::fire does, 3 rounds from a jammed Glock nobody holds.
+    {
+        scene turret = point_blank;
+        turret.zx = -4;
+        turret.turret_shot = true;
+        std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
+        if( q && q->timed ) {
+            {
+                std::lock_guard<std::mutex> lk( st->mx );
+                st->want = turret;
+            }
+            fp3d::queue_action( "pause" );
+            q = fp3d::wait_request( 20000, q->id );
+        }
+        const seen t = seen_now();
+        check( q && q->timed && t.turret_fired == 3 && !said( t, "is jammed" ),
+               "turret's jammed gun fires on (not wielded)", "fired " + std::to_string( t.turret_fired ) );
+    }
     // A burst stops at a jam from an earlier round: black-powder .300 BLK (recoil 1520) doesn't cycle a SIG MCX
     // Rattler (1700 needed), so CDDA leaves the first round's case in the chamber on full auto; its loop fired on
     // regardless, the avatar's now stops there.
@@ -3049,6 +3134,127 @@ static bool run_combat_checks()
                "reload on a jammed gun: CDDA's mend, no reload", std::to_string( took ) + " turns, ammo " +
                std::to_string( before.ammo ) + " -> " + std::to_string( after.ammo ) +
                ( after.jammed ? ", jammed" : ", cleared" ) + ( back ? "" : ", stuck" ) );
+    }
+    // The `clear` item action (bridge.h): only the wielded gun itself, named by its snapshot handle (hostile
+    // input). Refusals say why and spend nothing (same turn, same moves, still jammed); then the jammed gun in hand
+    // is cleared by CDDA's mend. CDDA's jam fixes need no tools or skills, so "no fix can be done" can't be reached
+    // with its data.
+    {
+        const uint32_t t_glock = fp3d::intern_id( fp3d::id_kind::itype, "glock_19" );
+        struct by_handle {
+            bool back = false;
+            seen before;
+            seen after;
+            std::string note;
+        };
+        // Builds `sc`, then sends `clear` for the item `pick` names in the snapshot ({} = nothing to send).
+        const auto clear_run = [&]( const scene & sc,
+        const std::function<fp3d::item_ref( const fp3d::snapshot & )> &pick ) {
+            by_handle c;
+            std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
+            if( q && q->timed ) {
+                {
+                    std::lock_guard<std::mutex> lk( st->mx );
+                    st->want = sc;
+                }
+                fp3d::queue_action( "pause" );
+                q = fp3d::wait_request( 20000, q->id );
+            }
+            const std::shared_ptr<const fp3d::snapshot> snap = fp3d::latest_snapshot();
+            if( !q || !q->timed || !snap ) {
+                c.note = ", no main loop";
+                return c;
+            }
+            c.before = seen_now();
+            fp3d::item_action a;
+            a.op = fp3d::item_op::clear;
+            a.item = pick( *snap );
+            if( a.item.uid == 0 || !fp3d::queue_item_action( a ) ) {
+                c.note = ", not queued";
+                return c;
+            }
+            std::optional<fp3d::ui_request> r = fp3d::wait_request( 30000, q->id );
+            int asked = 0;
+            while( r && !r->timed && asked++ < 5 ) {
+                fp3d::ui_answer ans;
+                ans.id = r->id;
+                ans.cancel = true;
+                print_request( *r, "unexpected, cancel" );
+                fp3d::answer( ans );
+                const uint64_t id = r->id;
+                r = fp3d::wait_request( 20000, id );
+            }
+            c.back = r && r->timed && asked == 0;
+            c.after = seen_now();
+            return c;
+        };
+        const auto wielded = []( const fp3d::snapshot & s ) {
+            for( const fp3d::carried_view &v : s.player.items ) {
+                if( v.flags & fp3d::carried_wielded ) {
+                    return fp3d::item_ref{ v.uid, v.type };
+                }
+            }
+            return fp3d::item_ref{};
+        };
+        // A magazine's handle from when it was carried, now inside the wielded gun.
+        const auto inside_wielded = [&]( const fp3d::snapshot & ) {
+            const seen now = seen_now();
+            return fp3d::item_ref{ now.mag_uid, now.mag_type };
+        };
+        const auto carried_glock = [&]( const fp3d::snapshot & s ) {
+            for( const fp3d::carried_view &v : s.player.items ) {
+                if( v.type == t_glock && !( v.flags & fp3d::carried_wielded ) ) {
+                    return fp3d::item_ref{ v.uid, v.type };
+                }
+            }
+            return fp3d::item_ref{};
+        };
+        const auto ground_glock = [&]( const fp3d::snapshot & s ) {
+            const fp3d::ui_point w{ s.player.pos.x - 1, s.player.pos.y, s.player.pos.z };
+            for( const fp3d::item_handle_view &h : handles_at( w ) ) {
+                if( h.type == t_glock ) {
+                    return fp3d::item_ref{ h.uid, h.type };
+                }
+            }
+            return fp3d::item_ref{};
+        };
+        const auto spent_nothing = []( const by_handle & c ) {
+            return c.back && c.after.turn == c.before.turn && c.after.moves == c.before.moves &&
+                   c.before.jammed && c.after.jammed;
+        };
+        const auto shown = []( const by_handle & c ) {
+            return "turn +" + std::to_string( c.after.turn - c.before.turn ) + ", moves " +
+                   std::to_string( c.before.moves ) + " -> " + std::to_string( c.after.moves ) +
+                   ( c.after.jammed ? ", jammed" : ", cleared" ) + c.note +
+                   ( c.after.messages.empty() ? std::string() : " [" + c.after.messages.back() + "]" );
+        };
+        scene jam = point_blank;
+        jam.zx = 0;
+        jam.fault = "fault_stovepipe";
+        scene with_others = jam;
+        with_others.spare_gun = true;
+        with_others.ground_gun = true;
+        by_handle c = clear_run( with_others, carried_glock );
+        check( spent_nothing( c ) && said( c.after, "Hold the gun" ), "clear: a gun carried but not wielded",
+               shown( c ) );
+        c = clear_run( with_others, ground_glock );
+        check( spent_nothing( c ) && said( c.after, "don't have that" ), "clear: a gun lying on the ground",
+               shown( c ) );
+        c = clear_run( jam, inside_wielded );
+        // Refused either way: CDDA's carried items don't reach into a magazine well, so it isn't found at all.
+        check( spent_nothing( c ) && ( said( c.after, "Hold the gun" ) || said( c.after, "don't have that" ) ),
+               "clear: the magazine in the wielded gun",
+               shown( c ) );
+        scene clean = jam;
+        clean.fault.clear();
+        c = clear_run( clean, wielded );
+        check( c.back && c.after.turn == c.before.turn && c.after.moves == c.before.moves && !c.after.jammed &&
+               said( c.after, "isn't jammed" ), "clear: a gun that isn't jammed", shown( c ) );
+        c = clear_run( jam, wielded );
+        const int64_t took = c.after.turn - c.before.turn;
+        check( c.back && c.before.jammed && !c.after.jammed && took >= 9 && took <= 15 &&
+               c.after.ammo == c.before.ammo && said( c.after, "You eject the spent casing" ),
+               "clear: the wielded jammed gun, CDDA's mend", shown( c ) );
     }
     return failed == 0;
 }
@@ -3477,7 +3683,7 @@ static bool run_gun_item_checks()
     fp3d::item_action unload_big = ul;
     unload_big.item.uid = fp3d::max_item_uid + 1;
     fp3d::item_action bad_op = ul;
-    bad_op.op = static_cast<fp3d::item_op>( 5 );
+    bad_op.op = static_cast<fp3d::item_op>( 6 );
     fp3d::item_action bad_hand = ul;
     bad_hand.hand = static_cast<fp3d::item_hand>( 3 );
     check( !fp3d::queue_item_action( no_ammo ) && !fp3d::queue_item_action( ammo_big ) &&

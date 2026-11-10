@@ -180,7 +180,9 @@ size_t queued_actions();
 // unload: empty a gun or magazine (CDDA's unload): a gun's magazine comes out whole, a magazine's rounds come out.
 // reload: load a carried gun or magazine with the ammo or magazine `container` names (CDDA's reload with that ammo
 // chosen, as much as fits); a gun holding a magazine or a gunmod is loaded where CDDA's reload menu would load it.
-enum class item_op : uint8_t { take, put, drop, unload, reload };
+// clear: clear the jam of the wielded gun `item` itself (fp3d/gun_faults.h clear_jam: CDDA's mend with the jam's
+// first fix the avatar can do, its time); pos, hand and container aren't used.
+enum class item_op : uint8_t { take, put, drop, unload, reload, clear };
 // take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
 // fit), wielded, the off hand.
 enum class item_hand : uint8_t { pack, main, off };

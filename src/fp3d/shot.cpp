@@ -40,12 +40,15 @@ namespace
 std::optional<shot_plan> plan;
 bool firing = false;                    // in the avatar's fire_gun with its wielded gun
 bool first_used = false;                // this trigger pull's first projectile has been decided
+int asks_this_pull = 0;                 // `shot` requests sent in this trigger pull
 int depth = 0;                          // projectile_attack nesting
 std::optional<shot_outcome> current;    // the outermost projectile's outcome
 
 std::atomic<uint64_t> n_asked{ 0 };
 std::atomic<uint64_t> n_accepted{ 0 };
 std::atomic<uint64_t> n_refused{ 0 };
+std::atomic<uint64_t> n_capped{ 0 };
+std::atomic<int> asks_cap{ default_asks_per_pull };
 std::atomic<uint64_t> n_planned{ 0 };
 std::atomic<uint64_t> n_parts{ 0 };
 std::atomic<uint64_t> n_spared{ 0 };
@@ -194,10 +197,16 @@ const std::string *planned_part( const Creature &target, const Creature *source 
     return &current->part;
 }
 
-// The part lands if goodhit <= sqrt(chance), chance in 0..1; a part that can't be hit never lands.
+// The client's part only weights CDDA's pick: rolled with the part's own chance (0..1) times 1 + 3 * (1 - goodhit)
+// (4 for a dead-centre roll, 1 for a graze), at most 1; CDDA's own pick stands otherwise. A part that can't be hit
+// never lands.
 bool part_lands( double chance, double goodhit )
 {
-    return std::isfinite( chance ) && chance > 0.0 && goodhit <= std::sqrt( std::min( chance, 1.0 ) );
+    if( !std::isfinite( chance ) || !( chance > 0.0 ) || !std::isfinite( goodhit ) ) {
+        return false;
+    }
+    const double weight = 1.0 + ( aim_weight_max - 1.0 ) * std::clamp( 1.0 - goodhit, 0.0, 1.0 );
+    return rng_float( 0.0, 1.0 ) < std::min( chance * weight, 1.0 );
 }
 } // namespace
 
@@ -250,6 +259,7 @@ firing_scope::firing_scope( const Character &shooter, const item &gun, const map
     firing = plan && plan->gun == &gun && plan->target == here.get_abs( target ) && wielded &&
              wielded.get_item() == &gun && gun.gun_current_mode().target == &gun;
     first_used = false;
+    asks_this_pull = 0;
 }
 
 firing_scope::~firing_scope()
@@ -257,6 +267,7 @@ firing_scope::~firing_scope()
     if( avatar_ ) {
         firing = false;
         first_used = false;
+        asks_this_pull = 0;
         plan.reset();
     }
 }
@@ -297,7 +308,9 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
     };
     try {
         std::optional<shot_outcome> out;
-        if( p->fly ) {
+        if( p->fly && asks_this_pull >= asks_cap.load() ) {
+            n_capped++;     // past the cap: CDDA's own path, nothing asked (its coin-flip side for a wild miss)
+        } else if( p->fly ) {
             // 30 degrees at most, as the client clamps it, so both sides fly the same line
             const double err = std::isfinite( rolled_arcmin ) ? std::clamp( rolled_arcmin, 0.0, 1800.0 ) : 0.0;
             double angle = rng_float( 0.0, 360.0 );
@@ -315,6 +328,7 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
             std::optional<ui_answer> a;
             if( active() ) {
                 n_asked++;
+                asks_this_pull++;
                 a = ask( req );
             }
             // CDDA's deviated line: the aim line turned by the error's horizontal part, err * sin(angle), to the
@@ -443,12 +457,18 @@ std::optional<bodypart_id> planned_body_part( const Creature &target, const Crea
     return id;
 }
 
+void set_asks_per_pull( int n )
+{
+    asks_cap = std::clamp( n, 1, 64 );
+}
+
 shot_counts get_shot_counts()
 {
     shot_counts c;
     c.asked = n_asked.load();
     c.accepted = n_accepted.load();
     c.refused = n_refused.load();
+    c.capped = n_capped.load();
     c.planned = n_planned.load();
     c.parts = n_parts.load();
     c.spared = n_spared.load();
