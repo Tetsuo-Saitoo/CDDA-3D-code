@@ -133,6 +133,7 @@ struct clock_state {
     double timescale = 1.0;
     bool paused = false;
     std::string pause_reason;
+    bool auto_pause_hostiles = true;     // real time pauses when a new hostile comes into view
 };
 constexpr double min_timescale = 0.25;
 constexpr double max_timescale = 16.0;
@@ -142,6 +143,12 @@ void set_timescale( double scale );      // clamped to min..max; NaN means 1
 void set_paused( bool paused );          // client side; clears the reason
 // Sim side. Pauses with a reason (e.g. a monster came into view); only in real time.
 void auto_pause( const std::string &reason );
+// Auto-pause when a new hostile comes into view (game::mon_info_update, where CDDA's safe mode would stop you).
+// Its own setting, on by default: FP3D games start with CDDA's safe mode off (boot.cpp), and real time still
+// stops for a hostile unless the client turns this off. Client side.
+void set_auto_pause_hostiles( bool on );
+// Sim side: a new hostile came into view; pauses real time ("hostile spotted") if the setting is on.
+void hostile_spotted();
 // Sim side, at every turn advance: blocks while paused and paces real time. Throws shutdown_signal.
 // `watched`: paced in real time in both modes, for an activity the player watches happen (a liquid fill).
 void pace_turn( bool fast_forward, bool watched = false );
@@ -209,6 +216,13 @@ constexpr const char *save_action = "fp3d_save";
 // Sim side. Takes the wanted save: nullopt if none, else its only_if_changed. note_saved() records the result.
 std::optional<bool> take_save_request();
 void note_saved( bool ok );
+
+// Main-loop jobs: changes the client asks for that must run between turns (cheats and the test kit, cheats.h).
+// The client side keeps the details and calls want_job(); ask() answers the main loop's next timed request with
+// job_action (also while paused, after a wanted save) and input_context runs them, then asks again. Only the
+// bridge sets `queued`, so a client can't send it itself. Client side; false after shutdown.
+constexpr const char *job_action = "fp3d_job";
+bool want_job();
 
 // Diagnostics: input polls answered with a timeout (they never reach the client), counted per place.
 void note_poll( const std::string &where );

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -28,6 +29,7 @@
 #include "do_turn.h"
 #include "fp3d/boot.h"
 #include "fp3d/bridge.h"
+#include "fp3d/cheats.h"
 #include "fp3d/game_access.h"
 #include "fp3d/held.h"
 #include "fp3d/points.h"
@@ -36,11 +38,13 @@
 #include "fp3d/snapshot.h"
 #include "game.h"
 #include "item.h"
+#include "math_parser_diag_value.h"
 #include "map.h"
 #include "mapdata.h"
 #include "messages.h"
 #include "monster.h"
 #include "npc.h"
+#include "path_info.h"
 #include "pocket_type.h"
 #include "rng.h"
 #include "type_id.h"
@@ -65,6 +69,9 @@ const itype_id itype_9mm( "9mm" );
 const itype_id itype_bag_plastic( "bag_plastic" );
 const itype_id itype_bottle_plastic( "bottle_plastic" );
 const itype_id itype_1l_gold( "1l_gold" );
+const itype_id itype_remington_870( "remington_870" );
+const itype_id itype_scar_l( "scar_l" );
+const itype_id itype_backpack_giant( "backpack_giant" );
 const ter_str_id ter_t_water_sh( "t_water_sh" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
@@ -95,6 +102,11 @@ struct observed {
     int moves = 0;
     int speed = 100;
     int bag_rocks = 0;       // item checks: rocks inside a plastic bag lying west
+    int carried_9mm = 0;     // item checks 2: 9 mm rounds carried outside guns and magazines
+    int carry_kg = 0;        // cheat checks: the avatar's weight capacity
+    int torso_hp_lost = -1;  // ... hp the torso lost to a 10 damage hit (-1: not probed)
+    int kit_guns = 0;        // ... carried Glock 19, Remington 870 and SCAR-L with ammo loaded
+    bool big_pack = false;   // ... the kit's big backpack, worn (or carried when CDDA won't let it be worn)
     std::vector<std::string> messages;
 };
 std::mutex observed_mutex;
@@ -102,6 +114,12 @@ observed last_observed;
 std::string sim_error;
 std::atomic<int> loads{ 0 };
 std::atomic<bool> spawn_zombie{ false };
+std::atomic<bool> clear_zombies_now{ false };  // safe mode checks: remove all monsters before the next request
+std::atomic<int> new_game_safe_mode{ -1 };     // g->safe_mode at the new game's first main-loop request
+std::atomic<int> loaded_safe_mode{ -1 };       // ... and at the first one after the reload
+std::atomic<bool> cheat_probe{ false };
+std::atomic<int> world_name_failures{ -1 };     // world name checks at boot (-1: not run)
+std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed in the gun safe         // cheat checks: hit the torso, wield an empty Glock
 // Hand checks: 1 = a zombie to the west and a rock in hand, 2 = a two-handed flail in hand, 3 = a hose in hand,
 // an empty jerrycan carried and a one-tile vehicle north with 4 L of gasoline in a small tank, 4 = a zombie west,
 // 5 = zombies gone and a spare hose carried, 6 = the spare hose dropped here, 7 = picked up again, 8 = the jerrycan
@@ -117,6 +135,9 @@ void observe()
     map &here = get_map();
     const tripoint_bub_ms p = u.pos_bub();
     static int zombies_placed = 0;
+    if( clear_zombies_now.exchange( false ) ) {
+        g->clear_zombies();
+    }
     if( spawn_zombie.exchange( false ) &&
         g->place_critter_at( mon_zombie, p + tripoint_rel_ms( -4, -4, 0 ) ) != nullptr ) {
         zombies_placed++;
@@ -230,10 +251,61 @@ void observe()
             u.i_add( bottle );
             break;
         }
+        case 13: {
+            // A locked gun safe south (sealed: never seen into or reached by hand) with a rock whose handle a
+            // client could know from before, a dresser three squares north (seen into only from next to it), a
+            // zombie corpse east, 20 rounds of 9 mm in the pack.
+            const tripoint_bub_ms s = p + tripoint_rel_ms( 0, 1, 0 );
+            here.i_clear( s );
+            here.furn_set( s, furn_str_id( "f_gunsafe_ml" ) );
+            item hidden( itype_rock );
+            hidden.set_var( "fp3d_uid", "777" );
+            here.add_item( s, hidden );
+            sealed_items = static_cast<int>( here.i_at( s ).size() );
+            const tripoint_bub_ms n = p + tripoint_rel_ms( 0, -3, 0 );
+            here.i_clear( n );
+            here.furn_set( n, furn_str_id( "f_dresser" ) );
+            here.add_item( n, item( itype_rock ) );
+            here.add_item( p + tripoint_rel_ms( 1, 0, 0 ), item::make_corpse( mon_zombie ) );
+            get_avatar().i_add( item( itype_9mm, calendar::turn, 20 ) );
+            // FP3D vars of other types than ours (a save edited by hand): read as none, no debug message.
+            item typed( itype_rock );
+            typed.set_var( "fp3d_uid", diag_value( 5.0 ) );
+            typed.set_var( "fp3d_spot", diag_value( 1.0 ) );
+            here.add_item( p + tripoint_rel_ms( 0, -1, 0 ), typed );
+            item marked( itype_rock );
+            marked.set_var( "fp3d_offhand", diag_value( std::string( "x" ) ) );
+            get_avatar().i_add( marked );
+            break;
+        }
         default:
             break;
     }
     observed o;
+    if( cheat_probe.exchange( false ) ) {
+        const bodypart_id torso = bodypart_str_id( "torso" ).id();
+        const int before = u.get_hp( torso );
+        get_avatar().apply_damage( nullptr, torso, 10 );
+        o.torso_hp_lost = before - u.get_hp( torso );
+        item empty( itype_glock_19 );
+        empty.ammo_set( itype_9mm );
+        empty.ammo_unset();
+        get_avatar().set_wielded_item( empty );
+    }
+    o.carry_kg = static_cast<int>( units::to_kilogram( u.weight_capacity() ) );
+    for( const item_location &it : get_avatar().all_items_loc() ) {
+        if( it->typeId() == itype_9mm && !( it.has_parent() && ( it.parent_item()->is_gun() ||
+                                            it.parent_item()->is_magazine() ) ) ) {
+            o.carried_9mm += it->charges;
+        }
+    }
+    for( const item_location &it : get_avatar().all_items_loc() ) {
+        if( ( it->typeId() == itype_glock_19 || it->typeId() == itype_remington_870 ||
+              it->typeId() == itype_scar_l ) && it->ammo_remaining() > 0 ) {
+            o.kit_guns++;
+        }
+        o.big_pack = o.big_pack || it->typeId() == itype_backpack_giant;
+    }
     o.zombies_placed = zombies_placed;
     o.visible = static_cast<int>( u.get_visible_creatures( 60 ).size() );
     o.safe_mode = static_cast<int>( g->safe_mode );
@@ -338,10 +410,35 @@ void build_scene()
     g->clear_zombies();
 }
 
+// A fresh world gets a folder of its own (boot.h): names in use are found ignoring case, folders CDDA doesn't
+// list included; only "fp3d-" worlds are replaceable. Run on the sim thread right after boot.
+int check_world_names()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what ) {
+        std::printf( "  worlds: %-38s %s\n", what, ok ? "PASS" : "FAIL" );
+        failed += ok ? 0 : 1;
+    };
+    check( fp3d::world_name_taken( "FP3D-SIM" ) == std::optional<std::string>( "fp3d-sim" ),
+           "a listed world, other case" );
+    check( !fp3d::world_name_taken( "fp3d-sim-free" ), "a free name" );
+    const std::filesystem::path odd = std::filesystem::u8path( PATH_INFO::savedir() ) / "Unlisted-Fp3d";
+    std::error_code ec;
+    std::filesystem::create_directories( odd, ec );
+    check( !ec && fp3d::world_name_taken( "unlisted-fp3d" ) == std::optional<std::string>( "Unlisted-Fp3d" ),
+           "an unlisted folder, other case" );
+    std::filesystem::remove_all( odd, ec );
+    check( fp3d::replaceable_world( "fp3d-live" ) && !fp3d::replaceable_world( "fp3d-" ) &&
+           !fp3d::replaceable_world( "World" ) && !fp3d::replaceable_world( "FP3D-live" ),
+           "only fp3d- worlds replaceable" );
+    return failed;
+}
+
 void sim_main()
 {
     try {
         fp3d::boot_world( "fp3d-sim", true );
+        world_name_failures = check_world_names();
         std::printf( "sim: data loaded, starting game\n" );
         // The real new-game path: calendar, start location, starting items, game mode.
         if( !fp3d_game_access::start_game( *g ) ) {
@@ -1260,6 +1357,60 @@ static bool run_item_checks()
     drop.item = { gold.uid, gold.type };
     res = run( drop );
     check( res.back && res.spent == 0 && has( res.msg, "don't have" ), "drop: not carried any more", show( res ) );
+
+    // Sealed furniture keeps its contents from hands and eyes; closed containers show theirs only from next to
+    // them; a stack put where it already is stays one stack; forbidden pockets (a corpse's) take nothing.
+    r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "second scene", "" );
+        return false;
+    }
+    hand_setup = 13;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const fp3d::ui_point south{ here.x, here.y + 1, here.z };
+    const fp3d::ui_point north3{ here.x, here.y - 3, here.z };
+    const fp3d::ui_point east{ here.x + 1, here.y, here.z };
+    const fp3d::ui_point north{ here.x, here.y - 1, here.z };
+    const std::vector<fp3d::item_handle_view> on_east = handles_at( east );
+    const std::vector<fp3d::item_handle_view> typed = handles_at( north );
+    check( r && typed.size() == 1 && typed[0].uid != 0 && typed[0].uid != 5 && typed[0].spot_x == -1 &&
+           !fp3d::latest_held().off.held, "vars of other types read as none",
+           typed.empty() ? "none" : std::to_string( typed[0].uid ) );
+    check( r && sealed_items == 1 && handles_at( south ).empty() && handles_at( north3 ).empty() &&
+           on_east.size() == 1, "sealed and distant container contents hidden",
+           std::to_string( sealed_items ) + " in the safe" );
+    take.item = { 777, t_rock };
+    take.pos = south;
+    take.hand = fp3d::item_hand::pack;
+    res = run( take );
+    check( res.back && res.spent == 0 && has( res.msg, "get at" ), "take: out of a locked gun safe", show( res ) );
+    put.item = { rock_b.uid, rock_b.type };
+    put.container = { 777, t_rock };
+    put.pos = south;
+    put.pocket = -1;
+    res = run( put );
+    check( res.back && res.spent == 0 && has( res.msg, "get at" ), "put: into a locked gun safe", show( res ) );
+    const fp3d::carried_view rounds = carried_type( type_of( "9mm" ), 0 );
+    const int before = snapshot().carried_9mm;
+    put.item = { rounds.uid, rounds.type };
+    put.container = { rounds.parent, carried( rounds.parent ).type };
+    put.pocket = rounds.pocket;
+    res = run( put );
+    put.pocket = -1;
+    const result again = run( put );
+    const int after = snapshot().carried_9mm;
+    check( rounds.uid != 0 && rounds.parent != 0 && before == 20 && after == 20 && res.spent == 0 &&
+           again.spent == 0 && has( res.msg, "already" ) && has( again.msg, "already" ),
+           "put: a stack where it already is", std::to_string( before ) + " -> " + std::to_string( after ) +
+           " rounds " + show( res ) );
+    put.item = { rock_b.uid, rock_b.type };
+    put.container = { on_east.empty() ? 0 : on_east[0].uid, on_east.empty() ? 0 : on_east[0].type };
+    put.pos = east;
+    put.pocket = 0;
+    res = run( put );
+    check( res.back && res.spent == 0 && has( res.msg, "no such pocket" ) && carried( rock_b.uid ).uid != 0,
+           "put: a corpse's forbidden pocket", show( res ) );
     return failed == 0;
 }
 
@@ -1277,11 +1428,11 @@ static bool run_queue_checks()
     }
     std::vector<fp3d::event> evs;
     fp3d::drain_events( evs );
+    loaded_safe_mode = snapshot().safe_mode;
 
-    // One bad action, safe mode off (the real-time goal's zombie is still in view and safe mode refuses to
-    // pass time near it), then three turns of waiting, all without answering a request.
+    // One bad action, then three turns of waiting, all without answering a request. The real-time goal's zombie
+    // is still in view: CDDA's safe mode would refuse to pass time near it, but it is off in FP3D games.
     fp3d::queue_action( "no_such_action" );
-    fp3d::queue_action( "safemode" );
     for( int i = 0; i < 3; i++ ) {
         fp3d::queue_action( "pause" );
     }
@@ -1296,9 +1447,9 @@ static bool run_queue_checks()
             msgs += " | " + e.text;
         }
     }
-    const bool ran = r1 && r1->timed && r1->id >= r0->id + 5 && r1->turn >= r0->turn + 2 &&
+    const bool ran = r1 && r1->timed && r1->id >= r0->id + 4 && r1->turn >= r0->turn + 2 &&
                      fp3d::queued_actions() == 0;
-    check( ran, "5 queued actions, no answers", r1 ? "turns +" + std::to_string( r1->turn - r0->turn ) +
+    check( ran, "4 queued actions, no answers", r1 ? "turns +" + std::to_string( r1->turn - r0->turn ) +
            ", requests +" + std::to_string( r1->id - r0->id ) + ( ran ? "" : msgs ) : "no request" );
     check( told, "bad action dropped with a message", "" );
     if( !r1 ) {
@@ -1324,6 +1475,166 @@ static bool run_queue_checks()
     check( accepted == static_cast<int>( fp3d::max_queued_actions ) && fp3d::queued_actions() == 0,
            "full queue refuses, clear empties", std::to_string( accepted ) + " accepted" );
     fp3d::set_paused( false );
+    return failed == 0;
+}
+
+// Safe mode (2026-11-10): FP3D games start with CDDA's safe mode off, new and loaded (boot.cpp); the `safemode`
+// action (Shift+1) still toggles it; auto-pause on a new hostile is its own clock setting (bridge.h).
+static bool run_safemode_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  safe mode: %-36s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    check( new_game_safe_mode == SAFE_MODE_OFF, "off in a new game", std::to_string( new_game_safe_mode ) );
+    check( loaded_safe_mode == SAFE_MODE_OFF, "off in a loaded game", std::to_string( loaded_safe_mode ) );
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    // The toggle: on, then off again. The sim observes right before each request.
+    fp3d::queue_action( "safemode" );
+    r = fp3d::wait_request( 20000, r->id );
+    const int on = snapshot().safe_mode;
+    check( r && on != SAFE_MODE_OFF, "safemode action turns it on", std::to_string( on ) );
+    if( !r ) {
+        return false;
+    }
+    fp3d::queue_action( "safemode" );
+    r = fp3d::wait_request( 20000, r->id );
+    const int off = snapshot().safe_mode;
+    check( r && off == SAFE_MODE_OFF, "and off again", std::to_string( off ) );
+    if( !r ) {
+        return false;
+    }
+
+    // Auto-pause turned off: a new zombie comes into view in real time and the clock runs on. Monsters are
+    // cleared first (and two turns pass) so the zombie counts as newly seen.
+    clear_zombies_now = true;
+    for( int i = 0; i < 2 && r; i++ ) {
+        fp3d::queue_action( "pause" );
+        r = fp3d::wait_request( 20000, r->id );
+    }
+    if( !r ) {
+        check( false, "turns pass after clearing monsters", "" );
+        return false;
+    }
+    const int placed_before = snapshot().zombies_placed;
+    fp3d::set_auto_pause_hostiles( false );
+    fp3d::set_timescale( 4.0 );
+    fp3d::set_clock_mode( fp3d::clock_mode::real_time );
+    spawn_zombie = true;
+    const int64_t turn0 = r->turn;
+    const std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
+    while( ms_since( t ) < 2000 ) {
+        if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, r->id ) ) {
+            r = next;
+        }
+    }
+    const fp3d::clock_state c = fp3d::get_clock();
+    const observed o = snapshot();
+    check( o.zombies_placed > placed_before && o.visible > 0, "a new zombie in view", "seen " +
+           std::to_string( o.visible ) );
+    check( !c.paused && r->turn >= turn0 + 3 && !c.auto_pause_hostiles, "auto-pause off: real time runs on",
+           "turns +" + std::to_string( r->turn - turn0 ) + ( c.paused ? ", paused: " + c.pause_reason : "" ) );
+    fp3d::set_auto_pause_hostiles( true );
+    fp3d::set_clock_mode( fp3d::clock_mode::turn_based );
+    fp3d::set_paused( false );
+    check( fp3d::get_clock().auto_pause_hostiles, "auto-pause back on", "" );
+    return failed == 0;
+}
+
+// Cheats and the test kit (fp3d/cheats.h, 2026-11-10): all off at first; names checked exactly; each one on, the
+// invincible / weight / ammo ones seen working; the kit handed out; all off again.
+static bool run_cheat_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  cheats: %-38s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    // The scene gives the avatar DEBUG_NIGHTVISION (dark starts), which is the night_vision cheat.
+    const fp3d::cheats_view first = fp3d::latest_cheats();
+    const uint32_t scene = 1U << static_cast<int>( fp3d::cheat::night_vision );
+    check( first.seq > 0 && first.on == scene, "all off in a normal game (but the scene's)",
+           std::to_string( first.on ) );
+    bool names_ok = true;
+    for( const char *bad : {
+             "", "INVINCIBLE", "invincible ", " invincible", "invincible\n", "god", "unlimited_ammo2",
+             "no_needs\x01"
+         } ) {
+        names_ok = names_ok && !fp3d::cheat_from_name( bad );
+    }
+    names_ok = names_ok && !fp3d::cheat_from_name( std::string( 100000, 'a' ) ) &&
+               fp3d::cheat_from_name( "night_vision" ) == fp3d::cheat::night_vision;
+    check( names_ok, "only exact names accepted", "" );
+    check( !fp3d::queue_action( fp3d::job_action ) && !fp3d::queue_action( fp3d::save_action ) &&
+           !fp3d::queue_action( fp3d::item_action_name ), "bridge's own actions can't be queued", "" );
+    check( !fp3d::request_cheat( fp3d::cheat::count, true ) &&
+           !fp3d::request_cheat( static_cast<fp3d::cheat>( 200 ), true ), "out-of-range cheat refused", "" );
+
+    // All on: applied at the main loop's next request (the sim asks again right after).
+    for( size_t i = 0; i < fp3d::cheat_count; i++ ) {
+        fp3d::request_cheat( static_cast<fp3d::cheat>( i ), true );
+    }
+    r = fp3d::wait_request( 20000, r->id );
+    const uint32_t all = ( 1U << fp3d::cheat_count ) - 1;
+    const fp3d::cheats_view on = fp3d::latest_cheats();
+    check( r && on.on == all, "all on", std::to_string( on.on ) );
+    if( !r ) {
+        return false;
+    }
+
+    // Probe: a 10 damage hit on the torso and an empty Glock wielded, then a turn passes (the gun refills).
+    cheat_probe = true;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const observed hit = snapshot();
+    if( r ) {
+        fp3d::queue_action( "pause" );
+        r = fp3d::wait_request( 20000, r->id );
+    }
+    const observed after = snapshot();
+    check( hit.torso_hp_lost == 0, "invincible: a hit does nothing", std::to_string( hit.torso_hp_lost ) );
+    check( hit.carry_kg >= 10000, "no weight limit", std::to_string( hit.carry_kg ) + " kg" );
+    check( r && after.ammo >= 15, "unlimited ammo refills the empty Glock", std::to_string( after.ammo ) );
+    if( !r ) {
+        return false;
+    }
+
+    // The test kit.
+    const uint64_t kits = fp3d::latest_cheats().kits_given;
+    check( fp3d::request_test_kit(), "test kit asked for", "" );
+    r = fp3d::wait_request( 20000, r->id );
+    const observed kit = snapshot();
+    check( r && fp3d::latest_cheats().kits_given == kits + 1 && kit.big_pack && kit.kit_guns >= 3,
+           "test kit: big pack, 3 loaded guns", std::to_string( kit.kit_guns ) + " guns" );
+    if( !r ) {
+        return false;
+    }
+
+    // All off again; the probe now hurts.
+    for( size_t i = 0; i < fp3d::cheat_count; i++ ) {
+        fp3d::request_cheat( static_cast<fp3d::cheat>( i ), false );
+    }
+    r = fp3d::wait_request( 20000, r->id );
+    check( r && fp3d::latest_cheats().on == 0, "all off again", std::to_string( fp3d::latest_cheats().on ) );
+    if( !r ) {
+        return false;
+    }
+    cheat_probe = true;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const observed hurt = snapshot();
+    check( r && hurt.torso_hp_lost > 0 && hurt.carry_kg < 1000, "off: a hit hurts, normal weight limit",
+           std::to_string( hurt.torso_hp_lost ) + " hp, " + std::to_string( hurt.carry_kg ) + " kg" );
     return failed == 0;
 }
 
@@ -1374,6 +1685,9 @@ int main()
         }
         requests++;
         drain();
+        if( req->timed && new_game_safe_mode < 0 ) {
+            new_game_safe_mode = snapshot().safe_mode;
+        }
         if( req->timed && issued ) {
             // Back in the main loop after issuing the goal's action: check the result.
             const goal &gl = goals[g_idx];
@@ -1414,10 +1728,12 @@ int main()
     }
     drain();
     const bool queue_ok = g_idx == n_goals && run_queue_checks();
-    const bool hands_ok = queue_ok && run_hand_checks();
+    const bool safemode_ok = queue_ok && run_safemode_checks();
+    const bool hands_ok = safemode_ok && run_hand_checks();
     const bool siphon_ok = hands_ok && run_siphon_checks();
     const bool shoot_ok = siphon_ok && run_shoot_checks();
     const bool items_ok = shoot_ok && run_item_checks();
+    const bool cheats_ok = items_ok && run_cheat_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -1447,11 +1763,16 @@ int main()
                  count( event_kind::message ), count( event_kind::sound ), count( event_kind::projectile ),
                  count( event_kind::anim ), count( event_kind::attack ), events_dropped );
     std::printf( "queue: %s\n", queue_ok ? "ok" : "BAD" );
+    std::printf( "safe mode: %s\n", safemode_ok ? "ok" : "BAD" );
     std::printf( "hands: %s\n", hands_ok ? "ok" : "BAD" );
     std::printf( "siphon: %s\n", siphon_ok ? "ok" : "BAD" );
     std::printf( "shoot: %s\n", shoot_ok ? "ok" : "BAD" );
     std::printf( "items: %s\n", items_ok ? "ok" : "BAD" );
-    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && hands_ok && siphon_ok &&
-           shoot_ok && items_ok ?
+    std::printf( "cheats: %s\n", cheats_ok ? "ok" : "BAD" );
+    const bool worlds_ok = world_name_failures == 0;
+    std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
+    return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
+           siphon_ok &&
+           shoot_ok && items_ok && cheats_ok && worlds_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

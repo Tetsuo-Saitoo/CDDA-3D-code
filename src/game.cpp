@@ -4855,8 +4855,8 @@ void game::mon_info_update( )
         turnssincelastmon = 0_turns;
         if( safe_mode == SAFE_MODE_ON ) {
             set_safe_mode( SAFE_MODE_STOP );
-            fp3d::auto_pause( "hostile spotted" ); // FP3D: real time stops like safe mode does
         }
+        fp3d::hostile_spotted(); // FP3D: real time stops for a new hostile (own setting; safe mode is off in FP3D)
     } else if( calendar::turn > previous_turn && get_option<bool>( "AUTOSAFEMODE" ) &&
                newseen == 0 ) { // Auto safe mode, but only if it's a new turn
         turnssincelastmon += calendar::turn - previous_turn;
