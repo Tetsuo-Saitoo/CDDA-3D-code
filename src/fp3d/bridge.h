@@ -29,6 +29,7 @@ enum class request_kind : int {
     target,       // pick a square, plus an action when aiming (look_around, target_ui)
     world_setup,  // new world settings + mods: `text` is the catalog JSON, the answer's `text` the choices (worldgen.h)
     chargen,      // create a character: `text` is the catalog JSON, the answer's `text` the choices JSON (chargen.h)
+    shot,         // one projectile of a client-flown trigger pull: CDDA's rolled error; answered with `shot` (shot.h)
 };
 const char *kind_name( request_kind k );
 
@@ -67,14 +68,20 @@ struct ui_request {
     int64_t turn = 0;                    // game turns since the cataclysm
     bool paused = false;                 // clock paused (pause_reason says why if the sim paused it)
     std::string pause_reason;
+    float shot_error = 0.0f;             // shot: the error CDDA rolled for this projectile, arcmin
+    float shot_angle = 0.0f;             // shot: which way off the sight line, degrees (0 up, 90 the shooter's right)
+    float dispersion = 0.0f;             // target (fire): max error after aiming in the current mode; shot: max, arcmin
+    float dispersion_typical = 0.0f;     // target (fire): the average error, arcmin (0 = not sent)
+    bool weapon_wielded = false;         // target (fire): the gun aimed is the avatar's wielded item
 };
 
-// A shot the client flew itself (target requests, with FIRE): see fp3d/shot.h.
+// A shot the client flew itself (target requests with FIRE, and shot requests): see fp3d/shot.h.
 struct shot_answer {
     ui_point end;                        // absolute square where the bullet stopped
     uint64_t hit_uid = 0;                // creature hit, 0 = miss
     std::string part;                    // body part / weak point id, "" = CDDA picks
     float quality = 0.3f;                // 0 dead centre .. <1 grazing
+    bool fly = false;                    // target: send a `shot` request for each projectile of this trigger pull
 };
 
 struct ui_answer {

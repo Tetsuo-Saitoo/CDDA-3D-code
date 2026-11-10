@@ -1015,12 +1015,8 @@ int Character::fire_gun( const tripoint_bub_ms &target, int shots )
 int Character::fire_gun( map &here, const tripoint_bub_ms &target, int shots, item &gun,
                          item_location ammo )
 {
-    // FP3D: a client-decided shot covers this one trigger pull only
-    struct fp3d_plan_done {
-        ~fp3d_plan_done() {
-            fp3d::clear_shot_plan();
-        }
-    } fp3d_plan_done_now;
+    // FP3D: the client's shot plan covers the avatar's one trigger pull with its wielded gun
+    const fp3d::firing_scope fp3d_firing( *this, gun );
     if( !gun.is_gun() ) {
         debugmsg( "%s tried to fire non-gun (%s).", get_name(), gun.tname() );
         return 0;
@@ -2710,6 +2706,13 @@ target_handler::trajectory target_ui::run()
     on_out_of_scope cleanup( [&here, &player_character]() {
         here.invalidate_map_cache( player_character.posz() + player_character.view_offset.z() );
     } );
+    // FP3D: a run that ends without a shot coming (cancel, reload, select, abort) drops the client's shot plan
+    bool fp3d_shot_coming = false;
+    on_out_of_scope fp3d_plan_cleanup( [&fp3d_shot_coming]() {
+        if( !fp3d_shot_coming ) {
+            fp3d::clear_shot_plan();
+        }
+    } );
 
     shared_ptr_fast<game::draw_callback_t> target_ui_cb = make_shared_fast<game::draw_callback_t>(
     [&]() {
@@ -2964,6 +2967,8 @@ target_handler::trajectory target_ui::run()
             break;
         }
     }
+    // FP3D: firing now, or aiming on to fire next turn
+    fp3d_shot_coming = loop_exit_code == ExitCode::Fire || loop_exit_code == ExitCode::Timeout;
 
     return traj;
 }
@@ -3011,13 +3016,25 @@ std::string target_ui::fp3d_ask()
             req.actions.emplace_back( "TOGGLE_UNLOAD_RAS_WEAPON" );
         }
     }
-    const fp3d::ui_answer a = fp3d::ask( req );
-    if( a.shot ) {
-        fp3d::set_shot_plan( { fp3d::to_abs_ms( a.shot->end ), a.shot->hit_uid, a.shot->part,
-                               static_cast<double>( a.shot->quality ) } );
-    } else {
-        fp3d::clear_shot_plan();
+    // Firing a gun: whether it is the wielded item, and its spread after aiming in the current mode, predicted as
+    // CDDA's aim panel does (fire_gun rolls total_gun_dispersion with the recoil reached).
+    const bool gun_fire = mode == TargetMode::Fire && relevant != nullptr && relevant->is_gun();
+    const item_location wielded = you->get_wielded_item();
+    req.weapon_wielded = gun_fire && wielded && wielded.get_item() == relevant;
+    if( gun_fire ) {
+        const item *gun = relevant->gun_current_mode().target;
+        gun = gun != nullptr ? gun : relevant;
+        const double recoil = predict_recoil( *you, *relevant, Target_attributes( src, dst ), sight_dispersion,
+                                              get_selected_aim_type(), you->recoil ).recoil;
+        const itype *ammo_type = gun->has_ammo() ? gun->ammo_data() : nullptr;
+        const int spread = ammo_type != nullptr && ammo_type->ammo ? static_cast<int>( ammo_type->ammo->shot_spread *
+                           gun->gun_shot_spread_multiplier() ) : 0;
+        const dispersion_sources d = you->total_gun_dispersion( *gun, recoil + you->recoil_vehicle(), spread );
+        req.dispersion = static_cast<float>( d.max() );
+        req.dispersion_typical = static_cast<float>( d.avg() );
     }
+    const fp3d::ui_answer a = fp3d::ask( req );
+    fp3d::clear_shot_plan();
     if( a.cancel ) {
         return "QUIT";
     }
@@ -3027,10 +3044,27 @@ std::string target_ui::fp3d_ask()
             set_cursor_pos( picked );
         }
     }
-    if( std::find( req.actions.begin(), req.actions.end(), a.action ) != req.actions.end() ) {
-        return a.action;
+    if( std::find( req.actions.begin(), req.actions.end(), a.action ) == req.actions.end() ) {
+        return "";
     }
-    return "";
+    // The client's shot counts for the avatar's wielded gun when the answer fires it (FIRE or an aim-and-shoot).
+    const bool fires = a.action == "FIRE" || std::any_of( aim_types.begin(), aim_types.end(),
+    [&a]( const aim_type & t ) {
+        return t.has_threshold && t.action == a.action;
+    } );
+    if( a.shot && req.weapon_wielded && fires ) {
+        fp3d::shot_plan p;
+        p.end = fp3d::to_abs_ms( a.shot->end );
+        p.hit_uid = a.shot->hit_uid;
+        p.part = a.shot->part;
+        p.quality = a.shot->quality;
+        p.turn = calendar::turn;
+        p.fly = a.shot->fly;
+        p.range = range;
+        p.targets = fp3d::shot_targets( dst_critter, targets );   // after the answer moved the cursor
+        fp3d::set_shot_plan( p );
+    }
+    return a.action;
 }
 
 void target_ui::fp3d_init_aim()
@@ -3886,6 +3920,9 @@ bool target_ui::action_aim_and_shoot( const std::string &action )
     if( it == aim_types.end() ) {
         debugmsg( "Could not find a valid aim_type for %s", action.c_str() );
         aim_mode = aim_types.begin();
+        // FP3D: fire as plain FIRE does instead of reading the threshold past the end of the list
+        set_last_target();
+        return true;
     }
     int aim_threshold = it->threshold;
     set_last_target();

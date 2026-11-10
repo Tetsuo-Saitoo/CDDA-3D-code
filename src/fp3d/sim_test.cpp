@@ -7,10 +7,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 #include <mutex>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -35,6 +38,7 @@
 #include "fp3d/events.h"
 #include "fp3d/snapshot.h"
 #include "game.h"
+#include "game_constants.h"
 #include "item.h"
 #include "map.h"
 #include "mapdata.h"
@@ -929,8 +933,9 @@ static bool run_shoot_checks()
            std::to_string( after.ammo ) );
     std::printf( "  shoot: zombie hp %d -> %d\n", before.zombie_hp, after.zombie_hp );
 
-    // Client-flown shots (fp3d/shot.h): a planned miss leaves the zombie as it was, a planned head hit
-    // always hurts it. Pistol reloaded, zombie restored each time (hand_setup 11).
+    // Client-flown shots (fp3d/shot.h): a planned miss that stops short leaves the zombie as it was; a planned
+    // head hit fires (CDDA's roll decides whether it lands: run_combat_checks covers that). Pistol reloaded,
+    // zombie restored each time (hand_setup 11).
     const auto client_shot = [&]( bool hit ) {
         hand_setup = 11;
         std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
@@ -951,12 +956,12 @@ static bool run_shoot_checks()
             a.id = c->id;
             if( c->kind == fp3d::request_kind::target && n == 1 ) {
                 fp3d::shot_answer s;
-                // a miss stops 2 squares north of the zombie; a hit is in its head
-                s.end = fp3d::ui_point{ c->origin.x - 3, c->origin.y - ( hit ? 0 : 2 ), c->origin.z };
+                // a miss stops a square short of the zombie; a hit is in its head
+                s.end = fp3d::ui_point{ c->origin.x - ( hit ? 3 : 2 ), c->origin.y, c->origin.z };
                 s.hit_uid = hit ? b.zombie_uid : 0;
                 s.part = "head";
                 s.quality = 0.1f;
-                a.pos = s.end;
+                a.pos = fp3d::ui_point{ c->origin.x - 3, c->origin.y, c->origin.z };
                 a.action = "FIRE";
                 a.shot = s;
             } else {
@@ -968,12 +973,15 @@ static bool run_shoot_checks()
         }
         return std::make_pair( b.zombie_hp, snapshot().zombie_hp );
     };
+    const fp3d::shot_counts c0 = fp3d::get_shot_counts();
     const auto miss = client_shot( false );
     check( miss.first > 0 && miss.second == miss.first, "client shot: planned miss",
            "hp " + std::to_string( miss.first ) + " -> " + std::to_string( miss.second ) );
     const auto head = client_shot( true );
-    check( head.first > 0 && head.second < head.first, "client shot: planned head hit",
-           "hp " + std::to_string( head.first ) + " -> " + std::to_string( head.second ) );
+    const fp3d::shot_counts c1 = fp3d::get_shot_counts();
+    check( head.first > 0 && head.second <= head.first && c1.planned == c0.planned + 2, "client shot: planned head hit",
+           "hp " + std::to_string( head.first ) + " -> " + std::to_string( head.second ) + ", plans used " +
+           std::to_string( c1.planned - c0.planned ) );
     return failed == 0;
 }
 
@@ -1327,6 +1335,466 @@ static bool run_queue_checks()
     return failed == 0;
 }
 
+// Client-flown shots (fp3d/shot.h, contracts/ui_requests.md): CDDA's dispersion roll decides each projectile and
+// the client's outcome can only lower it. Each case builds a scene on the sim thread (this function's own
+// before-ask hook, which also runs the shared observe() and is put back at the end), queues "fire" (or "throw"),
+// answers the target request with FIRE plus `shot` and each `shot` request as the case says, then checks game
+// state and the shot counters. "Skilled" scenes (gun skills 10, steady aim, the zombie adjacent) make CDDA's
+// roll hit, so a hit the client claims must land and a refused answer shows in the counters.
+static bool run_combat_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  combat: %-44s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct scene {
+        int zx = -1;                // the hostile zombie, squares from the avatar (0, 0 = none)
+        int zy = 0;
+        int sx = 0;                 // a second hostile zombie (0, 0 = none)
+        int sy = 0;
+        int fx = 0;                 // a friendly zombie (0, 0 = none)
+        int fy = 0;
+        int ax = 0;                 // where to aim (0, 0 = the hostile zombie)
+        int ay = 0;
+        int skill = 10;             // gun skills
+        bool steady = true;         // recoil 0; else at its max (no aim yet)
+        std::string gun = "glock_19";
+        std::string mode;           // gun mode, "" = its default
+        int moves = 0;              // moves left for the turn that fires (0 = a full turn)
+        bool armed = true;          // wield a loaded `gun`; else empty hands (throwing wields the rock)
+        bool rock = false;          // carry a rock to throw
+    };
+    struct seen {
+        int ammo = -1;
+        int hp = -1;                // the hostile zombie's hp (-1: none or gone)
+        int side_hp = -1;
+        int friendly_hp = -1;
+        uint64_t uid = 0;
+        uint64_t side_uid = 0;
+        uint64_t friendly_uid = 0;
+        int rocks = 0;              // rocks lying in the scene's area
+        bool has_plan = false;
+        int64_t turn = 0;
+        std::vector<std::string> messages;   // since the scene was set
+    };
+    struct state {
+        std::mutex mx;
+        std::optional<scene> want;  // the next scene to build
+        seen last;                  // observed before the newest request
+        uint64_t uids[3] = {};      // sim thread only
+    };
+    const std::shared_ptr<state> st = std::make_shared<state>();
+    const auto hook = [st]() {
+        std::optional<scene> sc;
+        {
+            std::lock_guard<std::mutex> lk( st->mx );
+            sc.swap( st->want );
+        }
+        avatar &u = get_avatar();
+        map &here = get_map();
+        const tripoint_bub_ms p = u.pos_bub();
+        if( sc ) {
+            g->clear_zombies();
+            for( int dx = -10; dx <= 2; dx++ ) {
+                for( int dy = -5; dy <= 5; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( here.inbounds( q ) && !here.veh_at( q ) ) {
+                        here.ter_set( q, ter_t_floor );
+                        here.furn_set( q, furn_str_id::NULL_ID() );
+                        if( q != p ) {
+                            here.i_clear( q );
+                        }
+                    }
+                }
+            }
+            u.set_all_parts_hp_to_max();
+            u.clear_effects();
+            for( const char *s : { "gun", "pistol", "smg", "throw" } ) {
+                u.set_skill_level( skill_id( s ), sc->skill );
+            }
+            u.recoil = sc->steady ? 0.0 : MAX_RECOIL;
+            if( sc->armed ) {
+                item gun( itype_id( sc->gun ) );
+                gun.ammo_set( itype_9mm );
+                if( !sc->mode.empty() ) {
+                    gun.gun_set_mode( gun_mode_id( sc->mode ) );
+                }
+                u.set_wielded_item( gun );
+            } else {
+                u.remove_weapon();
+            }
+            if( sc->rock ) {
+                u.i_add( item( itype_rock ) );
+            }
+            const auto place = [&]( int x, int y, bool friendly ) -> uint64_t {
+                if( x == 0 && y == 0 ) {
+                    return 0;
+                }
+                monster *m = g->place_critter_at( mon_zombie, p + tripoint_rel_ms( x, y, 0 ) );
+                if( m == nullptr ) {
+                    return 0;
+                }
+                if( friendly ) {
+                    m->friendly = -1;
+                }
+                return fp3d::creature_uid( *m );
+            };
+            st->uids[0] = place( sc->zx, sc->zy, false );
+            st->uids[1] = place( sc->sx, sc->sy, false );
+            st->uids[2] = place( sc->fx, sc->fy, true );
+            if( sc->moves > 0 ) {
+                u.set_moves( sc->moves );
+            }
+            Messages::clear_messages();
+            here.build_map_cache( p.z() );
+        }
+        observe();
+        seen o;
+        if( const item_location w = u.get_wielded_item() ) {
+            o.ammo = w->ammo_remaining();
+        }
+        o.uid = st->uids[0];
+        o.side_uid = st->uids[1];
+        o.friendly_uid = st->uids[2];
+        for( monster &m : g->all_monsters() ) {
+            const uint64_t id = fp3d::creature_uid( m );
+            if( id != 0 && id == o.uid ) {
+                o.hp = m.get_hp();
+            } else if( id != 0 && id == o.side_uid ) {
+                o.side_hp = m.get_hp();
+            } else if( id != 0 && id == o.friendly_uid ) {
+                o.friendly_hp = m.get_hp();
+            }
+        }
+        for( int dx = -10; dx <= 2; dx++ ) {
+            for( int dy = -5; dy <= 5; dy++ ) {
+                const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                if( q != p && here.inbounds( q ) ) {
+                    for( const item &it : here.i_at( q ) ) {
+                        o.rocks += it.typeId() == itype_rock ? 1 : 0;
+                    }
+                }
+            }
+        }
+        o.has_plan = fp3d::has_shot_plan();
+        o.turn = to_turns<int64_t>( calendar::turn - calendar::turn_zero );
+        for( const auto &m : Messages::recent_messages( 40 ) ) {
+            o.messages.push_back( m.second );
+        }
+        std::lock_guard<std::mutex> lk( st->mx );
+        st->last = std::move( o );
+    };
+    fp3d::set_before_ask_hook( hook );
+    struct restore_hook {
+        ~restore_hook() {
+            fp3d::set_before_ask_hook( observe );
+        }
+    } restore_now;
+    const auto seen_now = [st]() {
+        std::lock_guard<std::mutex> lk( st->mx );
+        return st->last;
+    };
+
+    // Who the client says its bullet hit, and the rest of its `shot`.
+    enum class who { none, zombie, side, friendly, ghost };
+    struct claim {
+        who hit = who::zombie;
+        int ex = 0;                 // a miss: where it stopped, squares from the avatar
+        int ey = 0;
+        std::string part = "head";
+        float quality = 0.05f;
+    };
+    const auto at = []( const fp3d::ui_request & r, int dx, int dy ) {
+        return fp3d::ui_point{ r.origin.x + dx, r.origin.y + dy, r.origin.z };
+    };
+    const auto make_shot = [&]( const claim & c, const scene & sc, const fp3d::ui_request & r, const seen & b,
+    bool fly ) {
+        fp3d::shot_answer s;
+        s.part = c.part;
+        s.quality = c.quality;
+        s.fly = fly;
+        switch( c.hit ) {
+            case who::zombie:
+                s.hit_uid = b.uid;
+                s.end = at( r, sc.zx, sc.zy );
+                break;
+            case who::side:
+                s.hit_uid = b.side_uid;
+                s.end = at( r, sc.sx, sc.sy );
+                break;
+            case who::friendly:
+                s.hit_uid = b.friendly_uid;
+                s.end = at( r, sc.fx, sc.fy );
+                break;
+            case who::ghost:
+                s.hit_uid = 0x7fffffffULL;
+                s.end = at( r, sc.zx, sc.zy );
+                break;
+            case who::none:
+                s.hit_uid = 0;
+                s.end = at( r, c.ex, c.ey );
+                break;
+        }
+        return s;
+    };
+
+    struct result {
+        seen before;
+        seen after;
+        fp3d::shot_counts c0;
+        fp3d::shot_counts c1;
+        std::optional<fp3d::ui_request> target;     // the first target request
+        std::vector<fp3d::ui_request> shots;        // the shot requests
+        bool back = false;                          // back in the main loop afterwards
+    };
+    // How the target request is answered: FIRE, an aim-and-shoot action, a cancel (all with the shot), or FIRE
+    // while throwing.
+    enum class answer_with { fire, aimed_shot, cancel };
+    // Builds `sc`, starts `action`, answers the target request with `with` and the FIRE answer's shot `plan` (with
+    // `fly`), and each shot request with `per` (nullopt: cancel).
+    const auto run = [&]( const scene & sc, const char *action, answer_with with, const claim & plan, bool fly,
+    const std::optional<claim> &per ) {
+        result r;
+        std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
+        if( !q || !q->timed ) {
+            return r;
+        }
+        {
+            std::lock_guard<std::mutex> lk( st->mx );
+            st->want = sc;
+        }
+        fp3d::queue_action( "pause" );
+        q = fp3d::wait_request( 20000, q->id );
+        if( !q || !q->timed ) {
+            return r;
+        }
+        r.before = seen_now();
+        r.c0 = fp3d::get_shot_counts();
+        fp3d::queue_action( action );
+        std::optional<fp3d::ui_request> c = fp3d::wait_request( 20000, q->id );
+        int n = 0;
+        while( c && !c->timed && n++ < 40 ) {
+            fp3d::ui_answer a;
+            a.id = c->id;
+            if( c->kind == fp3d::request_kind::target && !r.target ) {
+                r.target = *c;
+                a.pos = sc.ax != 0 || sc.ay != 0 ? at( *c, sc.ax, sc.ay ) : at( *c, sc.zx, sc.zy );
+                a.shot = make_shot( plan, sc, *c, r.before, fly );
+                a.cancel = with == answer_with::cancel;
+                a.action = "FIRE";
+                if( with == answer_with::aimed_shot ) {
+                    for( const std::string &act : c->actions ) {
+                        if( act.size() > 5 && act.compare( act.size() - 5, 5, "_SHOT" ) == 0 ) {
+                            a.action = act;   // the last one: the most careful aim
+                        }
+                    }
+                }
+            } else if( c->kind == fp3d::request_kind::shot ) {
+                r.shots.push_back( *c );
+                if( per ) {
+                    a.shot = make_shot( *per, sc, *c, r.before, false );
+                } else {
+                    a.cancel = true;
+                }
+            } else if( c->kind == fp3d::request_kind::item_select ) {
+                std::string label;
+                a.entry = first_entry_with( *c, "rock", label );
+                a.cancel = a.entry < 0;
+                print_request( *c, a.cancel ? "cancel" : label );
+            } else if( c->kind == fp3d::request_kind::popup && !c->actions.empty() ) {
+                a.action = has( c->actions, "YES" ) ? "YES" : c->actions.front();
+                print_request( *c, a.action );
+            } else {
+                a.cancel = true;   // aiming again after the shot, or anything else
+                if( c->kind != fp3d::request_kind::target ) {
+                    print_request( *c, "cancel" );
+                }
+            }
+            fp3d::answer( a );
+            const uint64_t id = c->id;
+            c = fp3d::wait_request( 20000, id );
+        }
+        r.back = c && c->timed;
+        r.after = seen_now();
+        r.c1 = fp3d::get_shot_counts();
+        std::vector<fp3d::event> evs;
+        fp3d::drain_events( evs );
+        return r;
+    };
+    const auto num = []( double v ) {
+        char buf[32];
+        std::snprintf( buf, sizeof( buf ), "%.1f", v );
+        return std::string( buf );
+    };
+    const auto counts = [&]( const result & r ) {
+        return "asked +" + std::to_string( r.c1.asked - r.c0.asked ) + " accepted +" +
+               std::to_string( r.c1.accepted - r.c0.accepted ) + " refused +" +
+               std::to_string( r.c1.refused - r.c0.refused ) + " planned +" +
+               std::to_string( r.c1.planned - r.c0.planned ) + " parts +" + std::to_string( r.c1.parts - r.c0.parts ) +
+               ", hp " + std::to_string( r.before.hp ) + " -> " + std::to_string( r.after.hp ) + ", ammo " +
+               std::to_string( r.before.ammo ) + " -> " + std::to_string( r.after.ammo ) + ( r.back ? "" : ", stuck" );
+    };
+    const auto delta = []( uint64_t a, uint64_t b ) {
+        return static_cast<int64_t>( b - a );
+    };
+    const auto fired = [&]( const result & r, int rounds ) {
+        return r.back && r.after.ammo == r.before.ammo - rounds;
+    };
+
+    const scene point_blank{};          // a zombie adjacent to the west, skilled
+    const claim head{};                 // hit the zombie in the head, quality 0.05
+
+    // Accepted: the target request tells the spread, the shot request CDDA's roll; the client's hit lands.
+    {
+        const result r = run( point_blank, "fire", answer_with::fire, head, true, head );
+        const fp3d::ui_request t = r.target.value_or( fp3d::ui_request() );
+        check( r.target && t.mode == "fire" && std::isfinite( t.dispersion ) && t.dispersion > 0.0f &&
+               t.dispersion_typical > 0.0f && t.weapon_wielded, "target request: dispersion, wielded",
+               "dispersion " + num( t.dispersion ) + " typical " + num( t.dispersion_typical ) );
+        const fp3d::ui_request s = r.shots.empty() ? fp3d::ui_request() : r.shots.front();
+        check( r.shots.size() == 1 && s.kind == fp3d::request_kind::shot && std::isfinite( s.shot_error ) &&
+               s.shot_error >= 0.0f && s.shot_angle >= 0.0f && s.shot_angle < 360.0f && s.dispersion > 0.0f &&
+               s.range > 0, "shot request: error, angle, dispersion", std::to_string( r.shots.size() ) +
+               " requests, error " + num( s.shot_error ) + " angle " + num( s.shot_angle ) + " max " +
+               num( s.dispersion ) + " range " + std::to_string( s.range ) );
+        check( fired( r, 1 ) && delta( r.c0.accepted, r.c1.accepted ) == 1 && r.after.hp < r.before.hp &&
+               !r.after.has_plan, "accepted hit (point blank, head, 0.05)", counts( r ) );
+    }
+    // Refused shot answers fall back to the FIRE answer's outcome (a head hit: it lands, CDDA's roll hits).
+    const auto refused = [&]( const char *what, const scene & sc, const claim & per ) {
+        const result r = run( sc, "fire", answer_with::fire, head, true, per );
+        check( fired( r, 1 ) && r.shots.size() == 1 && delta( r.c0.refused, r.c1.refused ) == 1 &&
+               delta( r.c0.accepted, r.c1.accepted ) == 0 && delta( r.c0.planned, r.c1.planned ) == 1 &&
+               r.after.hp < r.before.hp, what, counts( r ) );
+        return r;
+    };
+    {
+        claim nan_quality = head;
+        nan_quality.quality = std::nanf( "" );
+        refused( "refused: NaN quality", point_blank, nan_quality );
+        claim ghost = head;
+        ghost.hit = who::ghost;
+        refused( "refused: no such creature", point_blank, ghost );
+        claim outside = { who::none, -500, 0, "", 0.99f };
+        refused( "refused: end out of the bubble", point_blank, outside );
+        claim long_shot = { who::none, -40, 0, "", 0.99f };
+        refused( "refused: end beyond the gun's range", point_blank, long_shot );
+        scene with_side = point_blank;
+        with_side.sx = -3;
+        with_side.sy = 4;
+        claim side = head;
+        side.hit = who::side;
+        const result r = refused( "refused: a hit off CDDA's line", with_side, side );
+        check( r.before.side_hp > 0 && r.after.side_hp == r.before.side_hp, "  the creature off the line unhurt",
+               "hp " + std::to_string( r.before.side_hp ) + " -> " + std::to_string( r.after.side_hp ) );
+    }
+    // Cancelled shot requests too; the plan's outcome never goes beyond the first projectile of a burst.
+    {
+        const result r = run( point_blank, "fire", answer_with::fire, head, true, std::nullopt );
+        check( fired( r, 1 ) && delta( r.c0.refused, r.c1.refused ) == 1 && delta( r.c0.planned, r.c1.planned ) == 1 &&
+               r.after.hp < r.before.hp, "refused: cancel", counts( r ) );
+        scene burst = point_blank;
+        burst.gun = "hk_mp5";
+        burst.mode = "BURST";
+        const result b = run( burst, "fire", answer_with::fire, head, true, std::nullopt );
+        check( fired( b, 3 ) && b.shots.size() == 3 && delta( b.c0.asked, b.c1.asked ) == 3 &&
+               delta( b.c0.planned, b.c1.planned ) == 1, "burst: a shot request per round, plan once", counts( b ) );
+    }
+    // Parts: unknown or junk ids are ignored (CDDA picks), the hit still counts.
+    {
+        claim unknown = head;
+        unknown.part = "zz_no_such_part";
+        const result r = run( point_blank, "fire", answer_with::fire, head, true, unknown );
+        check( fired( r, 1 ) && delta( r.c0.accepted, r.c1.accepted ) == 1 && delta( r.c0.parts, r.c1.parts ) == 0 &&
+               r.after.hp < r.before.hp, "unknown part ignored", counts( r ) );
+        claim junk = head;
+        junk.part = std::string( 32, '#' ) + std::string( 32, '\xff' );
+        const result j = run( point_blank, "fire", answer_with::fire, head, true, junk );
+        check( fired( j, 1 ) && delta( j.c0.accepted, j.c1.accepted ) == 1 && delta( j.c0.parts, j.c1.parts ) == 0 &&
+               j.after.hp < j.before.hp, "64-byte junk part ignored", counts( j ) );
+    }
+    // The FIRE answer alone (no fly): a hit lands, a miss stops short of the zombie.
+    {
+        const result r = run( point_blank, "fire", answer_with::fire, head, false, std::nullopt );
+        check( fired( r, 1 ) && r.shots.empty() && delta( r.c0.planned, r.c1.planned ) == 1 &&
+               r.after.hp < r.before.hp, "FIRE answer: hit", counts( r ) );
+        scene three = point_blank;
+        three.zx = -3;
+        const claim short_miss = { who::none, -2, 0, "", 0.99f };
+        const result m = run( three, "fire", answer_with::fire, short_miss, false, std::nullopt );
+        check( fired( m, 1 ) && delta( m.c0.planned, m.c1.planned ) == 1 && m.before.hp > 0 &&
+               m.after.hp == m.before.hp, "FIRE answer: miss stops short", counts( m ) );
+    }
+    // Nothing stored: a cancel, a throw, a hit on a creature the request didn't offer, an outcome from an earlier turn.
+    {
+        const result c = run( point_blank, "fire", answer_with::cancel, head, true, std::nullopt );
+        check( c.back && c.after.ammo == c.before.ammo && c.shots.empty() && !c.after.has_plan &&
+               delta( c.c0.planned, c.c1.planned ) == 0 && c.after.hp == c.before.hp, "cancel with a shot: no plan",
+               counts( c ) );
+        scene throw_scene = point_blank;
+        throw_scene.zx = -3;
+        throw_scene.armed = false;
+        throw_scene.rock = true;
+        const result t = run( throw_scene, "throw", answer_with::fire, head, true, std::nullopt );
+        check( t.back && t.target && t.target->mode == "throw" && t.after.rocks > t.before.rocks &&
+               t.shots.empty() && !t.after.has_plan && delta( t.c0.planned, t.c1.planned ) == 0,
+               "throw with a shot: ignored", "rocks lying " + std::to_string( t.before.rocks ) + " -> " +
+               std::to_string( t.after.rocks ) + ", " + counts( t ) );
+        scene with_friend = point_blank;     // a friendly zombie on the line behind the hostile one
+        with_friend.zx = -3;
+        with_friend.fx = -5;
+        claim friend_hit = head;
+        friend_hit.hit = who::friendly;
+        const result f = run( with_friend, "fire", answer_with::fire, friend_hit, true, friend_hit );
+        check( fired( f, 1 ) && delta( f.c0.refused, f.c1.refused ) == 1 && delta( f.c0.planned, f.c1.planned ) == 0 &&
+               f.before.friendly_hp > 0 && f.after.friendly_hp == f.before.friendly_hp,
+               "hit on a creature not offered: ignored", "friendly hp " + std::to_string( f.before.friendly_hp ) +
+               " -> " + std::to_string( f.after.friendly_hp ) + ", " + counts( f ) );
+        scene slow = point_blank;           // no zombie; aiming from scratch with 2 moves left
+        slow.zx = 0;
+        slow.ax = -5;
+        slow.steady = false;
+        slow.moves = 2;
+        const claim on_line = { who::none, -4, 0, "", 0.99f };
+        const result e = run( slow, "fire", answer_with::aimed_shot, on_line, true, std::nullopt );
+        const int64_t shot_turn = e.shots.empty() ? -1 : e.shots.front().turn;
+        const int64_t aim_turn = e.target ? e.target->turn : -1;
+        check( fired( e, 1 ) && shot_turn > aim_turn && delta( e.c0.planned, e.c1.planned ) == 0 &&
+               delta( e.c0.asked, e.c1.asked ) == 1, "outcome from an earlier turn dropped", "aimed on turn " +
+               std::to_string( aim_turn ) + ", fired on " + std::to_string( shot_turn ) + ", " + counts( e ) );
+    }
+    // Unskilled and unaimed at 8 squares, the client claiming a dead-centre head shot every time: CDDA's roll
+    // decides, so these can't all be critical head shots.
+    {
+        scene far_zombie;
+        far_zombie.zx = -8;
+        far_zombie.skill = 0;
+        far_zombie.steady = false;
+        const claim dead_centre = { who::zombie, 0, 0, "head", 0.0f };
+        int shots = 0;
+        int crits = 0;
+        int hits = 0;
+        for( int i = 0; i < 20; i++ ) {
+            const result r = run( far_zombie, "fire", answer_with::fire, dead_centre, false, std::nullopt );
+            if( !fired( r, 1 ) ) {
+                continue;
+            }
+            shots++;
+            hits += r.after.hp < r.before.hp ? 1 : 0;
+            bool crit = false;
+            for( const std::string &m : r.after.messages ) {
+                crit = crit || m.find( "Critical" ) != std::string::npos || m.find( "in the head" ) != std::string::npos;
+            }
+            crits += crit ? 1 : 0;
+        }
+        check( shots == 20 && crits < shots, "20 claimed head shots: CDDA's roll decides",
+               std::to_string( shots ) + " fired, " + std::to_string( hits ) + " hit, " + std::to_string( crits ) +
+               " critical / head" );
+    }
+    return failed == 0;
+}
+
 int main()
 {
     std::setvbuf( stdout, nullptr, _IONBF, 0 );
@@ -1418,6 +1886,7 @@ int main()
     const bool siphon_ok = hands_ok && run_siphon_checks();
     const bool shoot_ok = siphon_ok && run_shoot_checks();
     const bool items_ok = shoot_ok && run_item_checks();
+    const bool combat_ok = items_ok && run_combat_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -1451,7 +1920,8 @@ int main()
     std::printf( "siphon: %s\n", siphon_ok ? "ok" : "BAD" );
     std::printf( "shoot: %s\n", shoot_ok ? "ok" : "BAD" );
     std::printf( "items: %s\n", items_ok ? "ok" : "BAD" );
+    std::printf( "combat: %s\n", combat_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && hands_ok && siphon_ok &&
-           shoot_ok && items_ok ?
+           shoot_ok && items_ok && combat_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

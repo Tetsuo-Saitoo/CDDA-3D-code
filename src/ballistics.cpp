@@ -278,13 +278,10 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         }
     }
 
-    // FP3D: the client flew this shot; its outcome replaces the dispersion roll
-    const fp3d::shot_plan *fp3d_plan = fp3d::shot_plan_for( origin );
-    if( fp3d_plan != nullptr ) {
-        aim.missed_by = fp3d_plan->hit_uid != 0 ? fp3d_plan->quality : 1.0;
-        aim.missed_by_tiles = 0.0;
-        aim.dispersion = 0.0;
-    }
+    // FP3D: the client's outcome for this projectile (fp3d/shot.h); the roll above decides whether it can hit
+    const fp3d::projectile_scope fp3d_shot( *here, origin, source, target_arg, aim.dispersion, dispersion.max(),
+                                            aim.missed_by );
+    const fp3d::shot_outcome *fp3d_out = fp3d_shot.outcome();
 
     // TODO: move to-hit roll back in here
 
@@ -323,13 +320,11 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
     double extend_to_range = no_overshoot ? range : proj_arg.range;
 
     tripoint_bub_ms target = target_arg;
-    if( fp3d_plan != nullptr ) { // FP3D: stop where the client's bullet stopped
-        const tripoint_bub_ms end = here->get_bub( fp3d_plan->end );
-        if( here->inbounds( end ) && end != source ) {
-            target = end;
-            range = rl_dist( source, target );
-            extend_to_range = range;
-        }
+    if( fp3d_out != nullptr ) { // FP3D: stop where the client's bullet stopped
+        target = fp3d_out->end;
+        range = rl_dist( source, target );
+        extend_to_range = range;
+        aim.missed_by_tiles = 0.0;
     }
     std::vector<tripoint_bub_ms> trajectory;
     if( aim.missed_by_tiles >= 1.0 ) {
@@ -550,8 +545,9 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                 cur_missed_by = std::max( rng_float( 0.1, 1.5 - aim.missed_by ) /
                                           critter->ranged_target_size(), 0.4 );
             }
-            if( fp3d_plan != nullptr && critter != nullptr ) { // FP3D: only the creature the client hit
-                cur_missed_by = fp3d::creature_uid( *critter ) == fp3d_plan->hit_uid ? fp3d_plan->quality : 1.0;
+            if( fp3d_out != nullptr && critter != nullptr ) { // FP3D: the client's hit counts for its creature only
+                cur_missed_by = fp3d::outcome_missed_by( *fp3d_out, *critter, cur_missed_by, tp == target_arg,
+                                aim.missed_by, spread * std::max( distance - 1, 0 ) );
             }
             // If the attack is shot, once we're past point-blank,
             // don't print normal hit msg.
