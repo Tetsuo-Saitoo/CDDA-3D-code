@@ -48,6 +48,7 @@
 #include "field_type.h"
 #include "flag.h"
 #include "flexbuffer_json.h"
+#include "fp3d/shot.h" // FP3D:
 #include "game.h"
 #include "game_constants.h"
 #include "gates.h"
@@ -450,6 +451,9 @@ void aim_activity_actor::finish( player_activity &act, Character &who )
 
     act.set_to_null();
     item_location weapon = get_weapon();
+    if( !weapon || aborted ) {
+        fp3d::clear_shot_plan(); // FP3D: aiming ended without a shot
+    }
     if( !weapon ) {
         restore_view();
         return;
@@ -490,6 +494,7 @@ void aim_activity_actor::finish( player_activity &act, Character &who )
 
 void aim_activity_actor::canceled( player_activity &/*act*/, Character &/*who*/ )
 {
+    fp3d::clear_shot_plan(); // FP3D: aiming interrupted or cancelled
     unload_RAS_weapon();
     restore_view();
 }

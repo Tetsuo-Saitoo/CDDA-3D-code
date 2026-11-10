@@ -1147,14 +1147,8 @@ projectile_attack_results Creature::select_body_part_projectile_attack(
     if( mon ) {
         fatal_hit = ret.max_damage * crit_multiplier > get_hp_max();
         ret.wp = mon->type->weakpoints.select_weakpoint( attack );
-        const fp3d::shot_plan *plan = fp3d::shot_plan_for( attack.source ); // FP3D: the part the client hit
-        if( plan != nullptr && plan->hit_uid == fp3d::creature_uid( *this ) ) {
-            for( const weakpoint &w : mon->type->weakpoints.weakpoint_list ) {
-                if( w.id == plan->part ) {
-                    ret.wp = &w;
-                    break;
-                }
-            }
+        if( const weakpoint *fp3d_wp = magic ? nullptr : fp3d::planned_weakpoint( *mon, attack, goodhit ) ) {
+            ret.wp = fp3d_wp; // FP3D: the client's weak point, when the hit is good enough to land there
         }
         crit_roll &= ret.wp->is_good && !ret.wp->id.empty();
         ret.is_headshot = !has_flag( mon_flag_NOHEAD ) && ret.wp->is_head;
@@ -1168,12 +1162,9 @@ projectile_attack_results Creature::select_body_part_projectile_attack(
         // Range is -0.5 to 1.5 -> missed_by will be [1, 0], so the rng addition to it
         // will push it to at most 1.5 and at least -0.5
         ret.bp_hit = get_anatomy()->select_body_part_projectile_attack( -0.5, 1.5, hit_value );
-        const fp3d::shot_plan *plan = fp3d::shot_plan_for( attack.source ); // FP3D: the part the client hit
-        if( !magic && plan != nullptr && plan->hit_uid == fp3d::creature_uid( *this ) && !plan->part.empty() ) {
-            const bodypart_str_id bp( plan->part );
-            if( bp.is_valid() && has_part( bp.id() ) ) {
-                ret.bp_hit = bp.id();
-            }
+        if( const std::optional<bodypart_id> fp3d_bp = magic ? std::nullopt :
+                fp3d::planned_body_part( *this, attack.source, goodhit ) ) {
+            ret.bp_hit = *fp3d_bp; // FP3D: the client's body part, when the hit is good enough to land there
         }
         crit_mod = get_crit_factor( ret.bp_hit );
         fatal_hit = ret.max_damage * crit_multiplier > get_hp_max( ret.bp_hit );

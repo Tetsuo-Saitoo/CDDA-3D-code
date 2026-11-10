@@ -147,6 +147,8 @@ const char *kind_name( request_kind k )
             return "world_setup";
         case request_kind::target:
             return "target";
+        case request_kind::shot:
+            return "shot";
     }
     return "?";
 }
@@ -210,9 +212,11 @@ ui_answer ask( ui_request req )
         }
         hook = c.before_ask;
     }
-    // Not again from a request asked inside the hook itself (CDDA's debug message prompt, say).
+    // Not again from a request asked inside the hook itself (CDDA's debug message prompt, say). A shot request
+    // skips it too: the client flies the shot against the figures it already shows, and a burst asks once per
+    // round while the game waits.
     static thread_local bool in_hook = false;
-    if( hook && !in_hook ) {
+    if( hook && !in_hook && req.kind != request_kind::shot ) {
         in_hook = true;
         try {
             hook();
@@ -321,15 +325,18 @@ ui_answer ask( ui_request req )
     if( a.pos && !( coord_ok( a.pos->x ) && coord_ok( a.pos->y ) && coord_ok( a.pos->z ) ) ) {
         a.pos.reset();
     }
-    // A client shot only answers a target request, lands somewhere real and names a short id.
-    if( a.shot && ( kind != request_kind::target ||
-                    !( coord_ok( a.shot->end.x ) && coord_ok( a.shot->end.y ) && coord_ok( a.shot->end.z ) ) ) ) {
+    // A client shot only answers a target or shot request, lands somewhere real, has a finite quality and
+    // names a short id. Only a target answer can ask for shot requests (`fly`).
+    if( a.shot && ( ( kind != request_kind::target && kind != request_kind::shot ) ||
+                    !( coord_ok( a.shot->end.x ) && coord_ok( a.shot->end.y ) && coord_ok( a.shot->end.z ) ) ||
+                    !std::isfinite( a.shot->quality ) ) ) {
         a.shot.reset();
     }
     if( a.shot ) {
         a.shot->part = sanitize_text( a.shot->part, 64 );
         // Not a number is not a quality: the worst one.
         a.shot->quality = std::isfinite( a.shot->quality ) ? std::clamp( a.shot->quality, 0.0f, 0.99f ) : 0.99f;
+        a.shot->fly = a.shot->fly && kind == request_kind::target;
     }
     return a;
 }

@@ -4,6 +4,7 @@
 
 #include <ctime>
 
+#include "fp3d/shot.h"
 #include "game.h"
 
 // FP3D: the one friend of `game` (declared in game.h). Keep this the only way fp3d code reaches game
@@ -13,10 +14,12 @@ class fp3d_game_access
     public:
         // The real new-game path (calendar, start location, starting items, game mode).
         static bool start_game( game &g ) {
+            fp3d::clear_shot_plan();
             return g.start_game();
         }
         // Loads a saved character into the active world; call g.setup() first (as the main menu does).
         static bool load_game( game &g, const save_t &save ) {
+            fp3d::clear_shot_plan();
             return g.load( save );
         }
         // CDDA's examine of one square (doors, furniture, vehicles, items), as the examine action does it.
