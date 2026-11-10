@@ -17,7 +17,9 @@
 // leaves the path to CDDA (its near miss along the aim line with its overshoot, or its wild miss; with `fly` the
 // wild miss turns to the side the shot request showed): the creatures it meets get CDDA's rolls, the aimed
 // square's one never better than CDDA's own (a CDDA miss stays a miss), and a creature whose own roll already
-// missed for the claim isn't rolled again. The planned part lands only if goodhit <= sqrt(its hit chance). CDDA
+// missed for the claim isn't rolled again. The planned part only weights CDDA's pick: it lands on a roll against
+// its own hit chance times up to aim_weight_max (dead centre), else CDDA's pick stands. With `fly` a trigger pull
+// asks for its first default_asks_per_pull projectiles; later ones take CDDA's own path unasked. CDDA
 // does everything else (ammo, recoil, noise, time, damage, armour, wounds).
 // The plan is dropped when the trigger pull ends or the aiming ends without one (aim_activity_actor).
 // Sim thread only, except get_shot_counts().
@@ -130,10 +132,18 @@ std::optional<bodypart_id> planned_body_part( const Creature &target, const Crea
         double goodhit );
 
 // Counters for tests and diagnostics; any thread.
+// A dead-centre hit makes the client's part this many times as likely as its own chance (1 for a graze).
+constexpr double aim_weight_max = 4.0;
+// `shot` requests per trigger pull at most (a long `fly` burst would stall the client one frame per round).
+constexpr int default_asks_per_pull = 8;
+// Tests only (not bound for the client): the cap, clamped to 1..64.
+void set_asks_per_pull( int n );
+
 struct shot_counts {
     uint64_t asked = 0;         // `shot` requests sent
     uint64_t accepted = 0;      // `shot` answers that passed the checks
     uint64_t refused = 0;       // `shot` answers cancelled, without a shot, or failing a check
+    uint64_t capped = 0;        // `fly` projectiles past the cap: CDDA's own path, not asked
     uint64_t planned = 0;       // FIRE-answer outcomes that passed the checks (first projectile)
     uint64_t parts = 0;         // client parts that landed
     uint64_t spared = 0;        // creatures met on the path that a claim's missed roll kept from a second roll

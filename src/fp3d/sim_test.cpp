@@ -2528,6 +2528,36 @@ static bool run_combat_checks()
         check( fired( n, 3 ) && n.shots.empty() && delta( n.c0.planned, n.c1.planned ) == 1,
                "burst without fly: plan for the first round only", counts( n ) );
     }
+    // A trigger pull asks for its first rounds only (the cap: 8 in play, 2 here): an MP5's 3-round burst with `fly`
+    // sends 2 shot requests; the third round takes CDDA's own path, unasked.
+    {
+        scene burst = point_blank;
+        burst.gun = "hk_mp5";
+        burst.mode = "BURST";
+        fp3d::set_asks_per_pull( 2 );
+        const result r = run( burst, "fire", answer_with::fire, head, true, std::nullopt );
+        fp3d::set_asks_per_pull( fp3d::default_asks_per_pull );
+        check( fired( r, 3 ) && r.shots.size() == 2 && delta( r.c0.asked, r.c1.asked ) == 2 &&
+               delta( r.c0.capped, r.c1.capped ) == 1, "burst past the request cap: CDDA's own path",
+               counts( r ) + ", " + std::to_string( r.shots.size() ) + " shot requests" );
+    }
+    // The client's part only weights CDDA's pick (QA): point blank, skilled, every hit claimed on the head dead
+    // centre; the head lands on some of them, not on all (a roll against its chance times 4).
+    {
+        const claim dead_head = { who::zombie, 0, 0, "head", 0.0f };
+        int hits = 0;
+        int landed = 0;
+        for( int i = 0; i < 16; i++ ) {
+            const result r = run( point_blank, "fire", answer_with::fire, dead_head, true, dead_head );
+            if( !fired( r, 1 ) || delta( r.c0.accepted, r.c1.accepted ) != 1 ) {
+                continue;
+            }
+            hits++;
+            landed += delta( r.c0.parts, r.c1.parts ) > 0 ? 1 : 0;
+        }
+        check( hits >= 10 && landed > 0 && landed < hits, "client part weights CDDA's pick",
+               "head landed on " + std::to_string( landed ) + " of " + std::to_string( hits ) + " claimed hits" );
+    }
     // Parts: unknown or junk ids are ignored (CDDA picks), the hit still counts.
     {
         claim unknown = head;
