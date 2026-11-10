@@ -97,6 +97,14 @@ struct vehicle_view {
     std::vector<vehicle_part_view> parts;         // cap 4096
 };
 
+struct worn_view {
+    uint32_t type = 0;                            // itype index
+    uint8_t layer = 0;                            // highest layer_level (0 personal .. 5 belted/aux)
+    uint8_t damage = 0;                           // item::damage_level(): 0 fine .. 5 nearly destroyed
+    uint8_t degradation = 0;                      // 0..255 of the itype's max degradation
+    std::vector<uint32_t> covers;                 // body_part indices
+};
+
 struct player_view {
     uint64_t uid = 0;
     ui_point pos;
@@ -114,6 +122,13 @@ struct player_view {
     int16_t pain = 0;
     int16_t morale = 0;
     uint32_t wielded = 0;
+    // Per body part, same order as body_parts: effect intensities (0 = none).
+    std::vector<uint8_t> bleed;
+    std::vector<uint8_t> bandaged;
+    std::vector<uint8_t> disinfected;
+    std::vector<uint8_t> bite;                    // 1 bitten wound
+    std::vector<uint8_t> infected;
+    std::vector<worn_view> worn;                  // inner to outer (CDDA's worn order); cap 64
 };
 
 struct environment_view {

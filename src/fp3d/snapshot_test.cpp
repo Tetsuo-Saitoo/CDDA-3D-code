@@ -3,6 +3,7 @@
 // revision, a zombie keeps its uid, and a map shift keeps everything matching. Exit code 0 = all checks pass.
 //
 // usage: fp3d-snapshot-test   (run from the cdda/ folder)
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -15,7 +16,9 @@
 #include "avatar.h"
 #include "cached_options.h"
 #include "coordinates.h"
+#include "calendar.h"
 #include "debug.h"
+#include "item.h"
 #include "fp3d/boot.h"
 #include "fp3d/points.h"
 #include "fp3d/snapshot.h"
@@ -125,6 +128,10 @@ int main()
         map &here = get_map();
         avatar &u = get_avatar();
         u.set_mutation( trait_DEBUG_NIGHTVISION );
+        u.clear_worn();
+        u.wear_item( item( itype_id( "tshirt" ) ), false );
+        u.wear_item( item( itype_id( "jacket_leather" ) ), false );
+        u.add_effect( efftype_id( "bandaged" ), 1_hours, bodypart_id( "arm_l" ) );
         refresh_caches();
         check( ter_str_id::NULL_ID().id().to_i() == 0 && furn_str_id::NULL_ID().id().to_i() == 0,
                "index 0 is t_null / f_null" );
@@ -135,6 +142,26 @@ int main()
         check_against_mapbuffer( *first, "full capture matches the submap buffer" );
         check( first->creatures.size() >= 1 && first->creatures[0].kind == 0 &&
                first->creatures[0].pos.x == first->player.pos.x, "player is the first creature" );
+        {
+            const fp3d::player_view &pv = first->player;
+            const size_t n = pv.body_parts.size();
+            bool covers_ok = true;
+            for( const fp3d::worn_view &w : pv.worn ) {
+                covers_ok = covers_ok && w.type != 0 && w.covers.size() <= n;
+            }
+            check( n > 0 && pv.bleed.size() == n && pv.bandaged.size() == n && pv.disinfected.size() == n &&
+                   pv.bite.size() == n && pv.infected.size() == n && covers_ok &&
+                   pv.worn.size() == 2 && pv.worn[0].layer <= pv.worn[1].layer &&
+                   pv.worn[0].type == fp3d::intern_id( fp3d::id_kind::itype, "tshirt" ),
+                   "player's worn items and wounds", std::to_string( pv.worn.size() ) + " worn" );
+            int bandaged = 0;
+            for( size_t i = 0; i < n; i++ ) {
+                if( pv.body_parts[i] == fp3d::intern_id( fp3d::id_kind::body_part, "arm_l" ) ) {
+                    bandaged = pv.bandaged[i];
+                }
+            }
+            check( bandaged > 0, "bandage on the left arm", std::to_string( bandaged ) );
+        }
 
         const std::shared_ptr<const fp3d::snapshot> again = timed_capture( ms );
         size_t shared = 0;

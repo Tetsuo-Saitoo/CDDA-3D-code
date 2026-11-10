@@ -15,6 +15,8 @@
 #include "character_id.h"
 #include "coordinates.h"
 #include "creature.h"
+#include "enums.h"
+#include "type_id.h"
 #include "field.h"
 #include "fp3d/id_tables.h"
 #include "fp3d/points.h"
@@ -272,6 +274,37 @@ void capture_player( const avatar &u, player_view &pv )
     pv.pain = clamp_i16( u.get_perceived_pain() );
     pv.morale = clamp_i16( u.get_morale_level() );
     pv.wielded = wielded_index( u );
+    for( const bodypart_id &bp : u.get_all_body_parts( get_body_part_flags::only_main ) ) {
+        const auto eff = [&]( const char *id ) {
+            return clamp_u8( u.get_effect_int( efftype_id( id ), bp ) );
+        };
+        pv.bleed.push_back( eff( "bleed" ) );
+        pv.bandaged.push_back( eff( "bandaged" ) );
+        pv.disinfected.push_back( eff( "disinfected" ) );
+        pv.bite.push_back( eff( "bite" ) > 0 ? 1 : 0 );
+        pv.infected.push_back( eff( "infected" ) );
+    }
+    // CDDA keeps worn items sorted inner to outer; invisible ones (e.g. integrated) are skipped.
+    for( const item_location &it : u.get_visible_worn_items() ) {
+        if( pv.worn.size() >= 64 ) {
+            break;
+        }
+        worn_view wv;
+        wv.type = intern_id( id_kind::itype, it->typeId().str() );
+        int layer = 0;
+        for( const layer_level l : it->get_layer() ) {
+            layer = std::max( layer, static_cast<int>( l ) );
+        }
+        wv.layer = clamp_u8( layer );
+        wv.damage = clamp_u8( std::max( 0, it->damage_level() ) );
+        wv.degradation = clamp_u8( 255.0 * std::max( 0, it->degradation() ) / std::max( 1, it->max_damage() ) );
+        for( const bodypart_id &bp : u.get_all_body_parts( get_body_part_flags::only_main ) ) {
+            if( it->covers( bp ) ) {
+                wv.covers.push_back( intern_id( id_kind::body_part, bp.id().str() ) );
+            }
+        }
+        pv.worn.push_back( std::move( wv ) );
+    }
 }
 
 void capture_environment( const avatar &u, environment_view &env )
@@ -567,6 +600,23 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     jo.member( "pain", static_cast<int>( pv.pain ) );
     jo.member( "morale", static_cast<int>( pv.morale ) );
     jo.member( "wielded", static_cast<int64_t>( pv.wielded ) );
+    write_array( jo, "bleed", pv.bleed );
+    write_array( jo, "bandaged", pv.bandaged );
+    write_array( jo, "disinfected", pv.disinfected );
+    write_array( jo, "bite", pv.bite );
+    write_array( jo, "infected", pv.infected );
+    jo.member( "worn" );
+    jo.start_array();
+    for( const worn_view &w : pv.worn ) {
+        jo.start_object();
+        jo.member( "type", static_cast<int64_t>( w.type ) );
+        jo.member( "layer", static_cast<int>( w.layer ) );
+        jo.member( "damage", static_cast<int>( w.damage ) );
+        jo.member( "degradation", static_cast<int>( w.degradation ) );
+        write_array( jo, "covers", w.covers );
+        jo.end_object();
+    }
+    jo.end_array();
     jo.end_object();
 
     const environment_view &env = s.env;
