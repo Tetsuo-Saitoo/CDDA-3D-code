@@ -144,8 +144,13 @@ bool rack_jammed( Character &who )
     if( !gun || jam_of( *gun ).is_null() ) {
         return false;
     }
-    // Cleared, or reload as usual: a jam that can't be cleared here never keeps R from reloading.
-    return clear_jam( who, gun ).empty();
+    // Cleared, or reload as usual after saying why not: a jam that can't be cleared here never keeps R from reloading.
+    const std::string why = clear_jam( who, gun );
+    if( why.empty() ) {
+        return true;
+    }
+    who.add_msg_if_player( m_info, why );
+    return false;
 }
 
 } // namespace fp3d
