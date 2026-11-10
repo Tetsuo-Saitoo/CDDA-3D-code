@@ -601,8 +601,6 @@ bool unload_magazine_now( avatar &u, item_location &targloc, int moves, item_han
     return any;
 }
 
-// CDDA's unload (Character::unload) with no menu: which part comes out is chosen as below, never asked; what comes
-// out goes to `a.hand`. Into the inventory with nothing to choose, it is Character::unload itself.
 // The wielded gun itself only: not something carried, lying around, or inside the gun (its magazine, a gunmod).
 bool clear( avatar &u, const item_action &a )
 {
@@ -621,6 +619,8 @@ bool clear( avatar &u, const item_action &a )
     return true;
 }
 
+// CDDA's unload (Character::unload) with no menu: which part comes out is chosen as below, never asked; what comes
+// out goes to `a.hand`. Into the inventory with nothing to choose, it is Character::unload itself.
 bool unload( avatar &u, const item_action &a )
 {
     std::string why;
