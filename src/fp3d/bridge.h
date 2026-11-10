@@ -305,6 +305,26 @@ std::string poll_report();
 // Strips control characters and caps the length; for any text coming from the client.
 std::string sanitize_text( const std::string &s, size_t max_len );
 
+// Boot progress, for the console, debug.log, the client and the bridge's stall check (either thread). The game
+// thread names its boot phases and CDDA's loading screen its steps (note_boot_step); each new phase is printed
+// with the time since begin_boot and how long the one before took. CDDA's debug messages are never a prompt in an
+// FP3D game (nobody could answer it during a boot): CDDA logs them, note_debug_error keeps the last one and
+// prints the first max_printed_errors. Texts are cleaned and cut to max_boot_text bytes (whole UTF-8 characters).
+constexpr size_t max_boot_text = 300;
+constexpr uint64_t max_printed_errors = 50;
+void begin_boot();
+void note_boot_step( const std::string &phase, const std::string &step = "" );
+void note_debug_error( const std::string &text );
+struct boot_progress {
+    std::string phase;           // "<phase>" or "<phase>: <step>", "" before the first
+    double seconds = 0.0;        // since begin_boot
+    double phase_seconds = 0.0;  // in this phase
+    uint64_t steps = 0;          // bumps on every note_boot_step
+    std::string last_error;      // the last debug message, "" none
+    uint64_t errors = 0;         // debug messages since begin_boot
+};
+boot_progress latest_boot_progress();
+
 } // namespace fp3d
 
 #endif // CATA_SRC_FP3D_BRIDGE_H

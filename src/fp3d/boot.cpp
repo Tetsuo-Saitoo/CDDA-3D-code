@@ -72,6 +72,7 @@ void boot_common( bool headless )
         // and then initialises and loads the options itself.
         FULL_SCREEN_WIDTH = EVEN_MINIMUM_TERM_WIDTH;
         FULL_SCREEN_HEIGHT = EVEN_MINIMUM_TERM_HEIGHT;
+        note_boot_step( "Starting SDL, options and tilesets" );
         catacurses::init_interface();
         // With animations on, the main input loop polls on a 125 ms timer instead of blocking.
         for( const char *opt : { "ANIMATIONS", "ANIMATION_RAIN", "ANIMATION_SCT", "AUTOSAVE" } ) {
@@ -90,6 +91,7 @@ void boot_common( bool headless )
             get_options().get_option( opt ).setValue( "false" );
         }
     }
+    note_boot_step( "Colours and static data" );
     init_colors();
     // A range (and its AI freeze) belongs to the game booted with it, not to the next one.
     reset_test_range();
@@ -98,6 +100,7 @@ void boot_common( bool headless )
     g->new_game = true;
     g->load_static_data();
 
+    note_boot_step( "Finding worlds" );
     world_generator->set_active_world( nullptr );
     world_generator->init();
 }
@@ -198,6 +201,7 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
             }
             world_generator->delete_world( name, true );
         }
+        note_boot_step( "Making world " + name );
         if( world_setup ) {
             world = run_world_setup( name );
             if( world == nullptr ) {
@@ -235,6 +239,7 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
     calendar::set_season_length( get_option<int>( "SEASON_LENGTH" ) );
 
     g->load_world_modfiles();
+    note_boot_step( "Id tables" );
     build_id_tables();
 
     get_avatar() = avatar();
@@ -264,7 +269,9 @@ void boot_saved_game( const std::string &world_name, const std::string &save_nam
     // As main_menu::load_game: setup() loads the core data, the world's mods and resets the game state.
     world_generator->set_active_world( world );
     g->setup();
+    note_boot_step( "Id tables" );
     build_id_tables();
+    note_boot_step( "Loading the save" );
     if( !fp3d_game_access::load_game( *g, save ) ) {
         throw std::runtime_error( "cannot load " + save_name + " from world " + world_name );
     }

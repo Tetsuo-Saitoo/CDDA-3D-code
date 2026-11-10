@@ -213,13 +213,23 @@ static void InitSDL()
     }
 #endif
 
-#if !defined(_WIN32)
-    // FP3D: headless outside Windows: CDDA's hidden window lives in SDL's offscreen driver, so the game
-    // thread never talks to the display server (Godot owns it; CI has none). SDL_VIDEODRIVER set by hand wins.
+    // FP3D: the hidden window never draws, so the game thread uses no GPU and no display server (Godot owns
+    // them; CI has none): a plain memory framebuffer (SDL would otherwise back it with an OpenGL texture, starting
+    // the GPU driver on this thread) and the software renderer. Forced over the player's SDL_RENDER_DRIVER and
+    // SDL_FRAMEBUFFER_ACCELERATION. Outside Windows the window lives in SDL's offscreen driver, forced over a
+    // global SDL_VIDEODRIVER (wayland, x11) too; FP3D_SDL_VIDEODRIVER picks another one for debugging.
     if( fp3d::active() ) {
-        setenv( "SDL_VIDEODRIVER", "offscreen", 0 );
-    }
+        SDL_SetHintWithPriority( SDL_HINT_FRAMEBUFFER_ACCELERATION, "0", SDL_HINT_OVERRIDE );
+        SDL_SetHintWithPriority( SDL_HINT_RENDER_DRIVER, "software", SDL_HINT_OVERRIDE );
+#if !defined(_WIN32)
+        const char *driver = getenv( "FP3D_SDL_VIDEODRIVER" );
+        const char *use = driver != nullptr && *driver != '\0' ? driver : "offscreen";
+        setenv( "SDL_VIDEODRIVER", use, 1 );
+#if defined(SDL_HINT_VIDEODRIVER)
+        SDL_SetHintWithPriority( SDL_HINT_VIDEODRIVER, use, SDL_HINT_OVERRIDE );
 #endif
+#endif
+    }
 
     ret = SDL_Init( init_flags );
     throwErrorIf( ret != 0, "SDL_Init failed" );
@@ -441,7 +451,8 @@ static void WinCreate()
         SDL_ShowCursor( SDL_ENABLE );
     }
 
-    if( get_option<bool>( "ENABLE_JOYSTICK" ) ) {
+    // FP3D: the client reads gamepads; opening HID devices on the game thread only risks a stall
+    if( get_option<bool>( "ENABLE_JOYSTICK" ) && !fp3d::active() ) {
         gamepad::init();
     }
 
