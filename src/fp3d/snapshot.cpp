@@ -384,6 +384,21 @@ void capture_vehicles( map &here, snapshot &s, std::vector<uint8_t> &vehicle_til
     }
 }
 
+// Creature::Attitude as the contract's 0 hostile, 1 neutral, 2 friendly (ANY counts as neutral).
+uint8_t attitude_index( Creature::Attitude a )
+{
+    switch( a ) {
+        case Creature::Attitude::HOSTILE:
+            return 0;
+        case Creature::Attitude::FRIENDLY:
+            return 2;
+        case Creature::Attitude::NEUTRAL:
+        case Creature::Attitude::ANY:
+            break;
+    }
+    return 1;
+}
+
 void capture_creatures( map &here, const avatar &u, snapshot &s )
 {
     std::set<const monster *> seen_monsters;
@@ -399,6 +414,7 @@ void capture_creatures( map &here, const avatar &u, snapshot &s )
         cv.uid = creature_uid( *c );
         cv.pos = to_ui_point( here.get_abs( c->pos_bub( here ) ) );
         cv.hp_frac = hp_frac( c->get_hp(), c->get_hp_max() );
+        cv.attitude = c->is_avatar() ? 1 : attitude_index( c->attitude_to( u ) );
         if( const monster *m = c->as_monster() ) {
             seen_monsters.insert( m );
             cv.kind = 2;
@@ -716,6 +732,7 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         jo.member( "move_mode", static_cast<int64_t>( c.move_mode ) );
         jo.member( "hp_frac", static_cast<int>( c.hp_frac ) );
         jo.member( "wielded", static_cast<int64_t>( c.wielded ) );
+        jo.member( "attitude", static_cast<int>( c.attitude ) );
         jo.end_object();
     }
     jo.end_array();
