@@ -6,10 +6,13 @@
 #include <cmath>
 #include <condition_variable>
 #include <deque>
+#include <exception>
 #include <map>
 #include <mutex>
 
 #include "calendar.h"
+#include "fp3d/cooking.h"
+#include "map_scale_constants.h"
 
 namespace fp3d
 {
@@ -19,7 +22,19 @@ namespace
 struct queued_action {
     std::string action;
     std::optional<item_action> item;
+    std::optional<stairs_action> stairs;
 };
+
+// A recipe query (L9) waiting for the sim.
+struct recipe_query {
+    uint64_t id = 0;
+    item_ref container;
+    ui_point pos;
+};
+
+// Thrown by ask() when CDDA code run by a query wants to ask the client something (a debug popup): queries
+// never prompt. Not a std::exception, so CDDA's handlers let it unwind to run_queries().
+struct query_prompt {};
 
 struct channel {
     std::mutex m;
@@ -31,6 +46,7 @@ struct channel {
     std::function<void()> before_ask;
     std::deque<queued_action> actions;   // queued main-loop actions (block B5)
     std::optional<item_action> item_now; // the item action last answered as `fp3d_item`, until the sim takes it
+    std::optional<stairs_action> stairs_now; // ... and the stairs action answered as `fp3d_stairs`
     bool save_wanted = false;            // request_save() until the sim takes it
     bool job_wanted = false;             // want_job() until the main loop takes it
     bool save_if_changed = false;
@@ -38,6 +54,9 @@ struct channel {
     clock_state clock;
     // Wall time the current game turn started; real time ends it turn_length() later.
     std::chrono::steady_clock::time_point turn_start = std::chrono::steady_clock::now();
+    std::deque<recipe_query> queries;    // posted, not run yet (L9)
+    std::deque<std::pair<uint64_t, std::string>> query_results;   // run, not taken yet
+    uint64_t next_query_id = 1;
 };
 
 channel &chan()
@@ -49,6 +68,7 @@ channel &chan()
 std::atomic<bool> bridge_active{ false };
 std::atomic<bool> interrupt_requested{ false };
 thread_local bool next_timed = false;
+thread_local bool in_query = false;
 std::mutex poll_mutex;
 std::map<std::string, uint64_t> poll_counts;
 // Answer coordinates feed CDDA's int point maths (absolute -> bubble); keep them far from overflow.
@@ -63,6 +83,44 @@ std::chrono::steady_clock::duration turn_length( double timescale )
 {
     return std::chrono::duration_cast<std::chrono::steady_clock::duration>(
                std::chrono::duration<double, std::milli>( 1000.0 / timescale ) );
+}
+
+// Sim side, with `lk` holding c.m: runs the pending recipe queries one by one, the lock released while CDDA code
+// runs. Returns with the lock held; stops early on shutdown (the caller then unwinds).
+void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
+{
+    while( !c.queries.empty() && !c.shut_down ) {
+        const recipe_query q = c.queries.front();
+        c.queries.pop_front();
+        lk.unlock();
+        std::string result;
+        {
+            struct query_scope {
+                query_scope() {
+                    in_query = true;
+                }
+                ~query_scope() {
+                    in_query = false;
+                }
+            } scope;
+            try {
+                result = run_recipe_query( q.id, q.container, q.pos );
+            } catch( const query_prompt & ) {
+                result = recipe_query_error_json( q.id, q.container.uid, "internal" );
+            } catch( const std::exception & ) {
+                result = recipe_query_error_json( q.id, q.container.uid, "internal" );
+            }
+        }
+        if( result.size() > max_query_result_bytes ) {
+            result = recipe_query_error_json( q.id, q.container.uid, "too large" );
+        }
+        lk.lock();
+        while( c.query_results.size() >= max_query_results ) {
+            c.query_results.pop_front();
+        }
+        c.query_results.emplace_back( q.id, std::move( result ) );
+        c.cv.notify_all();
+    }
 }
 } // namespace
 
@@ -140,6 +198,9 @@ bool next_is_timed()
 
 ui_answer ask( ui_request req )
 {
+    if( in_query ) {
+        throw query_prompt();
+    }
     channel &c = chan();
     std::function<void()> hook;
     {
@@ -168,6 +229,9 @@ ui_answer ask( ui_request req )
         req.candidates.resize( max_candidates );
     }
     std::unique_lock<std::mutex> lk( c.m );
+    if( timed ) {
+        run_queries( c, lk );   // the main loop answers recipe queries before it waits
+    }
     req.id = c.next_id++;
     const request_kind kind = req.kind;
     req.paused = c.clock.paused;
@@ -175,6 +239,7 @@ ui_answer ask( ui_request req )
     const uint64_t id = req.id;
     c.reply.reset();
     c.item_now.reset();   // only the answer to this request may carry one (a client can't send `fp3d_item` itself)
+    c.stairs_now.reset();
     c.pending = std::move( req );
     c.cv.notify_all();
     bool expired = false;
@@ -212,10 +277,16 @@ ui_answer ask( ui_request req )
             queued.id = id;
             queued.action = std::move( c.actions.front().action );
             c.item_now = std::move( c.actions.front().item );
+            c.stairs_now = std::move( c.actions.front().stairs );
             queued.queued = true;
             c.actions.pop_front();
             c.reply = std::move( queued );
             break;
+        }
+        // Recipe queries posted while the main loop waits (paused too); then everything is checked again.
+        if( timed && !c.queries.empty() ) {
+            run_queries( c, lk );
+            continue;
         }
         // Re-evaluated on every wake-up: the client may switch mode, timescale or pause meanwhile.
         if( timed && c.clock.mode == clock_mode::real_time && !c.clock.paused ) {
@@ -361,7 +432,8 @@ void hostile_spotted()
 bool queue_action( const std::string &action )
 {
     // The bridge's own answers (a save, cheats) only come from the bridge.
-    if( action == save_action || action == job_action || action == item_action_name ) {
+    if( action == save_action || action == job_action || action == item_action_name ||
+        action == stairs_action_name ) {
         return false;
     }
     channel &c = chan();
@@ -369,7 +441,7 @@ bool queue_action( const std::string &action )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ sanitize_text( action, 128 ), std::nullopt } );
+    c.actions.push_back( queued_action{ sanitize_text( action, 128 ), std::nullopt, std::nullopt } );
     c.cv.notify_all();
     return true;
 }
@@ -392,7 +464,7 @@ bool queue_item_action( const item_action &a )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ item_action_name, a } );
+    c.actions.push_back( queued_action{ item_action_name, a, std::nullopt } );
     c.cv.notify_all();
     return true;
 }
@@ -404,6 +476,68 @@ std::optional<item_action> take_item_action()
     std::optional<item_action> a = std::move( c.item_now );
     c.item_now.reset();
     return a;
+}
+
+bool queue_stairs_action( const stairs_action &a )
+{
+    if( ( a.dir != 1 && a.dir != -1 ) || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
+        a.pos.z < -OVERMAP_DEPTH || a.pos.z > OVERMAP_HEIGHT ) {
+        return false;
+    }
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.actions.size() >= max_queued_actions ) {
+        return false;
+    }
+    c.actions.push_back( queued_action{ stairs_action_name, std::nullopt, a } );
+    c.cv.notify_all();
+    return true;
+}
+
+std::optional<stairs_action> take_stairs_action()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    std::optional<stairs_action> a = std::move( c.stairs_now );
+    c.stairs_now.reset();
+    return a;
+}
+
+uint64_t post_recipe_query( const item_ref &container, const ui_point &pos )
+{
+    if( container.uid < 1 || container.uid > max_item_uid || container.type < 1 || container.type >= ( 1u << 24 ) ||
+        !coord_ok( pos.x ) || !coord_ok( pos.y ) || !coord_ok( pos.z ) ) {
+        return 0;
+    }
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.queries.size() >= max_pending_queries ) {
+        return 0;
+    }
+    const uint64_t id = c.next_query_id++;
+    c.queries.push_back( recipe_query{ id, container, pos } );
+    c.cv.notify_all();
+    return id;
+}
+
+std::optional<std::string> take_query_result( uint64_t id )
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    for( auto it = c.query_results.begin(); it != c.query_results.end(); ++it ) {
+        if( it->first == id ) {
+            std::string result = std::move( it->second );
+            c.query_results.erase( it );
+            return result;
+        }
+    }
+    return std::nullopt;
+}
+
+size_t pending_queries()
+{
+    std::lock_guard<std::mutex> lk( chan().m );
+    return chan().queries.size();
 }
 
 bool request_save( bool only_if_changed )
@@ -467,6 +601,11 @@ void pace_turn( bool fast_forward, bool watched )
     for( ;; ) {
         if( c.shut_down ) {
             throw shutdown_signal();
+        }
+        // Recipe queries also get answered during activities and pauses.
+        if( !in_query && !c.queries.empty() ) {
+            run_queries( c, lk );
+            continue;
         }
         if( c.clock.paused ) {
             c.cv.wait( lk );

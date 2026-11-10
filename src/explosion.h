@@ -70,6 +70,7 @@ struct queued_explosion {
     const Creature *source;
     const tripoint_abs_ms pos;
     const explosion_data data;
+    std::string fp3d_item; // FP3D: the itype behind it when queued (fp3d::explosion_item_scope), for its event
 
     queued_explosion( const Creature *source, const tripoint_abs_ms &pos, const explosion_data &data )
         : source( source ), pos( pos ), data( data ) {}

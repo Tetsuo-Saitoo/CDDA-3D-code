@@ -340,10 +340,8 @@ std::string apply_world_setup( const std::string &json, options_manager::options
         } else {
             picked = world_generator->get_mod_manager().get_default_mods();
         }
-        // Core mods first (CDDA loads them before any other), then the rest, each after its dependencies.
-        std::stable_partition( picked.begin(), picked.end(), []( const mod_id & m ) {
-            return m.is_valid() && m->core;
-        } );
+        // Each mod after its dependencies, then core mods moved first (as CDDA's mod manager puts them), the
+        // rest keeping their order.
         std::string why;
         for( const mod_id &m : picked ) {
             std::set<mod_id> visiting;
@@ -351,6 +349,9 @@ std::string apply_world_setup( const std::string &json, options_manager::options
                 return why;
             }
         }
+        std::stable_partition( mods.begin(), mods.end(), []( const mod_id & m ) {
+            return m.is_valid() && m->core;
+        } );
         if( std::count_if( mods.begin(), mods.end(), []( const mod_id & m ) {
         return m->core;
     } ) != 1 ) {
