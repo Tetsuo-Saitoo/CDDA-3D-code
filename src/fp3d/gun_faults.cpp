@@ -78,6 +78,8 @@ std::string clear_jam( Character &who, const item_location &gun )
     if( who.activity ) {
         return _( "You are busy." );
     }
+    // No light check on purpose: CDDA's mend command refuses when it's too dark (fine_detail_vision_mod() > 4),
+    // but its own quick fix at aim start never did; a stovepipe or a double feed is cleared by feel.
     const inventory &inv = who.crafting_inventory();
     for( const fault_fix_id &fix_id : jam->get_fixes() ) {
         const fault_fix &fix = *fix_id;
