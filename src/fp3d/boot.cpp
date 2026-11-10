@@ -17,6 +17,7 @@
 #include "enums.h"
 #include "filesystem.h"
 #include "fp3d/bridge.h"
+#include "fp3d/data_check.h"
 #include "fp3d/game_access.h"
 #include "fp3d/id_tables.h"
 #include "fp3d/test_range.h"
@@ -90,6 +91,11 @@ void boot_common( bool headless )
         if( get_options().has_option( opt ) ) {
             get_options().get_option( opt ).setValue( "false" );
         }
+    }
+    // A JSON parse cache entry older than its file (a cache shipped with the data, or data updated in place) is
+    // parsed again either way; keep it to a log line, not a reported error.
+    if( get_options().has_option( "WARN_ON_MODIFIED" ) ) {
+        get_options().get_option( "WARN_ON_MODIFIED" ).setValue( "false" );
     }
     note_boot_step( "Colours and static data" );
     init_colors();
@@ -238,7 +244,9 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
     calendar::set_eternal_season( get_option<bool>( "ETERNAL_SEASON" ) );
     calendar::set_season_length( get_option<int>( "SEASON_LENGTH" ) );
 
+    prepare_data_check( world->active_mod_order );
     g->load_world_modfiles();
+    finish_data_check();
     note_boot_step( "Id tables" );
     build_id_tables();
 
@@ -268,7 +276,9 @@ void boot_saved_game( const std::string &world_name, const std::string &save_nam
     }
     // As main_menu::load_game: setup() loads the core data, the world's mods and resets the game state.
     world_generator->set_active_world( world );
+    prepare_data_check( world->active_mod_order );
     g->setup();
+    finish_data_check();
     note_boot_step( "Id tables" );
     build_id_tables();
     note_boot_step( "Loading the save" );

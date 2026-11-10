@@ -16,6 +16,7 @@
 #include <memory>
 #include <functional>
 #include <mutex>
+#include <fstream>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -38,6 +39,7 @@
 #include "field_type.h"
 #include "flexbuffer_json.h"
 #include "fp3d/boot.h"
+#include "fp3d/data_check.h"
 #include "fp3d/bridge.h"
 #include "fp3d/cheats.h"
 #include "fp3d/cooking.h"
@@ -62,6 +64,7 @@
 #include "messages.h"
 #include "monster.h"
 #include "npc.h"
+#include "options.h"
 #include "path_info.h"
 #include "pocket_type.h"
 #include "rng.h"
@@ -158,6 +161,7 @@ std::atomic<bool> clear_zombies_now{ false };  // safe mode checks: remove all m
 std::atomic<int> new_game_safe_mode{ -1 };     // g->safe_mode at the new game's first main-loop request
 std::atomic<int> loaded_safe_mode{ -1 };       // ... and at the first one after the reload
 std::atomic<bool> cheat_probe{ false };
+std::atomic<int> data_check_failures{ -1 };     // data check skip checks at boot (-1: not run)
 std::atomic<int> world_name_failures{ -1 };     // world name checks at boot (-1: not run)
 std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed in the gun safe         // cheat checks: hit the torso, wield an empty Glock
 // Hand checks: 1 = a zombie to the west and a rock in hand, 2 = a two-handed flail in hand, 3 = a hose in hand,
@@ -808,11 +812,90 @@ int check_world_names()
     return failed;
 }
 
+// FP3D's data check skip (fp3d/data_check.h): the same data gives the same fingerprint, another mod or a world's own
+// mods change that, a garbled marker means check, and a check that passed is skipped the next time.
+int check_data_check()
+{
+    namespace fs = std::filesystem;
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what ) {
+        std::printf( "  data check: %-40s %s\n", what, ok ? "PASS" : "FAIL" );
+        failed += ok ? 0 : 1;
+    };
+    std::printf( "  data check: this boot %s CDDA's check\n", fp3d::data_check_skipped() ? "skipped" : "ran" );
+    check( !fp3d::data_check_skipped(), "test programs always check (seeded RNG)" );
+    fp3d::allow_data_check_skip_in_tests( true );
+    const std::vector<mod_id> mods = world_generator->active_world->active_mod_order;
+    const std::optional<std::string> fp = fp3d::data_fingerprint( mods );
+    check( fp && fp == fp3d::data_fingerprint( mods ), "same data, same fingerprint" );
+    const mod_id extra( "magiclysm" );
+    std::vector<mod_id> more = mods;
+    more.push_back( extra );
+    const std::optional<std::string> fp_more = extra.is_valid() ? fp3d::data_fingerprint( more ) : std::nullopt;
+    check( fp_more && fp_more != fp, "another mod, another fingerprint" );
+    const fs::path world_mods = ( PATH_INFO::world_base_save_path() / "mods" ).get_unrelative_path();
+    std::error_code ec;
+    const bool had_folder = fs::exists( world_mods, ec );
+    fs::create_directories( world_mods, ec );
+    check( fp3d::data_fingerprint( mods ) == fp, "empty world mods folder: same" );
+    {
+        std::ofstream mod( world_mods / "fp3d_sim_mod.json", std::ios::binary );
+        mod << "[]";
+    }
+    check( !fp3d::data_fingerprint( mods ), "world's own mods: checked every boot" );
+    fs::remove( world_mods / "fp3d_sim_mod.json", ec );
+    if( !had_folder ) {
+        fs::remove( world_mods, ec );
+    }
+    {
+        std::ofstream marker( fs::u8path( fp3d::data_check_marker_path() ), std::ios::binary | std::ios::trunc );
+        marker << "fp3d data check 1\nnot a fingerprint\n";
+    }
+    fp3d::prepare_data_check( mods );
+    check( !fp3d::data_check_skipped() && !get_option<bool>( "SKIP_VERIFICATION" ), "garbled marker: the check runs" );
+    fp3d::finish_data_check();
+    const bool errors = debug_has_error_been_observed();
+    fp3d::prepare_data_check( mods );
+    const bool skipped = fp3d::data_check_skipped() && get_option<bool>( "SKIP_VERIFICATION" );
+    fp3d::finish_data_check();
+    check( errors ? !skipped : skipped, errors ? "CDDA reported errors: not remembered" : "passed: skipped the next time" );
+    check( !get_option<bool>( "SKIP_VERIFICATION" ), "the option is back afterwards" );
+    if( skipped ) {
+        // A boot that failed between prepare and finish: the next prepare puts the option back first instead of
+        // taking it for the player's own choice.
+        fp3d::prepare_data_check( mods );
+        fp3d::prepare_data_check( mods );
+        const bool again = fp3d::data_check_skipped();
+        fp3d::finish_data_check();
+        check( again && !get_option<bool>( "SKIP_VERIFICATION" ), "failed boot: option back, skip kept" );
+    }
+    const fs::path marker = fs::u8path( fp3d::data_check_marker_path() );
+    fs::path kept = marker;
+    kept += ".sim";
+    const bool had_marker = fs::exists( marker, ec );
+    if( had_marker ) {
+        fs::rename( marker, kept, ec );
+    }
+    get_options().get_option( "SKIP_VERIFICATION" ).setValue( "true" );
+    fp3d::prepare_data_check( mods );
+    const bool left = !fp3d::data_check_skipped() && get_option<bool>( "SKIP_VERIFICATION" );
+    fp3d::finish_data_check();
+    check( left && get_option<bool>( "SKIP_VERIFICATION" ) && !fs::exists( marker, ec ),
+           "player's own skip: left alone, not remembered" );
+    get_options().get_option( "SKIP_VERIFICATION" ).setValue( "false" );
+    if( had_marker ) {
+        fs::rename( kept, marker, ec );
+    }
+    fp3d::allow_data_check_skip_in_tests( false );
+    return failed;
+}
+
 void sim_main()
 {
     try {
         fp3d::boot_world( "fp3d-sim", true );
         world_name_failures = check_world_names();
+        data_check_failures = check_data_check();
         std::printf( "sim: data loaded, starting game\n" );
         // The real new-game path: calendar, start location, starting items, game mode.
         if( !fp3d_game_access::start_game( *g ) ) {
@@ -4576,9 +4659,11 @@ int main()
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
+    const bool data_check_ok = data_check_failures == 0;
+    std::printf( "data check: %s\n", data_check_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           throw_pour_ok && worlds_ok && boot_ok ?
+           throw_pour_ok && worlds_ok && boot_ok && data_check_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }
