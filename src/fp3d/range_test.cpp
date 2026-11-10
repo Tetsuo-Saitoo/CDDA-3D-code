@@ -86,7 +86,8 @@ void before_ask()
 void sim_main()
 {
     try {
-        fp3d::boot_new_game_data( "fp3d-range", true, true );
+        // A throwaway fp3d- world: replaces the last run's (boot.h, replaceable_world).
+        fp3d::boot_new_game_data( "fp3d-range", true, true, false, true );
         fp3d::boot_test_range( 1 );
         fp3d::set_before_ask_hook( before_ask );
         while( !do_turn() ) {
