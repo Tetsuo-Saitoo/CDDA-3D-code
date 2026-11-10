@@ -469,10 +469,17 @@ bool queue_item_action( const item_action &a )
         return r.uid >= 1 && r.uid <= max_item_uid && r.type >= 1 && r.type < ( 1u << 24 );
     };
     const bool op_ok = a.op == item_op::take || a.op == item_op::put || a.op == item_op::drop ||
-                       a.op == item_op::unload || a.op == item_op::reload || a.op == item_op::clear;
+                       a.op == item_op::unload || a.op == item_op::reload || a.op == item_op::clear ||
+                       a.op == item_op::throw_ || a.op == item_op::pour;
     const bool hand_ok = a.hand == item_hand::pack || a.hand == item_hand::main || a.hand == item_hand::off;
+    // pour: exactly one target. Into a container: a whole ref, and no square (pos left at 0, 0, 0). Onto a square:
+    // no container at all (uid 0, type 0) and no pocket.
+    const bool no_container = a.container.uid == 0 && a.container.type == 0;
+    const bool no_pos = a.pos.x == 0 && a.pos.y == 0 && a.pos.z == 0;
+    const bool pour_ok = a.op != item_op::pour ||
+                         ( no_container ? a.pocket == -1 : ref_ok( a.container ) && no_pos );
     if( !op_ok || !hand_ok || !ref_ok( a.item ) || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
-        !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket ||
+        !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket || !pour_ok ||
         ( ( a.op == item_op::put || a.op == item_op::reload ) && !ref_ok( a.container ) ) ||
         ( a.has_spot && ( a.spot_x >= spot_scale || a.spot_y >= spot_scale ) ) ) {
         return false;
