@@ -15,6 +15,7 @@
 #include "enums.h"
 #include "flag.h"
 #include "fp3d/bridge.h"
+#include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
 #include "fp3d/snapshot.h"
 #include "game_constants.h"
@@ -600,6 +601,24 @@ bool unload_magazine_now( avatar &u, item_location &targloc, int moves, item_han
     return any;
 }
 
+// The wielded gun itself only: not something carried, lying around, or inside the gun (its magazine, a gunmod).
+bool clear( avatar &u, const item_action &a )
+{
+    const item_location gun = find_carried( u, a.item );
+    if( !gun ) {
+        return refuse( u, _( "You don't have that any more." ) );
+    }
+    const item_location wielded = u.get_wielded_item();
+    if( !wielded || wielded.get_item() != gun.get_item() ) {
+        return refuse( u, _( "Hold the gun to clear it." ) );
+    }
+    const std::string why = clear_jam( u, gun );
+    if( !why.empty() ) {
+        return refuse( u, why );
+    }
+    return true;
+}
+
 // CDDA's unload (Character::unload) with no menu: which part comes out is chosen as below, never asked; what comes
 // out goes to `a.hand`. Into the inventory with nothing to choose, it is Character::unload itself.
 bool unload( avatar &u, const item_action &a )
@@ -976,6 +995,8 @@ bool run_item_action( avatar &u )
             return unload( u, *a );
         case item_op::reload:
             return reload( u, *a );
+        case item_op::clear:
+            return clear( u, *a );
     }
     return false;
 }

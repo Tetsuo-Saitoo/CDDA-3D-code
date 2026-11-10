@@ -6,7 +6,8 @@
 // square (into the inventory, the main hand or the off hand), put a carried item into a container (a worn or held
 // one, or one lying in reach, into CDDA's best pocket or a given one), drop or place it on a square, unload a gun or
 // magazine (carried or in reach; what comes out goes to the inventory, the main hand or the off hand), reload a
-// carried gun or magazine with given ammo or a given magazine (carried or in reach). Each action finds its items
+// carried gun or magazine with given ammo or a given magazine (carried or in reach), clear the wielded gun's jam
+// (gun_faults.h). Each action finds its items
 // again by handle, square and itype, uses CDDA's rules (pockets, weight, volume, wielding, what loads into what)
 // and move costs, and refuses with a message saying why. Nothing is ever asked: where CDDA would show a menu, the
 // choice is fixed (unload: the item itself, then its gunmods in order; reload: the first part CDDA's reload menu
