@@ -546,12 +546,14 @@ bool explosion_processing_active()
 void explosion( const Creature *source, const tripoint_bub_ms &p, const explosion_data &ex )
 {
     _explosions.emplace_back( source, get_map().get_abs( p ), ex );
+    _explosions.back().fp3d_item = fp3d::current_explosion_item(); // FP3D:
 }
 
 void explosion( const Creature *source, map *here, const tripoint_bub_ms &p,
                 const explosion_data &ex )
 {
     _explosions.emplace_back( source, here->get_abs( p ), ex );
+    _explosions.back().fp3d_item = fp3d::current_explosion_item(); // FP3D:
 }
 
 void _make_explosion( map *m, const Creature *source, const tripoint_bub_ms &p,
@@ -1003,9 +1005,13 @@ void process_explosions()
             m.spawn_monsters( true, true );
             g->load_npcs( &m );
             process_explosions_in_progress = false;
-            _make_explosion( &m, ex.source, m.get_bub( ex.pos ), ex.data );
+            {
+                const fp3d::explosion_item_scope fp3d_item( ex.fp3d_item ); // FP3D: the blast's own item
+                _make_explosion( &m, ex.source, m.get_bub( ex.pos ), ex.data );
+            }
             m.process_falling();
         } else {
+            const fp3d::explosion_item_scope fp3d_item( ex.fp3d_item ); // FP3D: the blast's own item
             _make_explosion( bubble_map, ex.source, bubble_map->get_bub( ex.pos ), ex.data );
         }
     }
