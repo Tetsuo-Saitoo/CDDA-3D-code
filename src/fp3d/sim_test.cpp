@@ -608,7 +608,15 @@ int check_world_names()
            fp3d::reserved_world_name( "Fp3D-live" ) && !fp3d::reserved_world_name( "fp3d" ) &&
            !fp3d::reserved_world_name( "x-fp3d-" ) && !fp3d::reserved_world_name( "" ),
            "fp3d- names reserved, any case" );
-    check( fp3d::owned_world( "fp3d-sim" ), "the world boot made is marked as its own" );
+    check( fp3d::owned_world( "fp3d-sim" ) && fp3d::replacing_world_name( "fp3d-sim" ) == "fp3d-sim",
+           "the world boot made is its own to replace" );
+    // An fp3d- folder FP3D didn't mark (a player's, or an older FP3D's): left alone, the next name is used.
+    const std::filesystem::path blocked = std::filesystem::u8path( PATH_INFO::savedir() ) / "fp3d-blocked";
+    std::filesystem::create_directories( blocked, ec );
+    check( !ec && fp3d::replacing_world_name( "fp3d-blocked" ) == "fp3d-blocked-2" &&
+           fp3d::replacing_world_name( "FP3D-BLOCKED" ) == "FP3D-BLOCKED-2",
+           "someone else's world left alone, the next name used" );
+    std::filesystem::remove_all( blocked, ec );
     const std::filesystem::path theirs = std::filesystem::u8path( PATH_INFO::savedir() ) / "fp3d-theirs";
     std::filesystem::create_directories( theirs, ec );
     const bool plain = !fp3d::owned_world( "fp3d-theirs" );

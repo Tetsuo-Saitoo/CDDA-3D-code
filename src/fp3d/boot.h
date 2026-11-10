@@ -41,6 +41,9 @@ bool reserved_world_name( const std::string &world_name );
 // file) is replaced, so a player's world of such a name never is.
 constexpr const char *owned_world_marker = "fp3d_made_this_world.txt";
 bool owned_world( const std::string &world_name );
+// The world a replacing start uses for `world_name`: that name if it's free or owned_world, else the first free
+// or owned "<world_name>-2", "-3", ... (up to -99, else it throws). Never one someone else made.
+std::string replacing_world_name( const std::string &world_name );
 
 // Loads game data and the saved character `save_name` (its save id, i.e. the character name) from the existing
 // world `world_name` under the user directory, the way CDDA's main menu loads a game (g->setup(), then
