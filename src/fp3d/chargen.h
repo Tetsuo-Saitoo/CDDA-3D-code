@@ -13,7 +13,8 @@ class avatar;
 
 namespace fp3d
 {
-// Character templates in CDDA's templates folder (plain names only, sorted, at most 256).
+// Character templates in CDDA's templates folder (plain names only, files of at most 256 KiB, sorted, at most
+// 256).
 std::vector<std::string> list_templates();
 
 // The catalog as JSON. Needs the world's game data loaded (boot_new_game_data). Run on the sim thread.
@@ -21,7 +22,8 @@ std::string chargen_catalog_json();
 
 // Checks the choices (JSON, contracts/ui_requests.md "chargen") and, if they are all valid, builds `u` from them
 // (scenario, profession, backgrounds, stats, traits, skills, name, gender, age, height) and calls
-// avatar::initialize. Returns "" on success, otherwise why not; `u` is then in an unspecified state.
+// avatar::initialize. A transfer template ("Character to Template") loads as saved, without initialize, as in
+// CDDA. Returns "" on success, otherwise why not; `u` is then in an unspecified state.
 // The choices come from the client: every id, number and string is checked.
 std::string apply_chargen( avatar &u, const std::string &choices_json );
 
