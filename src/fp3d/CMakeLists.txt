@@ -9,6 +9,7 @@ target_sources(cataclysm-tiles-common PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/chargen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/held.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/shot.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/item_hands.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/worldgen.cpp)
 
 # Block B1: headless smoke test. Links the same object library as the game, opens no window.

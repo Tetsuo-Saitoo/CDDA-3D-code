@@ -155,6 +155,38 @@ bool queue_action( const std::string &action );
 void clear_actions();
 size_t queued_actions();
 
+// Item hands (L8/E6): one CDDA action on one given item, with no menu. Items are named by the handles snapshots
+// list (fp3d/item_hands.h): a uid plus the itype index from the same snapshot; the sim finds them again before
+// acting and refuses with a message when one is gone, out of reach or doesn't fit. Item actions go into the action
+// queue above (same order, same rules); the sim runs them as the main-loop action `fp3d_item`.
+enum class item_op : uint8_t { take, put, drop };
+enum class item_hand : uint8_t { pack, main, off };    // take: into the inventory, wielded, the off hand
+struct item_ref {
+    uint64_t uid = 0;                    // 1 .. max_item_uid
+    uint32_t type = 0;                   // itype index (session table); 0 = invalid
+};
+constexpr uint64_t max_item_uid = ( uint64_t{ 1 } << 53 ) - 1;   // exact in a double (Godot's JSON)
+constexpr uint16_t spot_scale = 1000;    // spots are permille of the square, 0 .. spot_scale - 1
+struct item_action {
+    item_op op = item_op::take;
+    item_ref item;                       // the item to take, put or drop
+    // take: the square the item lies on. drop: the square to put it on. put: the container's square, used
+    // when the container isn't carried.
+    ui_point pos;
+    item_hand hand = item_hand::pack;    // take
+    item_ref container;                  // put
+    int pocket = -1;                     // put: index into the container's pockets; -1 = CDDA's best pocket
+    bool has_spot = false;               // drop: keep where on the square it was placed
+    uint16_t spot_x = 0;                 // permille of the square, east
+    uint16_t spot_y = 0;                 // permille of the square, south
+};
+constexpr int max_item_pocket = 255;
+// Client side. False if a field is out of range or the queue is full.
+bool queue_item_action( const item_action &a );
+constexpr const char *item_action_name = "fp3d_item";
+// Sim side: the item action the bridge just answered `fp3d_item` with (once), nullopt if none.
+std::optional<item_action> take_item_action();
+
 // Client side. Asks the sim to stop the current activity (it confirms with a popup first, like CDDA).
 void interrupt();
 // Sim side. True once per interrupt().

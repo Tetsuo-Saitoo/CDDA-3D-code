@@ -8,6 +8,7 @@
 #include <set>
 #include <tuple>
 #include <unordered_map>
+#include <unordered_set>
 #include <utility>
 
 #include "avatar.h"
@@ -18,11 +19,15 @@
 #include "enums.h"
 #include "type_id.h"
 #include "field.h"
+#include "fp3d/held.h"
 #include "fp3d/id_tables.h"
+#include "fp3d/item_hands.h"
 #include "fp3d/points.h"
 #include "game.h"
 #include "flag.h"
 #include "item.h"
+#include "item_location.h"
+#include "item_pocket.h"
 #include "json.h"
 #include "lightmap.h"
 #include "map.h"
@@ -154,7 +159,8 @@ size_t bubble_index( const tripoint_bub_ms &p )
     return ( static_cast<size_t>( p.z() + OVERMAP_DEPTH ) * side + p.y() ) * side + p.x();
 }
 
-void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile, submap_view &sm )
+void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile, submap_view &sm,
+                               std::unordered_set<uint64_t> &seen )
 {
     map_stack stack = here.i_at( p );
     if( !stack.empty() ) {
@@ -187,7 +193,23 @@ void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile
                                     ( it->has_flag( flag_GIBBED ) ? corpse_gibbed : 0 );
             }
         }
-        sm.items.push_back( pile );
+        // Handles for the client to point at one item (fp3d/item_hands.h).
+        for( item &it : stack ) {
+            if( pile.handles.size() >= max_handles_per_tile ) {
+                break;
+            }
+            item_handle_view h;
+            h.uid = item_handle( it, &seen );
+            h.type = intern_id( id_kind::itype, it.typeId().str() );
+            uint16_t sx = 0;
+            uint16_t sy = 0;
+            if( item_spot( it, sx, sy ) ) {
+                h.spot_x = static_cast<int16_t>( sx );
+                h.spot_y = static_cast<int16_t>( sy );
+            }
+            pile.handles.push_back( h );
+        }
+        sm.items.push_back( std::move( pile ) );
     }
     size_t fields_here = 0;
     for( const auto &fd : here.field_at( p ) ) {
@@ -206,7 +228,7 @@ void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile
 
 std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
         const visibility_variables &cache, const std::vector<uint8_t> &vehicle_tiles, const point &grid,
-        int z )
+        int z, std::unordered_set<uint64_t> &seen )
 {
     auto sm = std::make_shared<submap_view>();
     const tripoint_bub_ms corner( grid.x * SEEX, grid.y * SEEY, z );
@@ -263,14 +285,41 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
 
             // Hidden information stays hidden: piles and fields only where the player looks now.
             if( vis == vis_seen_lit ) {
-                capture_items_and_fields( here, p, static_cast<uint8_t>( i ), *sm );
+                capture_items_and_fields( here, p, static_cast<uint8_t>( i ), *sm, seen );
             }
         }
     }
     return sm;
 }
 
-void capture_player( const avatar &u, player_view &pv )
+// `loc` and what's inside it, depth first, into `out` (capped).
+void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags, int depth,
+                   const item *offhand, std::unordered_set<uint64_t> &seen, std::vector<carried_view> &out )
+{
+    if( out.size() >= max_carried_listed || !loc ) {
+        return;
+    }
+    item &it = *loc.get_item();
+    carried_view cv;
+    cv.uid = item_handle( it, &seen );
+    cv.type = intern_id( id_kind::itype, it.typeId().str() );
+    cv.parent = parent;
+    cv.pocket = static_cast<int16_t>( pocket );
+    cv.flags = static_cast<uint8_t>( flags | ( &it == offhand ? carried_offhand : 0 ) );
+    out.push_back( cv );
+    if( depth >= max_carried_depth ) {
+        return;
+    }
+    int index = 0;
+    for( item_pocket *pk : it.get_all_contained_pockets() ) {
+        for( item *child : pk->all_items_top() ) {
+            list_carried( item_location( loc, child ), cv.uid, index, 0, depth + 1, offhand, seen, out );
+        }
+        index++;
+    }
+}
+
+void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &seen )
 {
     pv.uid = 1;
     pv.pos = to_ui_point( u.pos_abs() );
@@ -319,6 +368,14 @@ void capture_player( const avatar &u, player_view &pv )
             }
         }
         pv.worn.push_back( std::move( wv ) );
+    }
+    const item_location held = offhand_item( u );
+    const item *offhand = held ? held.get_item() : nullptr;
+    if( const item_location weapon = u.get_wielded_item() ) {
+        list_carried( weapon, 0, -1, carried_wielded, 0, offhand, seen, pv.items );
+    }
+    for( const item_location &worn : u.top_items_loc() ) {
+        list_carried( worn, 0, -1, carried_worn, 0, offhand, seen, pv.items );
     }
 }
 
@@ -455,7 +512,13 @@ void write_array( JsonOut &jo, const std::string &name, const Array &a )
 
 bool item_pile_view::operator==( const item_pile_view &o ) const
 {
-    return tile == o.tile && count == o.count && top == o.top && corpse == o.corpse && corpse_state == o.corpse_state;
+    return tile == o.tile && count == o.count && top == o.top && corpse == o.corpse && corpse_state == o.corpse_state &&
+           handles == o.handles;
+}
+
+bool item_handle_view::operator==( const item_handle_view &o ) const
+{
+    return uid == o.uid && type == o.type && spot_x == o.spot_x && spot_y == o.spot_y;
 }
 
 bool field_view::operator==( const field_view &o ) const
@@ -534,7 +597,9 @@ std::shared_ptr<const snapshot> capture_snapshot()
     }
     const tripoint_abs_sm origin = here.get_abs_sub();
     s->bubble_origin = ui_point{ origin.x(), origin.y(), 0 };
-    capture_player( u, s->player );
+    // Uids listed in this capture: a copy carrying an earlier item's uid (a split stack) gets its own.
+    std::unordered_set<uint64_t> seen;
+    capture_player( u, s->player, seen );
     capture_environment( u, s->env );
 
     std::vector<uint8_t> vehicle_tiles( static_cast<size_t>( MAPSIZE_X ) * MAPSIZE_Y * OVERMAP_LAYERS, 0 );
@@ -549,7 +614,7 @@ std::shared_ptr<const snapshot> capture_snapshot()
         for( int gy = 0; gy < MAPSIZE; gy++ ) {
             for( int gx = 0; gx < MAPSIZE; gx++ ) {
                 std::shared_ptr<const submap_view> fresh = capture_submap( here, u, cache, vehicle_tiles,
-                        point( gx, gy ), z );
+                        point( gx, gy ), z, seen );
                 const sm_key key{ fresh->pos.x, fresh->pos.y, fresh->pos.z };
                 const auto prev = state.previous.find( key );
                 if( prev == state.previous.end() ) {
@@ -648,6 +713,18 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         jo.end_object();
     }
     jo.end_array();
+    jo.member( "items" );
+    jo.start_array();
+    for( const carried_view &c : pv.items ) {
+        jo.start_array();
+        jo.write( static_cast<int64_t>( c.uid ) );
+        jo.write( static_cast<int64_t>( c.type ) );
+        jo.write( static_cast<int64_t>( c.parent ) );
+        jo.write( static_cast<int>( c.pocket ) );
+        jo.write( static_cast<int>( c.flags ) );
+        jo.end_array();
+    }
+    jo.end_array();
     jo.end_object();
 
     const environment_view &env = s.env;
@@ -702,6 +779,20 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
                 jo.write( static_cast<int>( p.corpse_state ) );
             }
             jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "handles" );
+        jo.start_array();
+        for( const item_pile_view &p : sm.items ) {
+            for( const item_handle_view &h : p.handles ) {
+                jo.start_array();
+                jo.write( static_cast<int>( p.tile ) );
+                jo.write( static_cast<int64_t>( h.uid ) );
+                jo.write( static_cast<int64_t>( h.type ) );
+                jo.write( static_cast<int>( h.spot_x ) );
+                jo.write( static_cast<int>( h.spot_y ) );
+                jo.end_array();
+            }
         }
         jo.end_array();
         jo.member( "fields" );

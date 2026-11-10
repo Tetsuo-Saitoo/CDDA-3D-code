@@ -14,6 +14,12 @@ namespace fp3d
 {
 namespace
 {
+// A queued main-loop action; item actions carry their details and go out as `fp3d_item`.
+struct queued_action {
+    std::string action;
+    std::optional<item_action> item;
+};
+
 struct channel {
     std::mutex m;
     std::condition_variable cv;
@@ -22,7 +28,8 @@ struct channel {
     uint64_t next_id = 1;
     bool shut_down = false;
     std::function<void()> before_ask;
-    std::deque<std::string> actions;     // queued main-loop actions (block B5)
+    std::deque<queued_action> actions;   // queued main-loop actions (block B5)
+    std::optional<item_action> item_now; // the item action last answered as `fp3d_item`, until the sim takes it
     bool save_wanted = false;            // request_save() until the sim takes it
     bool save_if_changed = false;
     save_status saves;
@@ -156,6 +163,7 @@ ui_answer ask( ui_request req )
     req.pause_reason = c.clock.pause_reason;
     const uint64_t id = req.id;
     c.reply.reset();
+    c.item_now.reset();   // only the answer to this request may carry one (a client can't send `fp3d_item` itself)
     c.pending = std::move( req );
     c.cv.notify_all();
     bool expired = false;
@@ -181,7 +189,8 @@ ui_answer ask( ui_request req )
         if( timed && !c.actions.empty() && !c.clock.paused ) {
             ui_answer queued;
             queued.id = id;
-            queued.action = std::move( c.actions.front() );
+            queued.action = std::move( c.actions.front().action );
+            c.item_now = std::move( c.actions.front().item );
             queued.queued = true;
             c.actions.pop_front();
             c.reply = std::move( queued );
@@ -304,9 +313,41 @@ bool queue_action( const std::string &action )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( sanitize_text( action, 128 ) );
+    c.actions.push_back( queued_action{ sanitize_text( action, 128 ), std::nullopt } );
     c.cv.notify_all();
     return true;
+}
+
+bool queue_item_action( const item_action &a )
+{
+    const auto ref_ok = []( const item_ref & r ) {
+        return r.uid >= 1 && r.uid <= max_item_uid && r.type >= 1 && r.type < ( 1u << 24 );
+    };
+    const bool op_ok = a.op == item_op::take || a.op == item_op::put || a.op == item_op::drop;
+    const bool hand_ok = a.hand == item_hand::pack || a.hand == item_hand::main || a.hand == item_hand::off;
+    if( !op_ok || !hand_ok || !ref_ok( a.item ) || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
+        !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket ||
+        ( a.op == item_op::put && !ref_ok( a.container ) ) ||
+        ( a.has_spot && ( a.spot_x >= spot_scale || a.spot_y >= spot_scale ) ) ) {
+        return false;
+    }
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.actions.size() >= max_queued_actions ) {
+        return false;
+    }
+    c.actions.push_back( queued_action{ item_action_name, a } );
+    c.cv.notify_all();
+    return true;
+}
+
+std::optional<item_action> take_item_action()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    std::optional<item_action> a = std::move( c.item_now );
+    c.item_now.reset();
+    return a;
 }
 
 bool request_save( bool only_if_changed )

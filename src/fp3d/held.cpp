@@ -12,6 +12,7 @@
 #include "enums.h"
 #include "fp3d/game_access.h"
 #include "fp3d/hands.h"
+#include "fp3d/item_hands.h"
 #include "game.h"
 #include "game_inventory.h"
 #include "handle_liquid.h"
@@ -136,14 +137,11 @@ bool hold( avatar &u )
     if( !loc ) {
         return false;
     }
-    for( item_location &m : marked_items( u ) ) {
-        m->erase_var( offhand_var );
+    const std::string not_held = hold_carried( u, loc );
+    if( !not_held.empty() ) {
+        u.add_msg_if_player( m_info, "%s", not_held );
+        return false;
     }
-    // A fresh token: the turn number (never reused), above the last one.
-    const double token = std::max( offhand_token( u ) + 1.0,
-                                   static_cast<double>( to_turns<int64_t>( calendar::turn - calendar::turn_zero ) ) );
-    u.set_value( token_value, token );
-    loc->set_var( offhand_var, token );
     u.mod_moves( -u.item_handling_cost( *loc ) );
     u.add_msg_if_player( _( "You hold your %s in your off hand." ), loc->tname() );
     return true;
@@ -401,15 +399,20 @@ void register_held_actions( input_context &ctxt )
     for( const std::string &d : hand_dir_names() ) {
         ctxt.register_action( use_prefix + d, no_translation( "use what you hold on what you face" ) );
     }
+    register_item_actions( ctxt );
 }
 
 bool is_held_action( const std::string &action )
 {
-    return action == hold_action || action == stow_action || starts_with( action, use_prefix );
+    return action == hold_action || action == stow_action || starts_with( action, use_prefix ) ||
+           is_item_action( action );
 }
 
 bool held_action( avatar &u, const std::string &action )
 {
+    if( is_item_action( action ) ) {
+        return run_item_action( u );
+    }
     if( action == hold_action ) {
         return hold( u );
     }
@@ -422,6 +425,46 @@ bool held_action( avatar &u, const std::string &action )
         return use_on( u, u.pos_bub() + tripoint_rel_ms( dx, dy, 0 ) );
     }
     return false;
+}
+
+std::string offhand_unavailable( avatar &u )
+{
+    return offhand_blocked( u );
+}
+
+std::string hold_carried( avatar &u, const item_location &loc )
+{
+    const std::string why = offhand_blocked( u );
+    if( !why.empty() ) {
+        return why;
+    }
+    const item_location weapon = u.get_wielded_item();
+    if( !loc || u.is_worn( *loc ) || ( weapon && weapon.get_item() == loc.get_item() ) ) {
+        return _( "Only a carried item can go in your off hand." );
+    }
+    if( loc->is_two_handed( u ) ) {
+        return string_format( _( "Your %s is too heavy to hold in one hand." ), loc->tname() );
+    }
+    for( item_location &m : marked_items( u ) ) {
+        m->erase_var( offhand_var );
+    }
+    // A fresh token: the turn number (never reused), above the last one.
+    const double token = std::max( offhand_token( u ) + 1.0,
+                                   static_cast<double>( to_turns<int64_t>( calendar::turn - calendar::turn_zero ) ) );
+    u.set_value( token_value, token );
+    item_location held = loc;
+    held->set_var( offhand_var, token );
+    return {};
+}
+
+void clear_offhand_mark( item &it )
+{
+    it.erase_var( offhand_var );
+}
+
+void mark_offhand_pending( item &it )
+{
+    it.set_var( offhand_var, 0.0 );
 }
 
 item_location offhand_item( avatar &u )
