@@ -131,7 +131,6 @@ const weakpoint *planned_weakpoint( const monster &target, const weakpoint_attac
 std::optional<bodypart_id> planned_body_part( const Creature &target, const Creature *source,
         double goodhit );
 
-// Counters for tests and diagnostics; any thread.
 // A dead-centre hit makes the client's part this many times as likely as its own chance (1 for a graze).
 constexpr double aim_weight_max = 4.0;
 // `shot` requests per trigger pull at most (a long `fly` burst would stall the client one frame per round).
@@ -139,6 +138,7 @@ constexpr int default_asks_per_pull = 8;
 // Tests only (not bound for the client): the cap, clamped to 1..64.
 void set_asks_per_pull( int n );
 
+// Counters for tests and diagnostics; any thread.
 struct shot_counts {
     uint64_t asked = 0;         // `shot` requests sent
     uint64_t accepted = 0;      // `shot` answers that passed the checks
