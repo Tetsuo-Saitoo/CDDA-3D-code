@@ -1,0 +1,13 @@
+[
+  {
+    "//": "FP3D: the no-weight-limit cheat (src/fp3d/cheats.h). Like CDDA's debug traits: never valid, only set by the cheat.",
+    "type": "mutation",
+    "id": "FP3D_CHEAT_CARRY",
+    "name": { "str": "Cheat: No Weight Limit" },
+    "points": 99,
+    "valid": false,
+    "description": "Carry any weight.  A testing cheat.",
+    "enchantments": [ { "values": [ { "value": "CARRY_WEIGHT", "add": 10000000 } ] } ],
+    "debug": true
+  }
+]

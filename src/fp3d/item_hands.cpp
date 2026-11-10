@@ -21,13 +21,19 @@
 #include "itype.h"
 #include "map.h"
 #include "map_selector.h"
+#include "math_parser_diag_value.h"
 #include "output.h"
 #include "pickup.h"
 #include "ret_val.h"
+#include "type_id.h"
 #include "string_formatter.h"
 #include "translation.h"
 #include "translations.h"
 #include "units.h"
+
+static const efftype_id effect_incorporeal( "incorporeal" );
+static const trait_id trait_SHELL2( "SHELL2" );
+static const trait_id trait_SHELL3( "SHELL3" );
 
 namespace fp3d
 {
@@ -68,6 +74,13 @@ uint32_t type_index( const item &it )
     return intern_id( id_kind::itype, it.typeId().str() );
 }
 
+// An item var as text, only when it holds text (anything else reads as none).
+std::string text_var( const item &it, const std::string &key )
+{
+    const diag_value *v = it.maybe_get_value( key );
+    return v != nullptr && v->is_str() ? v->str() : std::string();
+}
+
 bool matches( const item &it, const item_ref &r )
 {
     return !it.is_null() && read_item_handle( it ) == r.uid && type_index( it ) == r.type;
@@ -88,24 +101,33 @@ bool within_reach( const avatar &u, const tripoint_bub_ms &p )
     return p.z() == u.posz() && square_dist( u.pos_bub(), p ) <= 1;
 }
 
+// The one item with this handle; none when two share it (one the snapshot never listed, so never renumbered).
 item_location find_on_square( map &here, const tripoint_bub_ms &p, const item_ref &r )
 {
+    item_location found;
     for( item &it : here.i_at( p ) ) {
         if( matches( it, r ) ) {
-            return item_location( map_cursor( p ), &it );
+            if( found ) {
+                return item_location();
+            }
+            found = item_location( map_cursor( p ), &it );
         }
     }
-    return item_location();
+    return found;
 }
 
 item_location find_carried( avatar &u, const item_ref &r )
 {
+    item_location found;
     for( item_location &loc : u.all_items_loc() ) {
         if( loc && matches( *loc, r ) ) {
-            return loc;
+            if( found ) {
+                return item_location();
+            }
+            found = loc;
         }
     }
-    return item_location();
+    return found;
 }
 
 bool refuse( avatar &u, const std::string &why )
@@ -123,9 +145,15 @@ void after_inventory_change( avatar &u )
 bool take( avatar &u, const item_action &a )
 {
     map &here = get_map();
+    if( u.is_mounted() ) {
+        return refuse( u, _( "You can't pick anything up while you're riding." ) );
+    }
     const std::optional<tripoint_bub_ms> p = bubble_square( here, a.pos );
     if( !p || !within_reach( u, *p ) ) {
         return refuse( u, _( "You can't reach that from here." ) );
+    }
+    if( !here.accessible_items( *p ) ) {
+        return refuse( u, _( "You can't get at the items in there." ) );
     }
     item_location loc = find_on_square( here, *p, a.item );
     if( !loc ) {
@@ -219,11 +247,22 @@ bool put( avatar &u, const item_action &a )
     if( u.is_worn( *src ) ) {
         return refuse( u, string_format( _( "Take off your %s first." ), src->tname() ) );
     }
+    const ret_val<void> can_let_go = u.can_drop( *src );
+    if( !can_let_go.success() ) {
+        return refuse( u, can_let_go.str() );
+    }
     item_location dst = find_carried( u, a.container );
     if( !dst ) {
+        // As CDDA: riding, you can't reach into things on the ground.
+        if( u.is_mounted() ) {
+            return refuse( u, _( "You can't reach that while you're riding." ) );
+        }
         const std::optional<tripoint_bub_ms> p = bubble_square( here, a.pos );
         if( !p || !within_reach( u, *p ) ) {
             return refuse( u, _( "You can't reach that from here." ) );
+        }
+        if( !here.accessible_items( *p ) ) {
+            return refuse( u, _( "You can't get at the items in there." ) );
         }
         dst = find_on_square( here, *p, a.container );
     }
@@ -250,6 +289,16 @@ bool put( avatar &u, const item_action &a )
             return failed( _( "it has no such pocket" ) );
         }
         pocket = pockets[a.pocket];
+        if( pocket->is_forbidden() ) {
+            return failed( _( "it has no such pocket" ) );
+        }
+    }
+    // Already where it's going: nothing to move. (A copy would merge into the original.)
+    if( src.has_parent() && ( pocket != nullptr ? pocket == src.parent_pocket() :
+                              src.parent_item().get_item() == dst.get_item() ) ) {
+        return failed( _( "it's already in there" ) );
+    }
+    if( pocket != nullptr ) {
         const ret_val<item_pocket::contain_code> r = pocket->can_contain( it );
         if( !r.success() ) {
             ok = ret_val<void>::make_failure( r.str() );
@@ -272,12 +321,12 @@ bool put( avatar &u, const item_action &a )
     clear_offhand_mark( copy );
     copy.erase_var( spot_var );
     if( pocket != nullptr ) {
-        if( pocket->sealed() ) {
-            pocket->unseal();
-        }
         const ret_val<item *> in = pocket->insert_item( copy );
         if( !in.success() ) {
             return failed( in.str() );
+        }
+        if( pocket->sealed() ) {
+            pocket->unseal();
         }
         dst->on_contents_changed();
     } else {
@@ -285,6 +334,10 @@ bool put( avatar &u, const item_action &a )
         if( !in.success() ) {
             return failed( in.str() );
         }
+    }
+    if( !src ) {
+        debugmsg( "fp3d put: the source item went away during the insert" );
+        return false;
     }
     contents_change_handler handler;
     handler.add_unsealed( dst );
@@ -307,6 +360,14 @@ bool drop( avatar &u, const item_action &a )
     }
     if( u.is_worn( *src ) ) {
         return refuse( u, string_format( _( "Take off your %s first." ), src->tname() ) );
+    }
+    const ret_val<void> can_let_go = u.can_drop( *src );
+    if( !can_let_go.success() ) {
+        return refuse( u, can_let_go.str() );
+    }
+    // Items that act when dropped (CDDA's drop_action) go through CDDA's own drop.
+    if( src->type->drop_action ) {
+        return refuse( u, string_format( _( "You can't put your %s down by hand." ), src->tname() ) );
     }
     const std::optional<tripoint_bub_ms> p = bubble_square( here, a.pos );
     if( !p || !within_reach( u, *p ) ) {
@@ -348,7 +409,7 @@ uint64_t read_item_handle( const item &it )
     if( !it.has_var( uid_var ) ) {
         return 0;
     }
-    return parse_decimal( it.get_var( uid_var, std::string() ), max_item_uid ).value_or( 0 );
+    return parse_decimal( text_var( it, uid_var ), max_item_uid ).value_or( 0 );
 }
 
 uint64_t item_handle( item &it, std::unordered_set<uint64_t> *seen )
@@ -371,7 +432,7 @@ bool item_spot( const item &it, uint16_t &x, uint16_t &y )
     if( !it.has_var( spot_var ) ) {
         return false;
     }
-    const std::string s = it.get_var( spot_var, std::string() );
+    const std::string s = text_var( it, spot_var );
     const size_t comma = s.find( ',' );
     if( s.size() > 16 || comma == std::string::npos ) {
         return false;
@@ -401,6 +462,13 @@ bool run_item_action( avatar &u )
     const std::optional<item_action> a = take_item_action();
     if( !a ) {
         return false;
+    }
+    // As CDDA's do_regular_action for pickup and drop.
+    if( u.has_active_mutation( trait_SHELL2 ) || u.has_active_mutation( trait_SHELL3 ) ) {
+        return refuse( u, _( "You can't do that while you're in your shell." ) );
+    }
+    if( u.has_effect( effect_incorporeal ) && a->op != item_op::drop ) {
+        return refuse( u, _( "You lack the substance to affect anything." ) );
     }
     switch( a->op ) {
         case item_op::take:

@@ -2,6 +2,7 @@
 #ifndef CATA_SRC_FP3D_BOOT_H
 #define CATA_SRC_FP3D_BOOT_H
 
+#include <optional>
 #include <string>
 
 #include "coordinates.h"
@@ -13,19 +14,27 @@ namespace fp3d
 // already ran. Throws std::runtime_error on failure.
 void init_paths( const std::string &base_path, const std::string &user_dir );
 
-// Loads game data and creates a fresh world `world_name` (replacing one of that name) under the user directory,
-// with a random avatar. Follow with g->start_game() to play, or load_bubble_in_town() to just look.
+// Loads game data and creates a fresh world `world_name` under the user directory, with a random avatar. An
+// existing world of that name is replaced only when it is one of FP3D's own (replaceable_world); any other name in
+// use (world_name_taken) throws. Follow with g->start_game() to play, or load_bubble_in_town() to just look.
 // Run it on the thread that will own the game. Throws std::runtime_error on failure.
 // `headless` also turns off options that make input poll on a timer (animations) and creates CDDA's window,
 // which stays hidden as long as the bridge is active: call fp3d::set_active( true ) first.
 void boot_world( const std::string &world_name, bool headless );
 
 // boot_world's first half, for character creation (chargen.h): loads game data and, with `fresh_world`, creates
-// world `world_name` (replacing one of that name), otherwise uses the existing world of that name (throws if
-// there is none). The avatar is blank: build it (run_chargen / avatar::create), then g->start_game().
+// world `world_name` (throws if the name is in use, unless `replace` and replaceable_world: then that world and
+// its saves are deleted first), otherwise uses the existing world of that name (throws if there is none). The avatar is blank: build it (run_chargen / avatar::create), then g->start_game().
 // `world_setup` (fresh worlds only) asks the client for the world's settings and mods first (worldgen.h).
 void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless,
-                         bool world_setup = false );
+                         bool world_setup = false, bool replace = false );
+
+// The name of the world already using `world_name`'s folder, ignoring ASCII case (as Windows folders do): one CDDA
+// lists, or any entry of the save directory. nullopt when the name is free. Needs boot's paths and world list.
+std::optional<std::string> world_name_taken( const std::string &world_name );
+
+// FP3D's own throwaway worlds ("fp3d-" names: --quick, the tests), which a fresh start may replace.
+bool replaceable_world( const std::string &world_name );
 
 // Loads game data and the saved character `save_name` (its save id, i.e. the character name) from the existing
 // world `world_name` under the user directory, the way CDDA's main menu loads a game (g->setup(), then

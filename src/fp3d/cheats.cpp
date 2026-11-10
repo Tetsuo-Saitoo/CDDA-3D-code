@@ -1,0 +1,330 @@
+#include "fp3d/cheats.h"
+
+#include <array>
+#include <mutex>
+#include <utility>
+#include <vector>
+
+#include "avatar.h"
+#include "calendar.h"
+#include "fp3d/bridge.h"
+#include "item.h"
+#include "item_location.h"
+#include "itype.h"
+#include "messages.h"
+#include "type_id.h"
+
+static const itype_id itype_backpack_giant( "backpack_giant" );
+static const itype_id itype_bandages( "bandages" );
+static const itype_id itype_bottle_plastic( "bottle_plastic" );
+static const itype_id itype_crowbar( "crowbar" );
+static const itype_id itype_flashlight( "flashlight" );
+static const itype_id itype_glock_19( "glock_19" );
+static const itype_id itype_hammer( "hammer" );
+static const itype_id itype_knife_combat( "knife_combat" );
+static const itype_id itype_lighter( "lighter" );
+static const itype_id itype_machete( "machete" );
+static const itype_id itype_mre_beef( "mre_beef" );
+static const itype_id itype_multitool( "multitool" );
+static const itype_id itype_pot( "pot" );
+static const itype_id itype_remington_870( "remington_870" );
+static const itype_id itype_scar_l( "scar_l" );
+static const itype_id itype_screwdriver_set( "screwdriver_set" );
+static const itype_id itype_water_clean( "water_clean" );
+
+static const trait_id trait_DEBUG_CARDIO( "DEBUG_CARDIO" );
+static const trait_id trait_DEBUG_LS( "DEBUG_LS" );
+static const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
+static const trait_id trait_DEBUG_NODMG( "DEBUG_NODMG" );
+static const trait_id trait_DEBUG_NOTEMP( "DEBUG_NOTEMP" );
+static const trait_id trait_DEBUG_PREVENT_DEATH( "DEBUG_PREVENT_DEATH" );
+static const trait_id trait_DEBUG_STAMINA( "DEBUG_STAMINA" );
+static const trait_id trait_FP3D_CHEAT_CARRY( "FP3D_CHEAT_CARRY" );
+
+namespace fp3d
+{
+namespace
+{
+constexpr std::array<const char *, cheat_count> names = {
+    "invincible", "no_needs", "no_weight_limit", "unlimited_ammo", "stamina", "no_temperature", "night_vision"
+};
+const std::string ammo_value = "fp3d_cheat_ammo";
+
+std::vector<trait_id> traits_of( cheat c )
+{
+    switch( c ) {
+        case cheat::invincible:
+            return { trait_DEBUG_NODMG, trait_DEBUG_PREVENT_DEATH };
+        case cheat::no_needs:
+            return { trait_DEBUG_LS };
+        case cheat::no_weight_limit:
+            return { trait_FP3D_CHEAT_CARRY };
+        case cheat::stamina:
+            return { trait_DEBUG_STAMINA, trait_DEBUG_CARDIO };
+        case cheat::no_temperature:
+            return { trait_DEBUG_NOTEMP };
+        case cheat::night_vision:
+            return { trait_DEBUG_NIGHTVISION };
+        case cheat::unlimited_ammo:
+        case cheat::count:
+            break;
+    }
+    return {};
+}
+
+// What the client asked for, waiting for the main loop.
+struct requests {
+    std::mutex m;
+    std::array<std::optional<bool>, cheat_count> want{};
+    bool kit = false;
+    cheats_view latest;
+    uint64_t kits_given = 0;
+};
+requests &reqs()
+{
+    static requests r;
+    return r;
+}
+
+// The ammo to fill a gun with: what it holds now, else its default; null when it takes no ammo items.
+itype_id fill_ammo( const item &gun )
+{
+    itype_id ammo = gun.ammo_current();
+    if( ammo.is_null() ) {
+        ammo = gun.ammo_default();
+    }
+    return !ammo.is_null() && ammo->ammo ? ammo : itype_id::NULL_ID();
+}
+
+void top_up( avatar &u )
+{
+    item_location gun = u.get_wielded_item();
+    if( !gun || !gun->is_gun() ) {
+        return;
+    }
+    const itype_id ammo = fill_ammo( *gun );
+    if( ammo.is_null() ) {
+        return;
+    }
+    // Only when it isn't full already (refilling makes new ammo items).
+    item full( *gun );
+    full.ammo_set( ammo );
+    if( full.ammo_remaining() > gun->ammo_remaining() ) {
+        gun->ammo_set( ammo );
+    }
+}
+
+void give( avatar &u, item it )
+{
+    u.i_add_or_drop( it );
+}
+
+// `n` of an item: as charges when CDDA counts it by charges (ammo), else n copies.
+void give_n( avatar &u, const itype_id &id, int n )
+{
+    item it( id, calendar::turn );
+    if( it.count_by_charges() ) {
+        it.charges = n;
+        u.i_add_or_drop( it );
+    } else {
+        u.i_add_or_drop( it, n );
+    }
+}
+
+// A loaded gun, `spare` loaded spare magazines (magazine-fed guns only) and `loose` rounds.
+void give_gun( avatar &u, const itype_id &id, int spare, int loose )
+{
+    item gun( id, calendar::turn );
+    const itype_id ammo = fill_ammo( gun );
+    if( ammo.is_null() ) {
+        give( u, gun );
+        return;
+    }
+    gun.ammo_set( ammo );
+    const itype_id mag = gun.magazine_default();
+    give( u, gun );
+    if( !gun.magazine_integral() && !mag.is_null() && mag->magazine ) {
+        for( int i = 0; i < spare; i++ ) {
+            item m( mag, calendar::turn );
+            m.ammo_set( ammo );
+            give( u, m );
+        }
+    }
+    if( loose > 0 ) {
+        give_n( u, ammo, loose );
+    }
+}
+
+void give_test_kit( avatar &u )
+{
+    if( !u.wear_item( item( itype_backpack_giant, calendar::turn ), false ) ) {
+        give( u, item( itype_backpack_giant, calendar::turn ) );
+    }
+    give_gun( u, itype_glock_19, 3, 60 );
+    give_gun( u, itype_remington_870, 0, 30 );
+    give_gun( u, itype_scar_l, 3, 90 );
+    for( const itype_id &id : {
+             itype_machete, itype_knife_combat, itype_crowbar, itype_hammer, itype_screwdriver_set, itype_multitool,
+             itype_lighter, itype_pot
+         } ) {
+        give( u, item( id, calendar::turn ) );
+    }
+    item light( itype_flashlight, calendar::turn );
+    const itype_id cell = fill_ammo( light );
+    if( !cell.is_null() ) {
+        light.ammo_set( cell );
+    }
+    give( u, light );
+    give_n( u, itype_bandages, 10 );
+    give_n( u, itype_mre_beef, 4 );
+    for( int i = 0; i < 3; i++ ) {
+        item bottle( itype_bottle_plastic, calendar::turn );
+        bottle.put_in( item( itype_water_clean, calendar::turn, 2 ), pocket_type::CONTAINER );
+        give( u, bottle );
+    }
+    add_msg( m_good, "Test kit received." );
+}
+
+void set_cheat( avatar &u, cheat c, bool on )
+{
+    if( c == cheat::unlimited_ammo ) {
+        if( on ) {
+            u.set_value( ammo_value, std::string( "1" ) );
+            top_up( u );
+        } else {
+            u.remove_value( ammo_value );
+        }
+    } else {
+        for( const trait_id &t : traits_of( c ) ) {
+            if( !t.is_valid() ) {
+                continue;
+            }
+            if( on && !u.has_trait( t ) ) {
+                u.set_mutation( t );
+            } else if( !on && u.has_trait( t ) ) {
+                u.unset_mutation( t );
+            }
+        }
+    }
+    add_msg( m_info, "Cheat %s %s.", cheat_name( c ), on ? "on" : "off" );
+}
+} // namespace
+
+const char *cheat_name( cheat c )
+{
+    const size_t i = static_cast<size_t>( c );
+    return i < cheat_count ? names[i] : "";
+}
+
+std::optional<cheat> cheat_from_name( const std::string &name )
+{
+    for( size_t i = 0; i < cheat_count; i++ ) {
+        if( name == names[i] ) {
+            return static_cast<cheat>( i );
+        }
+    }
+    return std::nullopt;
+}
+
+bool request_cheat( cheat c, bool on )
+{
+    const size_t i = static_cast<size_t>( c );
+    if( i >= cheat_count || is_shut_down() ) {
+        return false;
+    }
+    {
+        requests &r = reqs();
+        std::lock_guard<std::mutex> lk( r.m );
+        r.want[i] = on;
+    }
+    return want_job();
+}
+
+bool request_test_kit()
+{
+    if( is_shut_down() ) {
+        return false;
+    }
+    {
+        requests &r = reqs();
+        std::lock_guard<std::mutex> lk( r.m );
+        r.kit = true;
+    }
+    return want_job();
+}
+
+cheats_view latest_cheats()
+{
+    requests &r = reqs();
+    std::lock_guard<std::mutex> lk( r.m );
+    return r.latest;
+}
+
+bool cheat_on( const avatar &u, cheat c )
+{
+    if( c == cheat::unlimited_ammo ) {
+        return u.maybe_get_value( ammo_value ) != nullptr;
+    }
+    const std::vector<trait_id> ts = traits_of( c );
+    if( ts.empty() ) {
+        return false;
+    }
+    for( const trait_id &t : ts ) {
+        if( !u.has_trait( t ) ) {
+            return false;
+        }
+    }
+    return true;
+}
+
+void run_cheat_requests( avatar &u )
+{
+    std::array<std::optional<bool>, cheat_count> want;
+    bool kit = false;
+    {
+        requests &r = reqs();
+        std::lock_guard<std::mutex> lk( r.m );
+        want = std::exchange( r.want, {} );
+        kit = std::exchange( r.kit, false );
+    }
+    for( size_t i = 0; i < cheat_count; i++ ) {
+        if( want[i] && cheat_on( u, static_cast<cheat>( i ) ) != *want[i] ) {
+            set_cheat( u, static_cast<cheat>( i ), *want[i] );
+        }
+    }
+    if( kit ) {
+        give_test_kit( u );
+        requests &r = reqs();
+        std::lock_guard<std::mutex> lk( r.m );
+        r.kits_given++;
+    }
+    publish_cheats( u );
+}
+
+void run_jobs()
+{
+    run_cheat_requests( get_avatar() );
+}
+
+void cheats_turn( avatar &u )
+{
+    if( cheat_on( u, cheat::unlimited_ammo ) ) {
+        top_up( u );
+    }
+}
+
+void publish_cheats( const avatar &u )
+{
+    uint32_t on = 0;
+    for( size_t i = 0; i < cheat_count; i++ ) {
+        if( cheat_on( u, static_cast<cheat>( i ) ) ) {
+            on |= uint32_t{ 1 } << i;
+        }
+    }
+    requests &r = reqs();
+    std::lock_guard<std::mutex> lk( r.m );
+    r.latest.seq++;
+    r.latest.on = on;
+    r.latest.kits_given = r.kits_given;
+}
+} // namespace fp3d

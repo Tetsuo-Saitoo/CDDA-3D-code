@@ -37,6 +37,7 @@
 #include "ui_manager.h"
 #include "fp3d/boot.h" // FP3D:
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/cheats.h" // FP3D:
 #include "fp3d/events.h" // FP3D:
 
 enum class kb_menu_status {
@@ -456,6 +457,11 @@ const std::string &input_context::handle_input( const int timeout )
             // A save the client asked for (fp3d::request_save) comes as the main loop's answer: save, ask again.
             if( a.queued && a.action == fp3d::save_action ) {
                 fp3d::run_save();
+                continue;
+            }
+            // FP3D: cheats and the test kit the client asked for (fp3d/cheats.h), likewise.
+            if( a.queued && a.action == fp3d::job_action ) {
+                fp3d::run_jobs();
                 continue;
             }
             // A timed (main loop) request expired in real time: the player waits out the turn.

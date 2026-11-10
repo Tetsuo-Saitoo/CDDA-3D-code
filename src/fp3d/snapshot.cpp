@@ -159,11 +159,12 @@ size_t bubble_index( const tripoint_bub_ms &p )
     return ( static_cast<size_t>( p.z() + OVERMAP_DEPTH ) * side + p.y() ) * side + p.x();
 }
 
+// `items_seen`: CDDA's could_see_items (never inside sealed containers, others only from next to them).
 void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile, submap_view &sm,
-                               std::unordered_set<uint64_t> &seen )
+                               std::unordered_set<uint64_t> &seen, bool items_seen )
 {
     map_stack stack = here.i_at( p );
-    if( !stack.empty() ) {
+    if( items_seen && !stack.empty() ) {
         std::vector<std::pair<units::volume, const item *>> by_volume;
         for( const item &it : stack ) {
             by_volume.emplace_back( it.volume(), &it );
@@ -285,7 +286,8 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
 
             // Hidden information stays hidden: piles and fields only where the player looks now.
             if( vis == vis_seen_lit ) {
-                capture_items_and_fields( here, p, static_cast<uint8_t>( i ), *sm, seen );
+                capture_items_and_fields( here, p, static_cast<uint8_t>( i ), *sm, seen,
+                                          here.could_see_items( p, u.pos_bub() ) );
             }
         }
     }
@@ -307,11 +309,14 @@ void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags
     cv.pocket = static_cast<int16_t>( pocket );
     cv.flags = static_cast<uint8_t>( flags | ( &it == offhand ? carried_offhand : 0 ) );
     out.push_back( cv );
-    if( depth >= max_carried_depth ) {
+    if( depth + 1 >= max_carried_depth ) {
         return;
     }
     int index = 0;
     for( item_pocket *pk : it.get_all_contained_pockets() ) {
+        if( index > max_item_pocket ) {
+            break;
+        }
         for( item *child : pk->all_items_top() ) {
             list_carried( item_location( loc, child ), cv.uid, index, 0, depth + 1, offhand, seen, out );
         }
@@ -326,6 +331,9 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
     pv.moves = u.get_moves();
     pv.move_mode = intern_id( id_kind::move_mode, u.move_mode.str() );
     for( const bodypart_id &bp : u.get_all_body_parts( get_body_part_flags::only_main ) ) {
+        if( pv.body_parts.size() >= max_body_parts_listed ) {
+            break;
+        }
         pv.body_parts.push_back( intern_id( id_kind::body_part, bp.id().str() ) );
         pv.hp.push_back( clamp_i16( u.get_part_hp_cur( bp ) ) );
         pv.hp_max.push_back( clamp_i16( u.get_part_hp_max( bp ) ) );
@@ -363,7 +371,7 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
         wv.damage = clamp_u8( std::max( 0, it->damage_level() ) );
         wv.degradation = clamp_u8( 255.0 * std::max( 0, it->degradation() ) / std::max( 1, it->max_damage() ) );
         for( const bodypart_id &bp : u.get_all_body_parts( get_body_part_flags::only_main ) ) {
-            if( it->covers( bp ) ) {
+            if( it->covers( bp ) && wv.covers.size() < max_body_parts_listed ) {
                 wv.covers.push_back( intern_id( id_kind::body_part, bp.id().str() ) );
             }
         }

@@ -46,7 +46,7 @@ int main()
     setupDebug( DebugOutput::std_err );
     rng_set_engine_seed( 7 );
     try {
-        fp3d::boot_new_game_data( "fp3d-chargen", true, false );
+        fp3d::boot_new_game_data( "fp3d-chargen", true, false, false, /*replace=*/true );
         const std::string catalog = fp3d::chargen_catalog_json();
         JsonValue root = json_loader::from_string( catalog );
         JsonObject jo = root.get_object();
