@@ -2520,7 +2520,8 @@ static bool run_combat_checks()
             const double along_line = std::max( -3.0 * vx + 1.0 * vy, 0.0 );
             const double off = std::abs( -3.0 * vy - 1.0 * vx );
             const double vert = iso_tangent( along_line, units::from_arcmin( std::abs( err * std::cos( angle ) ) ) );
-            const double own = std::min( 1.0, std::hypot( off, vert ) / r.before.size );
+            // and never better than CDDA's roll for an unintended hit (at least 0.4)
+            const double own = std::min( 1.0, std::max( std::hypot( off, vert ) / r.before.size, 0.4 ) );
             char own_text[32];
             std::snprintf( own_text, sizeof( own_text ), " %.2f", own );
             owns += own_text;
@@ -2640,6 +2641,38 @@ static bool run_combat_checks()
         check( used >= 8 && friend_hurt == 0, "client miss off the line: the bullet keeps CDDA's line",
                std::to_string( used ) + " fired (6 fly, 4 FIRE answer), friendly on the diagonal hurt " +
                std::to_string( friend_hurt ) + ", the aimed zombie hurt " + std::to_string( zombie_hurt ) );
+    }
+    // CDDA's wild miss isn't the client's to place: aiming at an empty square 8 west, unskilled, the client claims a
+    // miss ending on the cursor every time; where CDDA's roll is a square or more off there, CDDA's wild-miss path
+    // runs (its distance scatter, the request's heading), so not all of those end on the cursor.
+    {
+        scene empty_aim;
+        empty_aim.zx = 0;
+        empty_aim.ax = -8;
+        empty_aim.skill = 0;
+        empty_aim.steady = false;
+        const claim on_cursor = { who::none, -8, 0, "", 0.99f };
+        int wild = 0;
+        int wild_on_cursor = 0;
+        std::string ends;
+        for( int i = 0; i < 16 && wild < 6; i++ ) {
+            const result r = run( empty_aim, "fire", answer_with::fire, on_cursor, true, on_cursor );
+            if( !fired( r, 1 ) || r.shots.size() != 1 || !r.target || r.projectiles.empty() ) {
+                continue;
+            }
+            if( iso_tangent( 8.0, units::from_arcmin( r.shots.front().shot_error ) ) < 1.0 ) {
+                continue;
+            }
+            wild++;
+            const fp3d::ui_point &e = r.projectiles.front().pos;
+            const int ex = e.x - r.target->origin.x;
+            const int ey = e.y - r.target->origin.y;
+            ends += " (" + std::to_string( ex ) + "," + std::to_string( ey ) + ")";
+            wild_on_cursor += ex == -8 && ey == 0 ? 1 : 0;
+        }
+        check( wild >= 3 && wild_on_cursor < wild, "client miss on CDDA's wild miss: CDDA places it",
+               std::to_string( wild ) + " wild misses, on the cursor " + std::to_string( wild_on_cursor ) + ", ends" +
+               ends );
     }
     // A hit claimed on a creature a square off CDDA's line (lead-bridge's case): skilled and steady, aiming at a
     // zombie 8 squares west, the client claims a dead-centre hit on another zombie at (-3, 1), close by. Its own

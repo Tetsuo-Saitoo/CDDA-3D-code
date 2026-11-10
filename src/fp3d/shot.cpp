@@ -6,6 +6,7 @@
 #include <optional>
 #include <utility>
 
+#include "avatar.h"
 #include "ballistics.h"
 #include "bodypart.h"
 #include "character.h"
@@ -140,10 +141,11 @@ line_offset offset_from( const tripoint_bub_ms &source, const tripoint_bub_ms &a
 // part `vert_arcmin` over the distance along it (shot answers: CDDA's deviated line), plus `unknown_arcmin` over that
 // distance in the worst direction (a FIRE answer: the aim line, the error's direction unknown), against its size
 // (WIDE ammo takes a monster's plain size); the worse of two rolls for a HARDTOHIT character. 1 = a miss. Never
-// better than the creature's square standing exactly where the projectile went.
+// better than the creature's square standing exactly where the projectile went, nor than CDDA's roll for an
+// unintended hit (`aimed_missed_by`: CDDA's roll for the aimed square).
 double own_missed_by( const Creature &c, const tripoint_bub_ms &source, const tripoint_bub_ms &at, double vx,
                       double vy, double vert_arcmin, double unknown_arcmin, const projectile &proj,
-                      const dispersion_sources &dispersion )
+                      const dispersion_sources &dispersion, double aimed_missed_by )
 {
     const monster *mon = c.as_monster();
     const double size = mon != nullptr && proj.proj_effects.count( ammo_effect_WIDE ) ?
@@ -160,7 +162,13 @@ double own_missed_by( const Creature &c, const tripoint_bub_ms &source, const tr
     if( ch != nullptr && ch->has_flag( json_flag_HARDTOHIT ) ) {
         missed_by = std::max( missed_by, projectile_attack_roll( dispersion, rl_dist( source, at ), size ).missed_by );
     }
-    return std::isfinite( missed_by ) ? missed_by : 1.0;
+    // never better than CDDA's roll for a creature the projectile meets on the way (ballistics.cpp: unintended hit)
+    const double cdda_size = c.ranged_target_size();
+    const double unintended = cdda_size > 0.0 && std::isfinite( aimed_missed_by ) ?
+                              std::max( rng_float( 0.1, 1.5 - std::clamp( aimed_missed_by, 0.0, 1.0 ) ) / cdda_size,
+                                        0.4 ) : 1.0;
+    missed_by = std::max( missed_by, unintended );
+    return std::isfinite( missed_by ) ? std::min( missed_by, 1.0 ) : 1.0;
 }
 
 // A client hit counts only if the creature's own roll `own` hits (else CDDA's own path: nullopt); goodhit =
@@ -249,7 +257,7 @@ std::vector<uint64_t> shot_targets( const Creature *cursor, const std::vector<tr
             break;
         }
         if( const Creature *c = creatures.creature_at( t ) ) {
-            if( !c->is_avatar() ) {
+            if( !c->is_avatar() && c != cursor && c->attitude_to( get_avatar() ) == Creature::Attitude::HOSTILE ) {
                 out.push_back( creature_uid( *c ) );
             }
         }
@@ -311,7 +319,8 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
         if( c.end == target ) {
             return aim.missed_by;
         }
-        return own_missed_by( *c.hit, source, c.end, vx, vy, vert_arcmin, unknown_arcmin, proj, dispersion );
+        return own_missed_by( *c.hit, source, c.end, vx, vy, vert_arcmin, unknown_arcmin, proj, dispersion,
+                              aim.missed_by );
     };
     try {
         std::optional<shot_outcome> out;
@@ -335,22 +344,28 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
                 n_asked++;
                 a = ask( req );
             }
+            // CDDA's deviated line: the aim line turned by the error's horizontal part, err * sin(angle), to the
+            // shooter's right. CDDA's map has x east and y south, so the right of (ux, uy) is (-uy, ux).
+            const double side = std::sin( units::to_radians( units::from_degrees( angle ) ) );
+            const double h = units::to_radians( units::from_arcmin( err * side ) );
+            const double vx = ux * std::cos( h ) - uy * std::sin( h );
+            const double vy = uy * std::cos( h ) + ux * std::sin( h );
+            heading_ = std::atan2( vy, vx );
             bool used = false;
             if( a && !a->cancel && a->shot ) {
-                // CDDA's deviated line: the aim line turned by the error's horizontal part, err * sin(angle), to
-                // the shooter's right. CDDA's map has x east and y south, so the right of (ux, uy) is (-uy, ux).
-                const double side = std::sin( units::to_radians( units::from_degrees( angle ) ) );
-                const double h = units::to_radians( units::from_arcmin( err * side ) );
-                const double vx = ux * std::cos( h ) - uy * std::sin( h );
-                const double vy = uy * std::cos( h ) + ux * std::sin( h );
                 const std::optional<claim> c = check_claim( here, you, *p, source, vx, vy, shot_line_tiles,
                                                a->shot->hit_uid, to_abs_ms( a->shot->end ), a->shot->quality,
                                                a->shot->part );
                 if( c ) {
                     // the error's vertical part, err * cos(angle), is known: the line itself is the horizontal part
                     const double vert = err * std::cos( units::to_radians( units::from_degrees( angle ) ) );
-                    out = c->hit != nullptr ? hit_outcome( *c, own_roll( *c, vx, vy, vert, 0.0 ) ) :
-                          std::optional<shot_outcome>( miss_outcome( here, source, target, vx, vy, *c, proj.range ) );
+                    // a miss on CDDA's wild miss (a square or more off) takes CDDA's own wild-miss path, heading
+                    // along this line (wild_heading)
+                    if( c->hit != nullptr ) {
+                        out = hit_outcome( *c, own_roll( *c, vx, vy, vert, 0.0 ) );
+                    } else if( aim.missed_by_tiles < 1.0 ) {
+                        out = miss_outcome( here, source, target, vx, vy, *c, proj.range );
+                    }
                     used = true;
                     n_accepted++;
                 }
@@ -390,6 +405,11 @@ projectile_scope::~projectile_scope()
 const shot_outcome *projectile_scope::outcome() const
 {
     return outer_ && current ? &*current : nullptr;
+}
+
+std::optional<double> projectile_scope::wild_heading() const
+{
+    return outer_ && heading_ && std::isfinite( *heading_ ) ? heading_ : std::nullopt;
 }
 
 double outcome_missed_by( const shot_outcome &o, const Creature &critter, double cur, bool at_target,

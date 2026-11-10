@@ -340,7 +340,11 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         // cap wild misses at +/- 30 degrees
         units::angle dispersion_angle =
             std::min( units::from_arcmin( aim.dispersion ), 30_degrees );
-        rad += ( one_in( 2 ) ? 1 : -1 ) * dispersion_angle;
+        if( const std::optional<double> heading = fp3d_shot.wild_heading() ) {
+            rad = units::from_radians( *heading );  // FP3D: the side CDDA rolled for the client's shot request
+        } else {
+            rad += ( one_in( 2 ) ? 1 : -1 ) * dispersion_angle;
+        }
 
         // TODO: This should also represent the miss on z axis
         const int offset = std::min<int>( range, std::sqrt( aim.missed_by_tiles ) );
