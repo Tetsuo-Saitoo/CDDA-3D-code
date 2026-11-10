@@ -10,6 +10,7 @@ target_sources(cataclysm-tiles-common PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/held.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/shot.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/gun_faults.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/bullet_paths.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/item_hands.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/worldgen.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/test_range.cpp

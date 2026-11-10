@@ -41,6 +41,7 @@
 #include "fp3d/cheats.h"
 #include "fp3d/cooking.h"
 #include "fp3d/game_access.h"
+#include "fp3d/bullet_paths.h"
 #include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
 #include "fp3d/item_hands.h"
@@ -100,6 +101,7 @@ const vpart_id vpart_tank_small( "tank_small" );
 const ter_str_id ter_t_door_c( "t_door_c" );
 const ter_str_id ter_t_floor( "t_floor" );
 const ter_str_id ter_t_wall( "t_wall" );
+const ter_str_id ter_t_concrete_wall( "t_concrete_wall" );
 const ter_str_id ter_t_stairs_down( "t_stairs_down" );
 const ter_str_id ter_t_stairs_up( "t_stairs_up" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
@@ -2191,6 +2193,8 @@ static bool run_combat_checks()
         int ay = 0;
         int wx = 0;                 // a wall square (0, 0 = none)
         int wy = 0;
+        int wall_row = 0;           // a concrete wall along this row, across the scene's width, and one along
+                                    // its west edge (11 west) so nothing flies out of the scene (0 = none)
         int rounds = -1;            // rounds in the gun (-1 = full)
         bool spare_mag = false;     // carry a full spare magazine
         bool second_mag = false;    // and a second one with 5 rounds (two stacks, so CDDA asks which)
@@ -2263,9 +2267,24 @@ static bool run_combat_checks()
             if( sc->wx != 0 || sc->wy != 0 ) {
                 here.ter_set( p + tripoint_rel_ms( sc->wx, sc->wy, 0 ), ter_t_wall );
             }
+            if( sc->wall_row != 0 ) {
+                for( int dx = -10; dx <= 2; dx++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, sc->wall_row, 0 );
+                    if( here.inbounds( q ) && !here.veh_at( q ) ) {
+                        here.ter_set( q, ter_t_concrete_wall );
+                    }
+                }
+                for( int dy = -5; dy <= 5; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( -11, dy, 0 );
+                    if( here.inbounds( q ) && !here.veh_at( q ) ) {
+                        here.furn_set( q, furn_str_id::NULL_ID() );
+                        here.ter_set( q, ter_t_concrete_wall );
+                    }
+                }
+            }
             u.set_all_parts_hp_to_max();
             u.clear_effects();
-            for( const char *s : { "gun", "pistol", "smg", "throw" } ) {
+            for( const char *s : { "gun", "pistol", "smg", "shotgun", "rifle", "throw" } ) {
                 u.set_skill_level( skill_id( s ), sc->skill );
             }
             u.recoil = sc->steady ? 0.0 : MAX_RECOIL;
@@ -2450,6 +2469,10 @@ static bool run_combat_checks()
     // How the target request is answered: FIRE, an aim-and-shoot action, a cancel (all with the shot), or FIRE
     // while throwing.
     enum class answer_with { fire, aimed_shot, cancel };
+    // Answer a shell's shot request for each pellet too: with `per` (each), or also a ghost, a hit off the line and
+    // 3 more than asked (mixed).
+    enum class pellets_with { none, each, mixed };
+    pellets_with pellet_answers = pellets_with::none;
     // Builds `sc`, starts `action`, answers the target request with `with` and the FIRE answer's shot `plan` (with
     // `fly`), and each shot request with `per` (nullopt: cancel).
     const auto run = [&]( const scene & sc, const char *action, answer_with with, const claim & plan, bool fly,
@@ -2519,6 +2542,20 @@ static bool run_combat_checks()
                 r.shots.push_back( *c );
                 if( per ) {
                     a.shot = make_shot( *per, sc, *c, r.before, false );
+                    if( pellet_answers != pellets_with::none ) {
+                        const fp3d::pellet_answer pa{ a.shot->end, a.shot->hit_uid, a.shot->part, a.shot->quality };
+                        a.shot->pellets.assign( c->pellets.size(), pa );
+                        if( pellet_answers == pellets_with::mixed && a.shot->pellets.size() >= 2 ) {
+                            fp3d::pellet_answer ghost = pa;
+                            ghost.hit_uid = 0x7fffffffULL;
+                            fp3d::pellet_answer side = pa;
+                            side.hit_uid = r.before.side_uid;
+                            side.end = at( *c, sc.sx, sc.sy );
+                            a.shot->pellets[0] = ghost;
+                            a.shot->pellets[1] = side;
+                            a.shot->pellets.insert( a.shot->pellets.end(), 3, pa );
+                        }
+                    }
                 } else {
                     a.cancel = true;
                 }
@@ -2665,6 +2702,106 @@ static bool run_combat_checks()
         check( fired( r, 3 ) && r.shots.size() == 2 && delta( r.c0.asked, r.c1.asked ) == 2 &&
                delta( r.c0.capped, r.c1.capped ) == 1, "burst past the request cap: CDDA's own path",
                counts( r ) + ", " + std::to_string( r.shots.size() ) + " shot requests" );
+    }
+    // A shotgun shell's shot request names each pellet's spread, and the answer for each pellet counts as a
+    // projectile of its own: 00 buck at a zombie 4 squares west, every pellet claimed on it. Without pellets in the
+    // answer (an older client) the whole shell spreads around its one outcome, as before.
+    {
+        scene shell = point_blank;
+        shell.zx = -4;
+        shell.gun = "remington_870";
+        shell.ammo = "shot_00";
+        pellet_answers = pellets_with::each;
+        const result r = run( shell, "fire", answer_with::fire, head, true, head );
+        pellet_answers = pellets_with::none;
+        const fp3d::ui_request s = r.shots.empty() ? fp3d::ui_request() : r.shots.front();
+        bool spreads = !s.pellets.empty() && s.pellets.size() <= fp3d::max_shot_pellets;
+        for( const float v : s.pellets ) {
+            spreads = spreads && std::isfinite( v ) && std::abs( v ) <= 1800.0f;
+        }
+        check( r.shots.size() == 1 && spreads, "shell: the shot request names each pellet",
+               std::to_string( s.pellets.size() ) + " pellets" );
+        const int64_t pellets = delta( r.c0.pellets, r.c1.pellets );
+        check( fired( r, 1 ) && delta( r.c0.accepted, r.c1.accepted ) == 1 &&
+               pellets == static_cast<int64_t>( s.pellets.size() ) && r.after.hp < r.before.hp,
+               "shell: each pellet's answer checked and rolled", counts( r ) + ", pellets +" + std::to_string( pellets ) );
+        const result o = run( shell, "fire", answer_with::fire, head, true, head );
+        check( fired( o, 1 ) && delta( o.c0.accepted, o.c1.accepted ) == 1 && delta( o.c0.pellets, o.c1.pellets ) == 0 &&
+               o.after.hp < o.before.hp, "shell: one outcome without pellets", counts( o ) );
+        // a pellet naming a creature not offered, one hitting a creature off its line, and 3 more than asked:
+        // those two are refused, the extra ones ignored
+        scene mixed = shell;
+        mixed.sx = -3;
+        mixed.sy = 4;
+        pellet_answers = pellets_with::mixed;
+        const result m = run( mixed, "fire", answer_with::fire, head, true, head );
+        pellet_answers = pellets_with::none;
+        const size_t asked = m.shots.empty() ? 0 : m.shots.front().pellets.size();
+        const int64_t passed = delta( m.c0.pellets, m.c1.pellets );
+        check( fired( m, 1 ) && asked >= 3 && passed == static_cast<int64_t>( asked ) - 2 &&
+               m.after.side_hp == m.before.side_hp, "shell: bad pellets refused, extra ones ignored",
+               counts( m ) + ", pellets +" + std::to_string( passed ) + " of " + std::to_string( asked ) );
+    }
+    // A bullet with damage to spare goes on through the body it hit: 9mm (26) through a zombie (20) keeps 6.
+    {
+        scene in_line = point_blank;
+        in_line.zx = -2;
+        in_line.sx = -5;
+        const fp3d::path_counts p0 = fp3d::get_path_counts();
+        const result r = run( in_line, "fire", answer_with::fire, head, false, std::nullopt );
+        const fp3d::path_counts p1 = fp3d::get_path_counts();
+        // the event names the zombie hit and ends past it
+        bool past = false;
+        for( const fp3d::event &e : r.projectiles ) {
+            past = past || ( r.target && e.other == r.before.uid &&
+                             std::max( std::abs( e.pos.x - r.target->origin.x ), std::abs( e.pos.y - r.target->origin.y ) ) >= 3 );
+        }
+        check( fired( r, 1 ) && r.after.hp < r.before.hp && p1.through == p0.through + 1 && past,
+               "bullet goes on through the body it hit", counts( r ) + ", through +" +
+               std::to_string( p1.through - p0.through ) + ( past ? ", ends past it" : ", stops at it" ) );
+    }
+    // A bullet meeting a wall at a shallow angle may glance off it, never head-on: a concrete wall along the row 2
+    // north, 16 shots at its square 10 west (11 degrees off its face), then 4 straight at it.
+    {
+        scene glance = point_blank;
+        glance.zx = 0;
+        glance.wall_row = -2;
+        glance.ax = -10;
+        glance.ay = -2;
+        const claim at_wall = { who::none, -10, -2, "", 0.99f };
+        const fp3d::path_counts p0 = fp3d::get_path_counts();
+        int shots = 0;
+        int bounced = 0;
+        int flew_on = 0;    // ... to the west wall, 10 out: past the wall square it glanced off (8 or so west)
+        for( int i = 0; i < 16; i++ ) {
+            const uint64_t before = fp3d::get_path_counts().ricochets;
+            const result r = run( glance, "fire", answer_with::fire, at_wall, false, std::nullopt );
+            shots += fired( r, 1 ) ? 1 : 0;
+            if( fp3d::get_path_counts().ricochets == before || !r.target ) {
+                continue;
+            }
+            bounced++;
+            for( const fp3d::event &e : r.projectiles ) {
+                if( std::max( std::abs( e.pos.x - r.target->origin.x ), std::abs( e.pos.y - r.target->origin.y ) ) >= 10 ) {
+                    flew_on++;
+                    break;
+                }
+            }
+        }
+        const fp3d::path_counts p1 = fp3d::get_path_counts();
+        scene head_on = glance;
+        head_on.ax = 0;
+        const claim north = { who::none, 0, -2, "", 0.99f };
+        int straight = 0;
+        for( int i = 0; i < 4; i++ ) {
+            straight += fired( run( head_on, "fire", answer_with::fire, north, false, std::nullopt ), 1 ) ? 1 : 0;
+        }
+        const fp3d::path_counts p2 = fp3d::get_path_counts();
+        check( shots == 16 && bounced > 0 && p1.ricochets == p0.ricochets + bounced && flew_on == bounced,
+               "bullet glances off a wall and flies on", std::to_string( shots ) + " shots, " +
+               std::to_string( bounced ) + " ricochets, " + std::to_string( flew_on ) + " flew on" );
+        check( straight == 4 && p2.ricochets == p1.ricochets, "  never head-on",
+               std::to_string( straight ) + " shots, " + std::to_string( p2.ricochets - p1.ricochets ) + " ricochets" );
     }
     // The client's part only weights CDDA's pick (QA): point blank, skilled, every hit claimed on the head dead
     // centre; the head lands on some of them, not on all (a roll against its chance times 4).

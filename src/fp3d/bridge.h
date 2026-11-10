@@ -70,9 +70,21 @@ struct ui_request {
     std::string pause_reason;
     float shot_error = 0.0f;             // shot: the error CDDA rolled for this projectile, arcmin
     float shot_angle = 0.0f;             // shot: which way off the sight line, degrees (0 up, 90 the shooter's right)
+    std::vector<float> pellets;          // shot: a shell's pellets, each one's turn off that line, arcmin (+ = right)
     float dispersion = 0.0f;             // target (fire): max error after aiming in the current mode; shot: max, arcmin
     float dispersion_typical = 0.0f;     // target (fire): the average error, arcmin (0 = not sent)
     bool weapon_wielded = false;         // target (fire): the gun aimed is the avatar's wielded item
+};
+
+// Pellets a shot request names and a shot answer may carry, at most.
+constexpr size_t max_shot_pellets = 32;
+
+// Where one pellet of a shell went (shot answers to a request with `pellets`).
+struct pellet_answer {
+    ui_point end;                        // absolute square where the pellet stopped
+    uint64_t hit_uid = 0;                // creature hit, 0 = miss
+    std::string part;                    // body part / weak point id, "" = CDDA picks
+    float quality = 0.3f;                // 0 dead centre .. <1 grazing
 };
 
 // A shot the client flew itself (target requests with FIRE, and shot requests): see fp3d/shot.h.
@@ -82,6 +94,9 @@ struct shot_answer {
     std::string part;                    // body part / weak point id, "" = CDDA picks
     float quality = 0.3f;                // 0 dead centre .. <1 grazing
     bool fly = false;                    // target: send a `shot` request for each projectile of this trigger pull
+    // shot: one per pellet of the request, in its order (nullopt: that pellet takes CDDA's own path); none = the
+    // whole shell spreads around this answer's outcome
+    std::vector<std::optional<pellet_answer>> pellets;
 };
 
 struct ui_answer {

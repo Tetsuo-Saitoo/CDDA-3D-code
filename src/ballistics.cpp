@@ -12,6 +12,7 @@
 
 #include "character.h"
 #include "fp3d/events.h" // FP3D:
+#include "fp3d/bullet_paths.h" // FP3D:
 #include "fp3d/shot.h" // FP3D:
 #include "fp3d/snapshot.h" // FP3D:
 #include "coordinates.h"
@@ -278,9 +279,13 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         }
     }
 
+    // FP3D: every pellet's spread, CDDA's own roll moved up from the pellet loop below, so the shot request of a
+    // client-flown shell can name them (fp3d/shot.h)
+    const std::vector<fp3d::pellet> fp3d_pellets = fp3d::roll_pellets( proj_arg );
     // FP3D: the client's outcome for this projectile (fp3d/shot.h); the roll above decides whether it can hit
-    const fp3d::projectile_scope fp3d_shot( *here, origin, source, target_arg, proj_arg, dispersion, aim );
+    fp3d::projectile_scope fp3d_shot( *here, origin, source, target_arg, proj_arg, dispersion, aim, fp3d_pellets );
     const fp3d::shot_outcome *fp3d_out = fp3d_shot.outcome();
+    const bool fp3d_hit = fp3d_out != nullptr && fp3d_out->hit_uid != 0;
 
     // TODO: move to-hit roll back in here
 
@@ -313,16 +318,17 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
 
     // If we were targeting a tile rather than a monster, don't overshoot
     // Unless the target was a wall, then we are aiming high enough to overshoot
+    // FP3D: a client hit aims at its creature, so it overshoots as a shot at a creature does
     const bool no_overshoot = proj_effects.count( ammo_effect_NO_OVERSHOOT ) ||
-                              ( creatures.creature_at( here->get_abs( target_arg ) ) == nullptr && here->passable( target_arg ) );
+                              ( !fp3d_hit && creatures.creature_at( here->get_abs( target_arg ) ) == nullptr &&
+                                here->passable( target_arg ) );
 
     double extend_to_range = no_overshoot ? range : proj_arg.range;
 
     tripoint_bub_ms target = target_arg;
-    if( fp3d_out != nullptr && fp3d_out->hit_uid != 0 ) { // FP3D: the client's hit stops at its creature
+    if( fp3d_hit ) { // FP3D: the client's hit is at its creature (a bullet may go on through it)
         target = fp3d_out->end;
         range = rl_dist( source, target );
-        extend_to_range = range;
         aim.missed_by_tiles = 0.0;
     }
     std::vector<tripoint_bub_ms> trajectory;
@@ -394,6 +400,8 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         trajectory.insert( trajectory.end(), trajectory_extension.begin(), trajectory_extension.end() );
     }
 
+    // FP3D: a bullet goes on through bodies and glances off walls (fp3d/bullet_paths.h)
+    const bool fp3d_paths = fp3d::paths_apply( proj_arg, is_bullet, stream );
     bool first = true;
     bool print_messages = true;
     bool multishot = false;
@@ -407,18 +415,41 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
         tripoint_bub_ms target_c = target;
         std::vector<tripoint_bub_ms> t_copy = trajectory;
         double spread = 0;
+        // FP3D: this pellet's own outcome when the client flew each pellet, else the projectile's
+        fp3d_shot.select_pellet( static_cast<size_t>( j ) );
+        const fp3d::shot_outcome *fp3d_pellet = fp3d_shot.outcome();
+        bool fp3d_bounced = false;
+        bool fp3d_passed = false;               // went on through a body
+        Creature *fp3d_first_hit = nullptr;     // the event names it after a bullet went on through
+        damage_instance fp3d_wall_impact;       // the bullet's damage before the square it is shot into
+
         // calculate dispersion from shot_spread
         if( proj.shot_spread > 0 ) {
-            double sample = rng_normal( -proj.shot_spread, proj.shot_spread );
-            sample = sample >= 0 ? sample : -sample;
-            units::angle arc = std::min( units::from_arcmin( sample ), 30_degrees );
+            // FP3D: in an FP3D game rolled before the projectile flew (fp3d::roll_pellets)
+            const bool fp3d_rolled = static_cast<size_t>( j ) < fp3d_pellets.size();
+            units::angle arc;
+            if( fp3d_rolled ) {
+                arc = units::from_arcmin( fp3d_pellets[j].arcmin );
+            } else {
+                double sample = rng_normal( -proj.shot_spread, proj.shot_spread );
+                sample = sample >= 0 ? sample : -sample;
+                arc = std::min( units::from_arcmin( sample ), 30_degrees );
+            }
             spread = tan( arc / 2 ) * 2.0;
             double max_spread = spread * ( t_copy.size() - 1 );
-            if( max_spread >= 1.0 ) {
+            if( fp3d_pellet != nullptr && fp3d_shot.per_pellet() && fp3d_pellet->hit_uid != 0 ) {
+                // FP3D: the client's hit for this pellet, at its creature's square
+                target_c = fp3d_pellet->end;
+                t_copy = { source, first_p };
+                if( target_c != first_p ) {
+                    const std::vector<tripoint_bub_ms> to_hit = here->find_clear_path( first_p, target_c );
+                    t_copy.insert( t_copy.end(), to_hit.begin(), to_hit.end() );
+                }
+            } else if( max_spread >= 1.0 ) {
                 double dx = target_c.x() - source.x();
                 double dy = target_c.y() - source.y();
                 units::angle d = units::atan2( dy, dx );
-                d += ( one_in( 2 ) ? 1 : -1 ) * arc;
+                d += ( fp3d_rolled ? fp3d_pellets[j].side : ( one_in( 2 ) ? 1 : -1 ) ) * arc;
                 target_c.x() = std::clamp( source.x() + roll_remainder( range * cos( d ) ),
                                            0, MAPSIZE_X - 1 );
                 target_c.y() = std::clamp( source.y() + roll_remainder( range * sin( d ) ),
@@ -546,9 +577,9 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                 cur_missed_by = std::max( rng_float( 0.1, 1.5 - aim.missed_by ) /
                                           critter->ranged_target_size(), 0.4 );
             }
-            if( fp3d_out != nullptr && critter != nullptr ) { // FP3D: the client's hit counts for its creature only
-                cur_missed_by = fp3d::outcome_missed_by( *fp3d_out, *critter, cur_missed_by, tp == target_arg,
-                                aim.missed_by, spread * std::max( distance - 1, 0 ) );
+            if( fp3d_pellet != nullptr && critter != nullptr ) { // FP3D: the client's hit counts for its creature only
+                cur_missed_by = fp3d::outcome_missed_by( *fp3d_pellet, *critter, cur_missed_by, tp == target_arg,
+                                aim.missed_by, fp3d_shot.per_pellet() ? 0.0 : spread * std::max( distance - 1, 0 ) );
             }
             // If the attack is shot, once we're past point-blank,
             // don't print normal hit msg.
@@ -580,6 +611,9 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                 // Critter can still dodge the projectile
                 // In this case hit_critter won't be set
                 if( attack.last_hit_critter != nullptr ) {
+                    if( fp3d_first_hit == nullptr ) {
+                        fp3d_first_hit = attack.last_hit_critter;
+                    }
                     const field_type_id blood_type = critter->bloodType();
                     if( blood_type ) {
                         const size_t bt_len = blood_trail_len( attack.dealt_dam.total_damage() );
@@ -593,6 +627,15 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                         sfx::do_projectile_hit( *attack.last_hit_critter );
                     }
                     has_momentum = false;
+                    // FP3D: a bullet with damage to spare goes on through the body (fp3d/bullet_paths.h)
+                    if( fp3d_paths ) {
+                        const double left = fp3d::through_body( proj, *attack.last_hit_critter );
+                        if( left > 0.0 ) {
+                            proj.impact.mult_damage( left );
+                            has_momentum = true;
+                            fp3d_passed = true;
+                        }
+                    }
                     // on-hit effects for inflicted damage types
                     for( const std::pair<const damage_type_id, int> &dt : attack.dealt_dam.dealt_dams ) {
                         dt.first->onhit_effects( origin, attack.last_hit_critter );
@@ -601,6 +644,9 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
             } else if( in_veh != nullptr && veh_pointer_or_null( here->veh_at( tp ) ) == in_veh ) {
                 // Don't do anything, especially don't call map::shoot as this would damage the vehicle
             } else {
+                if( fp3d_paths ) {
+                    fp3d_wall_impact = proj.impact;     // FP3D: map::shoot clears it when it stops the bullet
+                }
                 double it = here->shoot( tp, proj, !no_item_damage && tp == target_c );
                 if( it > 0 ) {
                     // even if it's a shot, as we will never use impact after point-blank,
@@ -623,6 +669,16 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
                 proj.count = 1;
             }
 
+            // FP3D: a bullet a wall stopped may glance off it at a shallow angle, once (fp3d/bullet_paths.h)
+            if( fp3d_paths && !has_momentum && !fp3d_bounced && attack.last_hit_critter == nullptr &&
+                fp3d::ricochet( *here, proj, fp3d_wall_impact, t_copy, i, prev_point,
+                                proj_arg.range - rl_dist( source, prev_point ) ) ) {
+                fp3d_bounced = true;
+                has_momentum = true;
+                traj_len = t_copy.size();
+                --i;    // the loop goes on with the bounce's first square
+                continue;
+            }
             if( ( !has_momentum || !is_bullet ) && here->impassable( tp ) ) {
                 // Don't let flamethrowers go through walls
                 // TODO: Let them go through bars
@@ -631,10 +687,14 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
             }
             prev_point = tp;
         }
+        // FP3D: a bullet that went on through a body and hit nothing more still hit it (callers read this)
+        if( fp3d_passed && attack.last_hit_critter == nullptr ) {
+            attack.last_hit_critter = fp3d_first_hit;
+        }
         // FP3D: the flight path for the client
         if( fp3d::events_enabled() ) {
             const item &drop = proj.get_drop();
-            fp3d::on_projectile( *here, origin, t_copy, tp, attack.last_hit_critter,
+            fp3d::on_projectile( *here, origin, t_copy, tp, fp3d_first_hit,
                                  drop.is_null() ? "" : drop.typeId().str() );
         }
         // Done with the trajectory!

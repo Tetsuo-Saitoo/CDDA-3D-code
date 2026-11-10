@@ -10,7 +10,9 @@
 //   to the first projectile only, on the game turn it was set.
 // - With `fly`, each projectile of that trigger pull sends one `shot` request with the error CDDA rolled for it;
 //   the client flies that bullet and answers where it went. A cancel, or an answer that fails the checks, leaves
-//   that projectile to CDDA's own path (the plan's outcome is not used with `fly`).
+//   that projectile to CDDA's own path (the plan's outcome is not used with `fly`). A shotgun shell's request also
+//   names each pellet's spread (CDDA's own roll, roll_pellets); the client flies every pellet, and each pellet's
+//   answer is checked and rolled as a projectile of its own along the shell's line turned by its spread.
 // A client hit counts only if the creature's own roll hits (CDDA's roll for the aimed square's creature; for any
 // other, its square's distance off the projectile's line against its size, never better than CDDA's roll for an
 // unintended hit), with goodhit = max(that roll, the client's quality). A client miss, or a hit its roll misses,
@@ -95,20 +97,36 @@ struct shot_outcome {
     std::string part;           // the client's part; checked again when the hit lands
 };
 
+// One pellet's spread off the shell's line: `arcmin` (0..1800) to the shooter's right (side +1) or left (-1).
+struct pellet {
+    double arcmin = 0.0;
+    int side = 1;
+};
+// ballistics.cpp: every pellet's spread for `proj` in an FP3D game, rolled before the projectile flies as CDDA
+// rolls each one in its pellet loop (none without shot_spread, or outside FP3D games: CDDA's own roll order).
+std::vector<pellet> roll_pellets( const projectile &proj );
+
 // projectile_attack: one per call, right after CDDA's dispersion roll. In the avatar's firing_scope the outermost
-// call decides the projectile's outcome (with one `shot` request when the plan flies); nested calls (a bounce)
-// and other shooters get none, so CDDA's own path runs. Throws shutdown_signal like ask().
+// call decides the projectile's outcome (with one `shot` request when the plan flies, naming `pellets` for a
+// shell); nested calls (a bounce) and other shooters get none, so CDDA's own path runs. Throws shutdown_signal
+// like ask().
 class projectile_scope
 {
     public:
         projectile_scope( map &here, const Creature *origin, const tripoint_bub_ms &source,
                           const tripoint_bub_ms &target, const projectile &proj, const dispersion_sources &dispersion,
-                          const projectile_attack_aim &aim );
+                          const projectile_attack_aim &aim, const std::vector<pellet> &pellets );
         ~projectile_scope();
         projectile_scope( const projectile_scope & ) = delete;
         projectile_scope &operator=( const projectile_scope & ) = delete;
-        // null: CDDA's own path
+        // null: CDDA's own path. For a shell whose pellets the client flew one by one, the current pellet's (see
+        // select_pellet()); none before the pellet loop.
         const shot_outcome *outcome() const;
+        // The pellet loop's pellet `j` is next: outcome() and the client's part become its own when the client
+        // flew each pellet; else nothing changes.
+        void select_pellet( size_t j );
+        // Whether outcome() is a pellet's own: its roll already counts the pellet's spread.
+        bool per_pellet() const;
         // With `fly`: the side (+1 / -1, the sign CDDA's wild miss adds its angle with) the shot request's deviated
         // line turned to, which CDDA's wild miss takes instead of its coin flip; the angle is CDDA's own roll.
         std::optional<int> wild_side() const;
@@ -143,7 +161,8 @@ struct shot_counts {
     uint64_t asked = 0;         // `shot` requests sent
     uint64_t accepted = 0;      // `shot` answers that passed the checks
     uint64_t refused = 0;       // `shot` answers cancelled, without a shot, or failing a check
-    uint64_t capped = 0;        // `fly` projectiles past the cap: CDDA's own path, not asked
+    uint64_t pellets = 0;       // pellet answers that passed the checks (their shot answer counts as accepted)
+    uint64_t capped = 0;       // `fly` projectiles past the cap: CDDA's own path, not asked
     uint64_t planned = 0;       // FIRE-answer outcomes that passed the checks (first projectile)
     uint64_t parts = 0;         // client parts that landed
     uint64_t spared = 0;        // creatures met on the path that a claim's missed roll kept from a second roll
