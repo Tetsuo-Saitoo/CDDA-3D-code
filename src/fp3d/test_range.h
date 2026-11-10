@@ -7,9 +7,10 @@
 // outcome; the range only builds the scene and offers a few operations (spawn, teleport, time, heal, AI freeze).
 //
 // World: `fp3d-range`, quiet world options (no cities, monster spawns, hordes or random NPCs), a fixed seed and start
-// time. The avatar value `fp3d_range` marks a range game (saves keep it). Zones lie 8 OMT apart on one row, so only
-// one is in the reality bubble at a time; each uses at most 120x120 squares around its centre square (the north-west
-// corner of its centre OMT), z -1..+1. A zone is built the first time the player gets there (avatar value
+// time. The avatar value `fp3d_range` marks a range game (saves keep it, but a loaded save is never a range game: see
+// range_active). Zones lie 8 OMT apart on one row, so only one is in the reality bubble at a time; each uses at most
+// 120x120 squares around its centre square (the north-west corner of its centre OMT), z -1..+1. A zone is built the
+// first time the player teleports there, or again on rebuild_zone (avatar value
 // `fp3d_range_built_<id>`): the area is cleared (floor, solid ground below, open air above, no furniture, items,
 // vehicles, traps, fields or creatures) and the content placed.
 //
@@ -72,6 +73,15 @@ constexpr size_t pen_monsters_per_zone = 100;
 constexpr int max_spawn_count = 1000;
 constexpr int max_advance_minutes = 10080;       // a week
 constexpr size_t max_monster_id = 64;
+// The range clock stops this many days after the start of the game (about 10 years): set_time_of_day and advance
+// refuse to go past it, far from the end of CDDA's 32-bit turn counter.
+constexpr int max_range_days = 3650;
+// Teleport: when the zone centre is taken (a creature, a vehicle) or blocked, the player arrives on the nearest
+// free passable square at most this far from it.
+constexpr int arrival_search_squares = 10;
+// Zone ids are at most max_zone_id characters; a halls zone's id is its base (hall_id_bases) plus "_NN".
+constexpr size_t max_zone_id = 64;
+constexpr size_t max_hall_id_base = 54;
 
 // Sim side, after boot_new_game_data( "fp3d-range", true, headless ): seeds CDDA's RNG, makes the world quiet, fixes
 // the start date (spring, day 2, 10:00), creates a fixed avatar, marks the game as a range, starts it in the hub, builds
@@ -82,9 +92,15 @@ void reset_test_range();
 // True in a game boot_test_range started (game thread). The avatar value alone (a save, a mod) doesn't make one.
 bool range_active();
 
-// The zones (game thread), hub first, the rest sorted by id; built on first use from the loaded data, so a loaded
-// range save gets the same zones. Empty when not in a range game.
+// The zones (game thread), hub first, the rest sorted by id, ids unique; built on first use from the loaded data
+// (the same data gives the same zones). Empty when not in a range game: a loaded save never is one, whatever its
+// avatar values say (range_active needs the session boot_test_range starts).
 const std::vector<range_zone> &range_zones();
+// The id base of each item category's halls zones, in order: "halls_" plus the category id in lower case ('_' for
+// anything but a-z, 0-9 and '_'), at most max_hall_id_base characters. Unique: a base already taken (two
+// categories that differ only in case or punctuation, or only past the cap) gets "-2", "-3", ..., cut to stay
+// within the cap. Either thread (no game state).
+std::vector<std::string> hall_id_bases( const std::vector<std::string> &categories );
 range_counts range_content_counts();
 // The zone the avatar stands in, -1 if none.
 int current_zone();
@@ -105,7 +121,8 @@ const std::vector<hub_prop> &hub_props();
 
 // The pieces of gallery zone `zone` (empty if it isn't a gallery): every terrain and furniture id on its own square
 // with space around; emitters in their own rows at the south edge. The player arrives on the centre square; stairs up
-// are one square east of it (z0 -> z1). Game thread.
+// are one square east of it (z0 -> z1). Plants get a seed under them and open air a wall below, so they stay as they
+// are when the submaps load again. Game thread.
 struct gallery_piece {
     std::string id;
     bool furniture = false;
@@ -118,16 +135,26 @@ constexpr range_offset gallery_stairs{ 1, 0, 0 };
 // ("Only between turns.") unless called from the before-ask hook of a main-loop (timed) request (in_timed_hook):
 // never in the middle of an action, never from another thread. They also refuse outside range games and once the
 // player is dead. The client asks for them through fp3d/cheats.h (request_range_op).
-// `count` copies (or charges) of the item with session itype index `itype` (snapshot / id tables) on `square`.
+// `count` copies (or charges) of the item with session itype index `itype` (snapshot / id tables) on `square`, as
+// many as fit there (nothing spills onto the squares around); "Nothing was placed." when none did.
 std::string spawn_item( uint32_t itype, int count, const ui_point &square );
 // A monster `mtype` (id, at most 64 characters) on `square`: in the bubble, passable, nobody there.
 std::string spawn_monster( const std::string &mtype, const ui_point &square );
-// Moves the player to zone `index` (range games only) and builds it the first time.
+// Moves the player to zone `index` (range games only) and builds it the first time. The player lets go of what it
+// grabbed and stops hauling; its auto-move route and the client's queued actions are dropped. It arrives on the
+// zone centre, or when that is taken or blocked on the nearest free passable square (arrival_search_squares); with
+// none free it goes back where it was and the teleport is refused.
 std::string teleport_to_zone( size_t index );
-// Jumps forward to the next `minute` of the day (0..1439): today if still ahead, else tomorrow.
+// Clears zone `index` and builds it again (range games only). Refused while the player is in that zone, rides or is
+// in a vehicle. The zone's area is loaded for the build and the player's surroundings again after it (like two
+// teleports, but the player stays on its square); its auto-move route is dropped.
+std::string rebuild_zone( size_t index );
+// Jumps forward to the next `minute` of the day (0..1439): today if still ahead, else tomorrow; the current minute
+// (to the turn) changes nothing. Refused past max_range_days after the start.
 std::string set_time_of_day( int minute );
 // Waits `minutes` (1..10080) as real turns: CDDA's wait activity, which the main loop runs turn by turn (fast-forward,
-// interrupted like any wait). Returns once it is started.
+// interrupted like any wait). Returns once it is started. Refused when it would end past max_range_days after the
+// start.
 std::string advance( int minutes );
 // Monsters and NPCs skip their turns (no plans, no moves, no attacks); they still take damage and die. Not kept in
 // saves.

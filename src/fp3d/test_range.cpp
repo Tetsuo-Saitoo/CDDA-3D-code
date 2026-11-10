@@ -8,6 +8,8 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <stdexcept>
 #include <utility>
 
@@ -82,6 +84,8 @@ const ter_str_id ter_stairs_up( "t_stairs_up" );
 const ter_str_id ter_stairs_down( "t_stairs_down" );
 const field_type_str_id field_fire( "fd_fire" );
 const itype_id itype_gasoline( "gasoline" );
+// Planted in the gallery's plant furniture (any seed will do).
+const itype_id itype_plant_seed( "seed_wheat" );
 
 // Overmap square of zone 0; zone i is zone_spacing_omt * i further east.
 const tripoint_abs_omt range_origin( 20, 90, 0 );
@@ -158,12 +162,13 @@ std::mutex info_mutex;
 fp3d::range_info info_latest;
 uint64_t info_seq = 0;
 
-// Lower-case letters, digits and '_' only, capped: zone ids end up in avatar value names and the client.
-std::string id_part( const std::string &s )
+// Lower-case letters, digits and '_' only, at most `cap` characters: zone ids end up in avatar value names and the
+// client.
+std::string id_part( const std::string &s, size_t cap )
 {
     std::string out;
     for( const char c : s ) {
-        if( out.size() >= 48 ) {
+        if( out.size() >= cap ) {
             break;
         }
         const bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) || c == '_';
@@ -263,10 +268,18 @@ void build_registry()
         zones.push_back( std::move( z ) );
     }
     add_parts( zones, fp3d::zone_kind::armory, "armory", "Armory", c.guns, fp3d::armory_guns_per_zone );
-    for( const auto &[cat, n] : c.items_per_category ) {
+    std::vector<std::string> cats;
+    cats.reserve( c.items_per_category.size() );
+    for( const auto &cat_n : c.items_per_category ) {
+        cats.push_back( cat_n.first );
+    }
+    // Categories whose ids differ only in case or punctuation would share an id: the bases are made unique.
+    const std::vector<std::string> bases = fp3d::hall_id_bases( cats );
+    for( size_t i = 0; i < cats.size() && i < bases.size(); i++ ) {
+        const std::string &cat = cats[i];
         const item_category_id cid( cat );
         const std::string label = cid.is_valid() ? cid->name_header() : cat;
-        add_parts( zones, fp3d::zone_kind::halls, "halls_" + id_part( cat ), "Halls: " + label, n,
+        add_parts( zones, fp3d::zone_kind::halls, bases[i], "Halls: " + label, c.items_per_category[i].second,
                    fp3d::hall_items_per_zone, cat );
     }
     add_parts( zones, fp3d::zone_kind::lots, "lots", "Vehicle lot", c.vehicles, fp3d::lot_vehicles_per_zone );
@@ -468,9 +481,24 @@ void build_gallery( size_t index, const tripoint_abs_ms &s )
             continue;
         }
         if( piece.furniture ) {
-            here.furn_set( p, furn_str_id( piece.id ).id() );
+            const furn_id f = furn_str_id( piece.id ).id();
+            // A plant needs its seed under it, as CDDA's planted plots have (mapgen's sealed_item): without one the
+            // next load of the submap (map::grow_plant) logs an error and removes the plant.
+            if( f->has_flag( ter_furn_flag::TFLAG_PLANT ) && itype_plant_seed.is_valid() ) {
+                here.add_item( p, item( itype_plant_seed, calendar::turn ) );
+            }
+            here.furn_set( p, f );
         } else {
-            here.ter_set( p, ter_str_id( piece.id ).id() );
+            const ter_id t = ter_str_id( piece.id ).id();
+            // Open air over natural rock becomes a rock floor whenever the submap loads again (map::add_tree_tops):
+            // a wall under it keeps it open.
+            if( t->has_flag( "EMPTY_SPACE" ) ) {
+                const tripoint_bub_ms below = p + tripoint_rel_ms::below;
+                if( here.inbounds( below ) ) {
+                    here.ter_set( below, ter_wall.id() );
+                }
+            }
+            here.ter_set( p, t );
         }
     }
     // Working stairs: up one square east of the arrival square, a landing round the top.
@@ -533,6 +561,45 @@ void settle_avatar()
     here.invalidate_map_cache( u.posz() );
     here.build_map_cache( u.posz() );
     g->update_overmap_seen();
+}
+
+// Before the player is taken away from where it stands, as CDDA's own moves that put you elsewhere (game.cpp drops the
+// grab there): let go of what is grabbed (it stays behind), stop hauling, forget the auto-move route. The client's
+// queued actions were meant for the old place: dropped too.
+void leave_square( avatar &u )
+{
+    if( u.get_grab_type() != object_type::NONE ) {
+        u.grab( object_type::NONE );
+    }
+    u.stop_hauling();
+    u.clear_destination();
+    fp3d::clear_actions();
+}
+
+// Where the player arrives in a zone whose area is loaded: `centre` when it is free, else the nearest free square at
+// most arrival_search_squares from it (ring by ring). Free: in the bubble, passable, no vehicle part, no monster
+// or NPC (the avatar itself, the one moving, doesn't count). nullopt if there is none.
+std::optional<tripoint_abs_ms> arrival_square( const tripoint_abs_ms &centre )
+{
+    map &here = get_map();
+    creature_tracker &tracker = get_creature_tracker();
+    for( const tripoint_bub_ms &p : closest_points_first( here.get_bub( centre ), fp3d::arrival_search_squares ) ) {
+        if( !here.inbounds( p ) || !here.passable( p ) || here.veh_at( p ) ||
+            tracker.creature_at<monster>( p, true ) != nullptr || tracker.creature_at<npc>( p ) != nullptr ) {
+            continue;
+        }
+        return here.get_abs( p );
+    }
+    return std::nullopt;
+}
+
+// Loads the bubble round `omt` (CDDA's overmap teleport: the creatures of the old bubble are saved, a vehicle the
+// player is in is left) and puts the avatar on `square` in it: it is still where it was, outside the new bubble, and
+// must be in before anything looks at what it sees. settle_avatar() before the turn goes on.
+void load_bubble_at( const tripoint_abs_omt &omt, const tripoint_abs_ms &square )
+{
+    g->place_player_overmap( omt, false );
+    get_avatar().setpos( square, false );
 }
 
 void quiet_world_options()
@@ -714,6 +781,32 @@ bool range_active()
     return session.load() && g != nullptr && avatar_flag( range_var );
 }
 
+std::vector<std::string> hall_id_bases( const std::vector<std::string> &categories )
+{
+    static const std::string prefix = "halls_";
+    static_assert( max_hall_id_base > 8 && max_hall_id_base + 10 <= max_zone_id, "room for '_NN' parts" );
+    std::vector<std::string> out;
+    out.reserve( categories.size() );
+    std::set<std::string> used;
+    for( const std::string &cat : categories ) {
+        std::string base = prefix + id_part( cat, max_hall_id_base - prefix.size() );
+        if( !used.insert( base ).second ) {
+            // Taken: the first free "-k", the base cut to make room (ends in a digit, so no base made from a
+            // category id, which has no '-', can match it later).
+            for( size_t k = 2; ; k++ ) {
+                const std::string suffix = "-" + std::to_string( k );
+                std::string candidate = base.substr( 0, max_hall_id_base - suffix.size() ) + suffix;
+                if( used.insert( candidate ).second ) {
+                    base = std::move( candidate );
+                    break;
+                }
+            }
+        }
+        out.push_back( std::move( base ) );
+    }
+    return out;
+}
+
 const std::vector<range_zone> &range_zones()
 {
     static const std::vector<range_zone> none;
@@ -837,6 +930,20 @@ std::string op_refusal()
     return "";
 }
 
+// Whether moving the clock `ahead` would pass the range clock's end, max_range_days after the start of the game.
+// In 64 bits: never overflows, whatever the clock says.
+bool past_clock_end( const time_duration &ahead )
+{
+    const int64_t end = int64_t{ to_turn<int>( calendar::start_of_game ) } + int64_t{ max_range_days } *
+                        to_turns<int64_t>( 1_days );
+    return int64_t{ to_turn<int>( calendar::turn ) } + to_turns<int64_t>( ahead ) > end;
+}
+
+std::string clock_end_refusal()
+{
+    return string_format( "The range clock stops %d days after the start.", max_range_days );
+}
+
 bool coord_ok( const ui_point &p )
 {
     const auto ok = []( int v ) {
@@ -854,11 +961,11 @@ std::string spawn_item( uint32_t itype, int count, const ui_point &square )
     if( count < 1 || count > max_spawn_count ) {
         return string_format( "Count must be 1 to %d.", max_spawn_count );
     }
-    const std::vector<std::string> names = id_names( id_kind::itype );
-    if( itype == 0 || itype >= names.size() ) {
+    const std::string name = id_name( id_kind::itype, itype );
+    if( name.empty() ) {
         return "No such item type.";
     }
-    const itype_id type( names[itype] );
+    const itype_id type( name );
     if( !type.is_valid() || type.is_null() || type->has_flag( range_pseudo ) ) {
         return "That item type can't be spawned.";
     }
@@ -870,14 +977,19 @@ std::string spawn_item( uint32_t itype, int count, const ui_point &square )
     if( !here.inbounds( p ) ) {
         return "That square is outside the reality bubble.";
     }
+    // On that square only (no overflow onto its neighbours): as many as fit.
     item it( type, calendar::turn );
+    int placed = 0;
     if( it.count_by_charges() ) {
         it.charges = count;
-        here.add_item_or_charges( p, it );
+        placed = here.add_item_or_charges( p, it, false ).is_null() ? 0 : count;
     } else {
-        for( int i = 0; i < count; i++ ) {
-            here.add_item_or_charges( p, it );
+        while( placed < count && !here.add_item_or_charges( p, it, false ).is_null() ) {
+            placed++;
         }
+    }
+    if( placed == 0 ) {
+        return "Nothing was placed.";
     }
     return "";
 }
@@ -938,15 +1050,55 @@ std::string teleport_to_zone( size_t index )
         return "No such zone.";
     }
     avatar &u = get_avatar();
+    leave_square( u );
+    const tripoint_abs_ms back = u.pos_abs();
+    const bool was_in_vehicle = u.in_vehicle;
     const tripoint_abs_ms dest = zone_centre( zones[index] );
-    g->place_player_overmap( zones[index].centre, false );
-    // The avatar is still where it was (outside the new bubble): put it on the arrival square before anything
-    // looks at what it sees.
-    u.setpos( dest, false );
+    load_bubble_at( zones[index].centre, dest );
     if( !zones[index].built ) {
         build_zone( index );
     }
-    u.setpos( dest, false );
+    const std::optional<tripoint_abs_ms> arrive = arrival_square( dest );
+    if( !arrive ) {
+        // Back where it was (its square was its own: still free), in the vehicle it was in.
+        load_bubble_at( project_to<coords::omt>( back ), back );
+        map &here = get_map();
+        if( was_in_vehicle && here.veh_at( u.pos_bub() ).part_with_feature( "BOARDABLE", true ) ) {
+            here.board_vehicle( u.pos_bub(), &u );
+        }
+        settle_avatar();
+        reg().version++;
+        return "No free square to arrive on there.";
+    }
+    u.setpos( *arrive, false );
+    settle_avatar();
+    reg().version++;
+    return "";
+}
+
+std::string rebuild_zone( size_t index )
+{
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
+    }
+    const std::vector<range_zone> &zones = range_zones();
+    if( index >= zones.size() ) {
+        return "No such zone.";
+    }
+    if( current_zone() == static_cast<int>( index ) ) {
+        return "Not while you are in that zone.";
+    }
+    avatar &u = get_avatar();
+    // The overmap teleport below would leave the vehicle or the mount behind.
+    if( u.in_vehicle || u.is_mounted() ) {
+        return "Not while riding or in a vehicle.";
+    }
+    // Bubble coordinates change on the way: the route would point elsewhere.
+    u.clear_destination();
+    const tripoint_abs_ms back = u.pos_abs();
+    load_bubble_at( zones[index].centre, zone_centre( zones[index] ) );
+    build_zone( index );
+    load_bubble_at( project_to<coords::omt>( back ), back );
     settle_avatar();
     reg().version++;
     return "";
@@ -960,12 +1112,18 @@ std::string set_time_of_day( int minute )
     if( minute < 0 || minute > 1439 ) {
         return "The minute of the day must be 0 to 1439.";
     }
-    const time_point day_start = calendar::turn - time_past_midnight( calendar::turn );
-    time_point target = day_start + time_duration::from_minutes( minute );
-    if( target <= calendar::turn ) {
-        target += 1_days;
+    // Ahead of now to that minute: today if still ahead, tomorrow if already past, nothing if now.
+    time_duration ahead = time_duration::from_minutes( minute ) - time_past_midnight( calendar::turn );
+    if( ahead < 0_turns ) {
+        ahead += 1_days;
     }
-    calendar::turn = target;
+    if( ahead == 0_turns ) {
+        return "";
+    }
+    if( past_clock_end( ahead ) ) {
+        return clock_end_refusal();
+    }
+    calendar::turn += ahead;
     get_weather().update_weather();
     g->reset_light_level();
     get_map().invalidate_map_cache( get_avatar().posz() );
@@ -979,6 +1137,9 @@ std::string advance( int minutes )
     }
     if( minutes < 1 || minutes > max_advance_minutes ) {
         return string_format( "Minutes must be 1 to %d.", max_advance_minutes );
+    }
+    if( past_clock_end( time_duration::from_minutes( minutes ) ) ) {
+        return clock_end_refusal();
     }
     avatar &u = get_avatar();
     if( u.activity ) {

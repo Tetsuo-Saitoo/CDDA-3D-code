@@ -1,8 +1,9 @@
 // K7 test range test: boots the range (fixed seed) with CDDA's game loop on a worker thread behind the bridge and
-// drives it like a client. Checks the zone registry, every hub prop, the gallery (every terrain and furniture id, working
-// stairs), the range operations (and that bad input is refused), frozen AI (and that unfreezing lets the hub zombie
-// act), and the median turn time in the hub and the gallery. Range operations run on the sim thread, in the hook that
-// runs before each request. Exit code 0 only if every check passed.
+// drives it like a client. Checks the zone registry (unique ids), every hub prop, the gallery (every terrain and
+// furniture id, working stairs), the range operations (and that bad input is refused, the clock's end, a full square),
+// teleport arrival next to a taken centre, rebuilding a zone, frozen AI (and that unfreezing lets the hub zombie act),
+// and the median turn time in the hub and the gallery. Range operations run on the sim thread, in the hook that runs
+// before each request. Exit code 0 only if every check passed.
 //
 // usage: fp3d-range-test   (run from the cdda/ folder)
 #include <algorithm>
@@ -33,6 +34,7 @@
 #include "creature_tracker.h"
 #include "debug.h"
 #include "do_turn.h"
+#include "enums.h"
 #include "field_type.h"
 #include "fp3d/boot.h"
 #include "fp3d/bridge.h"
@@ -346,6 +348,19 @@ size_t check_registry()
         }
     }
     check( sorted && ids.size() == zones.size(), "hub first and built, the rest sorted by id, unique" );
+    bool ids_ok = true;
+    std::string bad_id;
+    for( const fp3d::range_zone &z : zones ) {
+        bool ok = !z.id.empty() && z.id.size() <= fp3d::max_zone_id;
+        for( const char c : z.id ) {
+            ok = ok && ( ( c >= 'a' && c <= 'z' ) || ( c >= '0' && c <= '9' ) || c == '_' || c == '-' );
+        }
+        if( !ok && bad_id.empty() ) {
+            bad_id = z.id;
+        }
+        ids_ok = ids_ok && ok;
+    }
+    check( ids_ok, "zone ids: a-z 0-9 _ -, at most max_zone_id characters", bad_id );
     check( spaced, "zones 8 OMT apart on one row" );
     const auto has_kind = [&]( fp3d::zone_kind k, size_t want_at_least ) {
         return static_cast<size_t>( per_kind[fp3d::zone_kind_name( k )] ) >= want_at_least;
@@ -361,6 +376,31 @@ size_t check_registry()
         }
     }
     return 0;
+}
+
+// Halls id bases from categories that collide (case, punctuation, past the cap): unique, capped, stable.
+void check_zone_ids()
+{
+    std::printf( "zone ids:\n" );
+    const std::string longer( 80, 'a' );
+    const std::vector<std::string> cats = {
+        "food", "Food", "FOOD", "fo-od", "fo_od", "fo od", "", "!", longer, longer + "b", longer + "c",
+        std::string( fp3d::max_hall_id_base, 'z' ), std::string( fp3d::max_hall_id_base, 'z' ) + "Z"
+    };
+    const std::vector<std::string> bases = fp3d::hall_id_bases( cats );
+    std::set<std::string> unique( bases.begin(), bases.end() );
+    bool capped = bases.size() == cats.size();
+    std::string list;
+    for( const std::string &b : bases ) {
+        capped = capped && b.size() <= fp3d::max_hall_id_base && b.compare( 0, 6, "halls_" ) == 0;
+        list += b.substr( 0, 14 ) + ( b.size() > 14 ? "..(" + std::to_string( b.size() ) + ")" : "" ) + " ";
+    }
+    check( unique.size() == cats.size() && capped, "hall id bases: colliding categories get unique, capped ids",
+           list.substr( 0, 160 ) );
+    check( bases.size() >= 3 && bases[0] == "halls_food" && bases[1] == "halls_food-2" && bases[2] == "halls_food-3",
+           "hall id bases: the first keeps its id, the rest -2, -3",
+           bases.size() >= 3 ? bases[1] + " " + bases[2] : "" );
+    check( fp3d::hall_id_bases( cats ) == bases, "hall id bases: the same categories give the same ids" );
 }
 
 void check_hub()
@@ -484,7 +524,8 @@ void check_operations( size_t gallery )
     std::string off_loop;
     for( const std::string &r : {
              fp3d::spawn_item( rock, 1, ui( rock_sq ) ), fp3d::spawn_monster( "mon_zombie", ui( offset( s, 5, 5 ) ) ),
-             fp3d::teleport_to_zone( 0 ), fp3d::set_time_of_day( 600 ), fp3d::advance( 1 ), fp3d::heal()
+             fp3d::teleport_to_zone( 0 ), fp3d::set_time_of_day( 600 ), fp3d::advance( 1 ), fp3d::heal(),
+             fp3d::rebuild_zone( 1 )
          } ) {
         off_loop += r.empty() ? "[accepted]" : "[" + r + "]";
     }
@@ -526,6 +567,34 @@ void check_operations( size_t gallery )
     }
     check( all_refused, "spawn_item: bad index, count or square refused", why.substr( 0, 120 ) );
 
+    // A square that holds no more: as many as fit, then "Nothing was placed." (nothing spills next door).
+    const uint32_t can = fp3d::intern_id( fp3d::id_kind::itype, "jerrycan" );
+    const tripoint_abs_ms full_sq = offset( s, -3, 4 );
+    std::string fill;
+    std::string full;
+    int cans = 0;
+    int cans_after = -1;
+    int next_door = -1;
+    on_sim( [&] {
+        fill = fp3d::spawn_item( can, fp3d::max_spawn_count, ui( full_sq ) );
+        cans = items_of( full_sq, "jerrycan" );
+        full = fp3d::spawn_item( can, 1, ui( full_sq ) );
+        cans_after = items_of( full_sq, "jerrycan" );
+        next_door = 0;
+        for( int dy = -2; dy <= 2; dy++ ) {
+            for( int dx = -2; dx <= 2; dx++ ) {
+                next_door += dx == 0 && dy == 0 ? 0 : items_of( offset( full_sq, dx, dy ), "jerrycan" );
+            }
+        }
+        map &here = get_map();
+        here.i_clear( here.get_bub( full_sq ) );
+    } );
+    check( fill.empty() && cans > 0 && cans < fp3d::max_spawn_count && next_door == 0,
+           "spawn_item: as many as fit, on that square only", ok_or( fill ) + " " + std::to_string( cans ) +
+           " jerrycans, " + std::to_string( next_door ) + " next door" );
+    check( full == "Nothing was placed." && cans_after == cans, "spawn_item: into a full square refused",
+           ok_or( full ) );
+
     // spawn_monster
     const tripoint_abs_ms mon_sq = offset( s, 4, 4 );
     bad.clear();
@@ -566,7 +635,9 @@ void check_operations( size_t gallery )
     // set_time_of_day
     int64_t before_turn = 0;
     int64_t after_turn = 0;
+    int64_t same_turn = 0;
     int minute_now = -1;
+    std::string same;
     bad.clear();
     good.clear();
     on_sim( [&] {
@@ -574,6 +645,12 @@ void check_operations( size_t gallery )
         good = fp3d::set_time_of_day( 600 );
         after_turn = to_turns<int64_t>( calendar::turn - calendar::turn_zero );
         minute_now = to_minutes<int>( time_past_midnight( calendar::turn ) );
+        // Again at the same minute, three times: nothing moves (it used to add a day each time).
+        for( int i = 0; i < 3; i++ ) {
+            const std::string r = fp3d::set_time_of_day( 600 );
+            same += r.empty() ? "" : "[" + r + "]";
+        }
+        same_turn = to_turns<int64_t>( calendar::turn - calendar::turn_zero );
         bad.push_back( fp3d::set_time_of_day( -1 ) );
         bad.push_back( fp3d::set_time_of_day( 1440 ) );
         bad.push_back( fp3d::set_time_of_day( INT32_MIN ) );
@@ -585,6 +662,32 @@ void check_operations( size_t gallery )
            "set_time_of_day: 10:00, forward", ok_or( good ) + " minute " + std::to_string( minute_now ) );
     all_refused = bad.size() == 3 && !bad[0].empty() && !bad[1].empty() && !bad[2].empty();
     check( all_refused, "set_time_of_day: out of range refused, clock untouched" );
+    check( same.empty() && same_turn == after_turn, "set_time_of_day: the current minute leaves the clock alone",
+           same + " " + std::to_string( same_turn - after_turn ) + " turns moved" );
+
+    // The clock's end: half an hour before it, an hour ahead is refused (both ways), the current minute is fine. The
+    // clock is put back afterwards (only refusals ran: nothing else saw the far future).
+    std::string end_tod;
+    std::string end_adv;
+    std::string end_same;
+    std::string end_past;
+    bool end_untouched = false;
+    on_sim( [&] {
+        const time_point saved = calendar::turn;
+        const time_point end = calendar::start_of_game + time_duration::from_days( fp3d::max_range_days );
+        calendar::turn = end - 30_minutes;
+        const int m = to_minutes<int>( time_past_midnight( calendar::turn ) );
+        end_tod = fp3d::set_time_of_day( ( m + 60 ) % 1440 );
+        end_adv = fp3d::advance( 60 );
+        end_same = fp3d::set_time_of_day( m );
+        end_untouched = calendar::turn == end - 30_minutes;
+        calendar::turn = end + 1_hours;
+        end_past = fp3d::advance( 1 );
+        end_untouched = end_untouched && calendar::turn == end + 1_hours;
+        calendar::turn = saved;
+    } );
+    check( !end_tod.empty() && !end_adv.empty() && !end_past.empty() && end_same.empty() && end_untouched,
+           "clock: past max_range_days refused, clock untouched", "[" + end_tod + "][" + end_adv + "]" );
 
     // advance: real turns through CDDA's wait activity
     bad.clear();
@@ -793,6 +896,129 @@ void check_gallery( size_t gallery )
            snap ? "z " + std::to_string( snap->player.pos.z ) : "" );
 }
 
+// Teleport onto a zone whose centre is taken (a monster there): the player lands next to it and lets go of its grab
+// and route. The player stands on the gallery's stairs (check_gallery). Leaves rocks on the gallery floor for
+// check_rebuild to see cleared.
+void check_teleport_arrival( size_t gallery )
+{
+    std::printf( "teleport arrival:\n" );
+    const tripoint_abs_ms c = centre_of( gallery );
+    const uint32_t rock = fp3d::intern_id( fp3d::id_kind::itype, "rock" );
+    std::string spawned;
+    std::string tp;
+    std::string mon;
+    std::string marker;
+    bool grabbed = false;
+    bool routed = false;
+    bool let_go = false;
+    bool no_route = false;
+    tripoint_abs_ms at;
+    int zone = -1;
+    int rocks = -1;
+    on_sim( [&] {
+        map &here = get_map();
+        avatar &u = get_avatar();
+        spawned = fp3d::spawn_monster( "mon_zombie", ui( c ) );
+        u.grab( object_type::FURNITURE, tripoint_rel_ms( 0, 1, 0 ) );
+        grabbed = u.get_grab_type() == object_type::FURNITURE;
+        u.set_destination( { here.get_bub( offset( c, 3, 3 ) ) } );
+        routed = u.has_destination();
+        tp = fp3d::teleport_to_zone( gallery );
+        at = u.pos_abs();
+        let_go = u.get_grab_type() == object_type::NONE;
+        no_route = !u.has_destination();
+        zone = fp3d::current_zone();
+        map &now = get_map();
+        if( monster *m = get_creature_tracker().creature_at<monster>( now.get_bub( c ) ) ) {
+            mon = m->type->id.str();
+            g->remove_zombie( *m );
+        }
+        marker = fp3d::spawn_item( rock, 3, ui( offset( c, 2, -2 ) ) );
+        rocks = items_of( offset( c, 2, -2 ), "rock" );
+    } );
+    const int dist = std::max( std::abs( at.x() - c.x() ), std::abs( at.y() - c.y() ) );
+    check( spawned.empty() && tp.empty() && mon == "mon_zombie" && dist == 1 && at.z() == c.z() &&
+           zone == static_cast<int>( gallery ), "teleport: centre taken, lands on a free square next to it",
+           ok_or( spawned ) + " " + ok_or( tp ) + " " + mon + " at centre+(" + std::to_string( at.x() - c.x() ) + "," +
+           std::to_string( at.y() - c.y() ) + "," + std::to_string( at.z() - c.z() ) + ")" );
+    check( grabbed && routed && let_go && no_route, "teleport: lets go of the grab, drops the auto-move route" );
+    check( marker.empty() && rocks == 3, "gallery: rocks left on the floor", ok_or( marker ) );
+}
+
+// rebuild_zone: refused for the zone the player is in (the hub) and bad indices; from the hub the gallery is built
+// again (its rocks gone, its pieces in place) while the hub and the player stay as they were.
+void check_rebuild( size_t gallery )
+{
+    std::printf( "rebuild:\n" );
+    const tripoint_abs_ms s = centre_of( 0 );
+    const tripoint_abs_ms c = centre_of( gallery );
+    std::vector<std::string> bad;
+    std::string good;
+    tripoint_abs_ms before;
+    tripoint_abs_ms after;
+    mon_state mons_before;
+    mon_state mons_after;
+    int zone = -1;
+    int hub_rocks = -1;
+    bool built = false;
+    on_sim( [&] {
+        const size_t n = fp3d::range_zones().size();
+        bad.push_back( fp3d::rebuild_zone( 0 ) );
+        bad.push_back( fp3d::rebuild_zone( n ) );
+        bad.push_back( fp3d::rebuild_zone( static_cast<size_t>( -1 ) ) );
+        before = get_avatar().pos_abs();
+        mons_before = monsters_now();
+        good = fp3d::rebuild_zone( gallery );
+        after = get_avatar().pos_abs();
+        mons_after = monsters_now();
+        zone = fp3d::current_zone();
+        hub_rocks = items_of( offset( s, 2, 2 ), "rock" );
+        built = fp3d::range_zones()[gallery].built;
+    } );
+    bool refused = bad.size() == 3;
+    std::string why;
+    for( const std::string &b : bad ) {
+        refused = refused && !b.empty();
+        why += "[" + b + "]";
+    }
+    check( refused, "rebuild_zone: the zone you are in and bad indices refused", why.substr( 0, 120 ) );
+    check( good.empty() && built && before == after && zone == 0 && hub_rocks == 5,
+           "rebuild_zone: from the hub, the player and the hub untouched", ok_or( good ) + " zone " +
+           std::to_string( zone ) + " hub rocks " + std::to_string( hub_rocks ) );
+    check( mons_before == mons_after && !mons_after.empty(), "rebuild_zone: the hub's monsters back in place",
+           std::to_string( mons_before.size() ) + " before, " + std::to_string( mons_after.size() ) + " after" );
+
+    std::string tp;
+    int rocks = -1;
+    size_t pieces = 0;
+    size_t missing = 0;
+    std::string missing_ids;
+    bool stairs = false;
+    on_sim( [&] {
+        tp = fp3d::teleport_to_zone( gallery );
+        map &here = get_map();
+        rocks = items_of( offset( c, 2, -2 ), "rock" );
+        const std::vector<fp3d::gallery_piece> list = fp3d::gallery_pieces( gallery );
+        pieces = list.size();
+        for( const fp3d::gallery_piece &p : list ) {
+            const tripoint_bub_ms b = here.get_bub( offset( c, p.at.x, p.at.y, p.at.z ) );
+            const std::string there = p.furniture ? here.furn( b ).id().str() : here.ter( b ).id().str();
+            if( there != p.id ) {
+                missing++;
+                if( missing <= 8 ) {
+                    missing_ids += p.id + "(" + there + ") ";
+                }
+            }
+        }
+        const fp3d::range_offset st = fp3d::gallery_stairs;
+        stairs = here.ter( here.get_bub( offset( c, st.x, st.y, 0 ) ) ).id().str() == "t_stairs_up" &&
+                 here.ter( here.get_bub( offset( c, st.x, st.y, 1 ) ) ).id().str() == "t_stairs_down";
+    } );
+    check( tp.empty() && rocks == 0 && pieces > 0 && missing == 0 && stairs,
+           "rebuild_zone: the gallery cleared and built again", ok_or( tp ) + " rocks " + std::to_string( rocks ) +
+           ", " + std::to_string( missing ) + " of " + std::to_string( pieces ) + " pieces missing " + missing_ids );
+}
+
 void check_info( size_t gallery )
 {
     std::printf( "range info:\n" );
@@ -851,6 +1077,7 @@ int main()
     }
     std::printf( "boot: first request after %.1f s\n", ms_since( boot_start ) / 1000.0 );
 
+    check_zone_ids();
     const size_t gallery = check_registry();
     check_hub();
     check_frozen( "hub" );
@@ -858,9 +1085,11 @@ int main()
     check_turn_time( "hub" );
     check_unfreeze();
     check_gallery( gallery );
+    check_teleport_arrival( gallery );
     check_turn_time( "gallery" );
     check_info( gallery );
     check_back_to_hub();
+    check_rebuild( gallery );
 
     fp3d::shutdown();
     sim.join();
