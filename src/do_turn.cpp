@@ -22,6 +22,7 @@
 #include "fp3d/cheats.h" // FP3D:
 #include "fp3d/events.h" // FP3D:
 #include "fp3d/held.h" // FP3D:
+#include "fp3d/test_range.h" // FP3D:
 #include "activity_type.h"
 #include "avatar.h"
 #include "bionics.h"
@@ -313,6 +314,15 @@ void monmove()
             }
         }
 
+        // FP3D: frozen AI (fp3d/test_range.h): no turn, plans, moves or attacks; fields still hurt
+        if( fp3d::ai_frozen() ) {
+            critter.set_moves( 0 );
+            if( !critter.is_dead() ) {
+                m.creature_in_field( critter );
+            }
+            continue;
+        }
+
         if( !critter.is_dead() ) {
             critter.process_turn();
         }
@@ -368,6 +378,12 @@ void monmove()
 
     // Now, do active NPCs.
     for( npc &guy : g->all_npcs() ) {
+        // FP3D: frozen AI (fp3d/test_range.h)
+        if( fp3d::ai_frozen() ) {
+            guy.set_moves( 0 );
+            m.creature_in_field( guy );
+            continue;
+        }
         int turns = 0;
         int real_count = 0;
         const int count_limit = std::max( 10, guy.get_moves() / 64 );

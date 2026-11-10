@@ -10,6 +10,8 @@
 #include <exception>
 #include <map>
 #include <memory>
+#include <optional>
+#include <set>
 #include <sstream>
 #include <string>
 #include <tuple>
@@ -164,6 +166,7 @@ int main()
                 }
             }
             check( bandaged > 0, "bandage on the left arm", std::to_string( bandaged ) );
+            check( !pv.wielded_gun, "no gun wielded: no wielded_gun" );
         }
 
         const std::shared_ptr<const fp3d::snapshot> again = timed_capture( ms );
@@ -173,6 +176,30 @@ int main()
         }
         check( shared == first->submaps.size() && again->seq == first->seq + 1,
                "nothing changed: every submap shared", std::to_string( shared ) + " shared" );
+        {
+            // A wielded gun: its type, fouling, loaded rounds and faults.
+            item gun( itype_id( "glock_19" ) );
+            gun.ammo_set( gun.ammo_default(), 7 );
+            gun.set_var( "dirt", 1234 );
+            const std::set<fault_id> potential = gun.faults_potential();
+            const std::string fault = potential.empty() ? std::string() : potential.begin()->str();
+            if( !potential.empty() ) {
+                gun.set_fault( *potential.begin(), true, false );
+            }
+            u.set_wielded_item( gun );
+            double gun_ms = 0;
+            const std::shared_ptr<const fp3d::snapshot> armed = timed_capture( gun_ms );
+            const std::optional<fp3d::gun_view> &g = armed->player.wielded_gun;
+            check( g && g->type == fp3d::intern_id( fp3d::id_kind::itype, "glock_19" ) && g->dirt == 1234 &&
+                   g->rounds == 7 && !fault.empty() && g->faults == std::vector<std::string> { fault },
+                   "wielded gun: type, dirt, rounds, faults", g ? std::to_string( g->rounds ) + " rounds" : "none" );
+            std::ostringstream gun_json;
+            fp3d::write_snapshot_json( gun_json, *armed, u.posz(), u.posz() );
+            check( gun_json.str().find( "\"wielded_gun\":{\"type\":" ) != std::string::npos &&
+                   gun_json.str().find( "\"dirt\":1234,\"rounds\":7,\"faults\":[\"" + fault + "\"]" ) !=
+                   std::string::npos, "wielded_gun in the JSON" );
+            u.remove_weapon();
+        }
 
         // One wall 3 squares east of the player: exactly one submap's shape revision moves.
         const tripoint_bub_ms wall_at = u.pos_bub() + tripoint_rel_ms( 3, 0, 0 );

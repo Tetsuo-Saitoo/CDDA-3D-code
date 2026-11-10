@@ -21,6 +21,9 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
+
+#include "fp3d/bridge.h"
 
 class avatar;
 
@@ -42,6 +45,30 @@ bool cheats_allowed();
 // first cheat turned on (or kit given) turns the game's achievements off, as CDDA's debug menu does.
 bool request_cheat( cheat c, bool on );
 bool request_test_kit();
+
+// The test range's operations (fp3d/test_range.h), asked for like cheats. They run in the before-ask hook of the
+// main loop's next request (run_range_requests), also while paused; the game refuses them outside range games.
+enum class range_op_kind : uint8_t { spawn_item, spawn_monster, teleport, time_of_day, advance, ai_frozen, heal };
+struct range_op {
+    range_op_kind kind = range_op_kind::heal;
+    uint32_t itype = 0;      // spawn_item: session itype index (id tables)
+    int64_t number = 0;      // spawn_item count, teleport zone index, time_of_day minute, advance minutes, ai_frozen 0/1
+    ui_point square;         // spawn_item, spawn_monster
+    std::string monster;     // spawn_monster: mtype id
+};
+constexpr size_t max_range_ops_waiting = 32;
+constexpr size_t max_range_results = 16;
+// Client side: the operation's id (1, 2, ...); 0 when cheats aren't allowed, max_range_ops_waiting already wait,
+// the monster id is longer than test_range.h's max_monster_id, or after shutdown. Disallowing cheats drops what waits.
+uint64_t request_range_op( const range_op &op );
+struct range_op_result {
+    uint64_t id = 0;
+    std::string error;       // "" = done
+};
+// Client side: the last max_range_results results, oldest first.
+std::vector<range_op_result> latest_range_results();
+// Sim side, in the before-ask hook: runs what waits when it's a main-loop request's hook (in_timed_hook).
+void run_range_requests();
 
 struct cheats_view {
     uint64_t seq = 0;              // bumps on every publish; 0 = nothing published yet
