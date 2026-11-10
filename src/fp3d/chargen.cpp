@@ -2,11 +2,13 @@
 
 #include <algorithm>
 #include <array>
-#include <cctype>
+#include <cstdint>
 #include <filesystem>
 #include <map>
+#include <optional>
 #include <set>
 #include <sstream>
+#include <utility>
 #include <vector>
 
 #include "avatar.h"
@@ -159,21 +161,109 @@ void reset_to_scenario( avatar &u, const scenario &scen, const profession &prof 
 }
 
 constexpr size_t max_templates = 256;
+// Bigger template files are skipped (not listed, not loaded).
+constexpr std::uintmax_t max_template_bytes = 256 * 1024;
 
-// A template name the client may save under: 1-64 of letters, digits, space, _ - and not starting with a
-// space or dot, so it stays one plain file in the templates folder.
-bool template_name_ok( const std::string &n )
+bool ascii_alnum( char ch )
 {
-    if( n.empty() || n.size() > max_name_bytes || n.front() == ' ' || n.back() == ' ' ) {
-        return false;
+    return ( ch >= 'a' && ch <= 'z' ) || ( ch >= 'A' && ch <= 'Z' ) || ( ch >= '0' && ch <= '9' );
+}
+
+// A Windows device name (CON, PRN, AUX, NUL, COM0-9, LPT0-9, the console ones) in any case, also with an
+// extension or trailing spaces: Windows opens the device instead of a file of that name.
+bool device_name( const std::string &n )
+{
+    std::string base = n.substr( 0, n.find( '.' ) );
+    while( !base.empty() && base.back() == ' ' ) {
+        base.pop_back();
     }
-    for( const char ch : n ) {
-        const unsigned char u = static_cast<unsigned char>( ch );
-        if( !( std::isalnum( u ) || ch == ' ' || ch == '_' || ch == '-' ) ) {
-            return false;
+    for( char &ch : base ) {
+        if( ch >= 'A' && ch <= 'Z' ) {
+            ch = static_cast<char>( ch - 'A' + 'a' );
         }
     }
+    if( base == "con" || base == "prn" || base == "aux" || base == "nul" || base == "conin$" ||
+        base == "conout$" || base == "clock$" ) {
+        return true;
+    }
+    return base.size() == 4 && ( base.compare( 0, 3, "com" ) == 0 || base.compare( 0, 3, "lpt" ) == 0 ) &&
+           base[3] >= '0' && base[3] <= '9';
+}
+
+// A template name the client may save under: 1-64 of ASCII letters, digits, space, _ -, not starting or ending
+// with a space and not a device name, so it stays one plain file in the templates folder.
+bool template_name_ok( const std::string &n )
+{
+    if( n.empty() || n.size() > max_name_bytes || n.front() == ' ' || n.back() == ' ' || device_name( n ) ) {
+        return false;
+    }
+    return std::all_of( n.begin(), n.end(), []( char ch ) {
+        return ascii_alnum( ch ) || ch == ' ' || ch == '_' || ch == '-';
+    } );
+}
+
+// 1..max_bytes of valid UTF-8 (no overlong forms, surrogates or code points past U+10FFFF) and no control
+// characters (C0, DEL, C1). The bridge checks save names the same way.
+bool plain_text( const std::string &s, size_t max_bytes )
+{
+    if( s.empty() || s.size() > max_bytes ) {
+        return false;
+    }
+    static const std::array<uint32_t, 5> min_cp = { 0, 0, 0x80, 0x800, 0x10000 };
+    size_t i = 0;
+    while( i < s.size() ) {
+        const unsigned char c = static_cast<unsigned char>( s[i] );
+        if( c < 0x80 ) {
+            if( c < 0x20 || c == 0x7f ) {
+                return false;
+            }
+            i++;
+            continue;
+        }
+        size_t len = 0;
+        uint32_t cp = 0;
+        if( ( c & 0xe0 ) == 0xc0 ) {
+            len = 2;
+            cp = c & 0x1f;
+        } else if( ( c & 0xf0 ) == 0xe0 ) {
+            len = 3;
+            cp = c & 0x0f;
+        } else if( ( c & 0xf8 ) == 0xf0 ) {
+            len = 4;
+            cp = c & 0x07;
+        } else {
+            return false;
+        }
+        if( i + len > s.size() ) {
+            return false;
+        }
+        for( size_t k = 1; k < len; k++ ) {
+            const unsigned char cc = static_cast<unsigned char>( s[i + k] );
+            if( ( cc & 0xc0 ) != 0x80 ) {
+                return false;
+            }
+            cp = ( cp << 6 ) | ( cc & 0x3f );
+        }
+        if( cp < min_cp[len] || cp < 0xa0 || cp > 0x10ffff || ( cp >= 0xd800 && cp <= 0xdfff ) ) {
+            return false;
+        }
+        i += len;
+    }
     return true;
+}
+
+// A character name the game saves under, as the bridge's save_name_ok: plain text of at most max_name_bytes,
+// not starting with '#' (CDDA keeps such a name unencoded as the file name).
+bool name_ok( const std::string &n )
+{
+    return plain_text( n, max_name_bytes ) && n.front() != '#';
+}
+
+// A character name read from a template file: name_ok, and no path characters or edge spaces either.
+bool stored_name_ok( const std::string &n )
+{
+    return name_ok( n ) && n.front() != ' ' && n.back() != ' ' &&
+           n.find_first_of( "/\\:*?\"<>|" ) == std::string::npos;
 }
 
 pool_type chosen_pool()
@@ -181,9 +271,18 @@ pool_type chosen_pool()
     return multi_pool() ? pool_type::MULTI_POOL : pool_type::FREEFORM;
 }
 
+// A name typed in the client: control characters dropped, cut to max_name_bytes on a character boundary and
+// trimmed. The result still needs name_ok.
 std::string checked_name( const std::string &raw )
 {
-    std::string name = sanitize_text( raw, max_name_bytes );
+    std::string name = sanitize_text( raw, raw.size() );
+    if( name.size() > max_name_bytes ) {
+        size_t cut = max_name_bytes;
+        while( cut > 0 && ( static_cast<unsigned char>( name[cut] ) & 0xc0 ) == 0x80 ) {
+            --cut;
+        }
+        name.resize( cut );
+    }
     // Trim; the name becomes a save file name (CDDA encodes it), so keep it plain and non-empty.
     while( !name.empty() && name.back() == ' ' ) {
         name.pop_back();
@@ -194,9 +293,64 @@ std::string checked_name( const std::string &raw )
     }
     return name.substr( start );
 }
-// Writes `name: {choices}` for template `name` (as apply_chargen reads them); nothing if it doesn't load.
-// load_template sets CDDA's global scenario: put the old one back.
-void write_template_choices( JsonOut &jo, const std::string &name )
+
+std::filesystem::path template_path( const std::string &name )
+{
+    return std::filesystem::u8path( PATH_INFO::templatedir() + name + ".template" );
+}
+
+// Template `name`'s file if it is a regular file (not a link) of at most max_template_bytes: its time and size.
+bool template_file_ok( const std::string &name, std::filesystem::file_time_type &mtime, std::uintmax_t &size )
+{
+    namespace fs = std::filesystem;
+    const fs::path p = template_path( name );
+    std::error_code ec;
+    if( fs::symlink_status( p, ec ).type() != fs::file_type::regular || ec ) {
+        return false;
+    }
+    size = fs::file_size( p, ec );
+    if( ec || size > max_template_bytes ) {
+        return false;
+    }
+    mtime = fs::last_write_time( p, ec );
+    return !ec;
+}
+
+// Saves `u` as template `name`. False unless the file is there and new afterwards: avatar::save_template
+// reports nothing.
+bool save_template_checked( avatar &u, const std::string &name )
+{
+    namespace fs = std::filesystem;
+    const fs::path p = template_path( name );
+    std::error_code ec;
+    const fs::file_time_type before = fs::last_write_time( p, ec );
+    const bool existed = !ec;
+    u.save_template( name, chosen_pool() );
+    std::error_code ec2;
+    if( fs::symlink_status( p, ec2 ).type() != fs::file_type::regular || ec2 ) {
+        return false;
+    }
+    const fs::file_time_type after = fs::last_write_time( p, ec2 );
+    return !ec2 && ( !existed || after != before );
+}
+
+// What a template holds, as template_choices lists it.
+struct template_info {
+    std::string scenario;
+    std::string profession;
+    std::vector<std::string> backgrounds;
+    std::array<int, 4> stats = {};
+    std::vector<std::string> traits;
+    std::vector<std::pair<std::string, int>> skills;
+    std::string name;
+    bool male = true;
+    int age = 0;
+    int height = 0;
+};
+
+// Loads template `name` into a scratch avatar; nothing if it doesn't load. load_template sets CDDA's global
+// scenario: the old one is put back.
+std::optional<template_info> read_template( const std::string &name )
 {
     const scenario *before = get_scenario();
     avatar t;
@@ -210,45 +364,133 @@ void write_template_choices( JsonOut &jo, const std::string &name )
     const scenario *scen = get_scenario();
     set_scenario( before );
     if( !loaded || scen == nullptr || t.prof == nullptr ) {
-        return;
+        return std::nullopt;
     }
-    jo.member( name );
-    jo.start_object();
-    jo.member( "scenario", scen->ident().str() );
-    jo.member( "profession", t.prof->ident().str() );
-    std::vector<std::string> bgs;
+    template_info ti;
+    ti.scenario = scen->ident().str();
+    ti.profession = t.prof->ident().str();
     for( const profession *h : t.hobbies ) {
-        bgs.push_back( h->ident().str() );
+        if( h != nullptr && h->ident().is_valid() && ti.backgrounds.size() < max_list ) {
+            ti.backgrounds.push_back( h->ident().str() );
+        }
     }
-    write_strings( jo, "backgrounds", bgs );
-    jo.member( "str", t.str_max );
-    jo.member( "dex", t.dex_max );
-    jo.member( "int", t.int_max );
-    jo.member( "per", t.per_max );
-    std::vector<std::string> traits;
+    ti.stats = { t.str_max, t.dex_max, t.int_max, t.per_max };
     for( const trait_id &m : t.get_mutations( true ) ) {
         bool locked = scen->is_locked_trait( m ) || t.prof->is_locked_trait( m );
         for( const profession *h : t.hobbies ) {
-            locked = locked || h->is_locked_trait( m );
+            locked = locked || ( h != nullptr && h->is_locked_trait( m ) );
         }
-        if( !locked ) {
-            traits.push_back( m.str() );
+        if( !locked && m.is_valid() && ti.traits.size() < max_list ) {
+            ti.traits.push_back( m.str() );
         }
     }
-    write_strings( jo, "traits", traits );
-    jo.member( "skills" );
-    jo.start_object();
     for( const Skill &sk : Skill::skills ) {
         const int lvl = static_cast<int>( t.get_skill_level( sk.ident() ) );
         if( lvl > 0 && !sk.is_contextual_skill() ) {
-            jo.member( sk.ident().str(), std::min<int>( lvl, skill_costs.size() - 1 ) );
+            ti.skills.emplace_back( sk.ident().str(), std::min<int>( lvl, skill_costs.size() - 1 ) );
         }
     }
+    // The name is file data: sent only if the game could save under it.
+    ti.name = stored_name_ok( t.name ) ? t.name : std::string();
+    ti.male = t.male;
+    ti.age = t.base_age();
+    ti.height = t.base_height();
+    return ti;
+}
+
+struct cached_template {
+    std::filesystem::file_time_type mtime;
+    std::uintmax_t size = 0;
+    std::optional<template_info> info;
+};
+
+// Read templates by name, for the game data `key` names. Chargen runs on the sim thread only.
+struct template_cache_t {
+    std::string key;
+    std::map<std::string, cached_template> entries;
+};
+
+template_cache_t &template_cache()
+{
+    static template_cache_t cache;
+    return cache;
+}
+
+// The game data the cached templates were read with: the active world and its mods.
+std::string game_data_key()
+{
+    std::string key;
+    if( world_generator->active_world != nullptr ) {
+        key = world_generator->active_world->world_name;
+        for( const mod_id &m : world_generator->active_world->active_mod_order ) {
+            key += '\n' + m.str();
+        }
+    }
+    return key;
+}
+
+// Drops cached templates that aren't `listed`, or all of them if the game data changed.
+void prune_template_cache( const std::vector<std::string> &listed )
+{
+    template_cache_t &cache = template_cache();
+    const std::string key = game_data_key();
+    if( key != cache.key ) {
+        cache.entries.clear();
+        cache.key = key;
+    }
+    for( auto it = cache.entries.begin(); it != cache.entries.end(); ) {
+        if( std::find( listed.begin(), listed.end(), it->first ) == listed.end() ) {
+            it = cache.entries.erase( it );
+        } else {
+            ++it;
+        }
+    }
+}
+
+// Template `name` as read_template reads it, read again only when its file changed. Null if it doesn't load.
+const template_info *cached_template_info( const std::string &name )
+{
+    template_cache_t &cache = template_cache();
+    std::filesystem::file_time_type mtime;
+    std::uintmax_t size = 0;
+    if( !template_file_ok( name, mtime, size ) ) {
+        cache.entries.erase( name );
+        return nullptr;
+    }
+    auto it = cache.entries.find( name );
+    if( it == cache.entries.end() || it->second.mtime != mtime || it->second.size != size ) {
+        cached_template c;
+        c.mtime = mtime;
+        c.size = size;
+        c.info = read_template( name );
+        it = cache.entries.insert_or_assign( name, std::move( c ) ).first;
+    }
+    return it->second.info ? &*it->second.info : nullptr;
+}
+
+// Writes `name: {choices}` for template `name` (as apply_chargen reads them).
+void write_template_choices( JsonOut &jo, const std::string &name, const template_info &ti )
+{
+    jo.member( name );
+    jo.start_object();
+    jo.member( "scenario", ti.scenario );
+    jo.member( "profession", ti.profession );
+    write_strings( jo, "backgrounds", ti.backgrounds );
+    jo.member( "str", ti.stats[0] );
+    jo.member( "dex", ti.stats[1] );
+    jo.member( "int", ti.stats[2] );
+    jo.member( "per", ti.stats[3] );
+    write_strings( jo, "traits", ti.traits );
+    jo.member( "skills" );
+    jo.start_object();
+    for( const std::pair<std::string, int> &sk : ti.skills ) {
+        jo.member( sk.first, sk.second );
+    }
     jo.end_object();
-    jo.member( "name", t.name );
-    jo.member( "male", t.male );
-    jo.member( "age", t.base_age() );
-    jo.member( "height", t.base_height() );
+    jo.member( "name", ti.name );
+    jo.member( "male", ti.male );
+    jo.member( "age", ti.age );
+    jo.member( "height", ti.height );
     jo.end_object();
 }
 } // namespace
@@ -272,7 +514,8 @@ std::vector<std::string> list_templates()
             continue;
         }
         const std::string name = file.substr( 0, file.size() - ext.size() );
-        if( template_name_ok( name ) && out.size() < max_templates ) {
+        const std::uintmax_t size = it->file_size( ec2 );
+        if( template_name_ok( name ) && !ec2 && size <= max_template_bytes && out.size() < max_templates ) {
             out.push_back( name );
         }
     }
@@ -310,12 +553,17 @@ std::string chargen_catalog_json()
 
     // Default selection: the generic scenario and its cheapest profession, as CDDA's own screen starts.
     jo.member( "default_scenario", scenario::generic()->ident().str() );
-    write_strings( jo, "templates", list_templates() );
+    const std::vector<std::string> templates = list_templates();
+    write_strings( jo, "templates", templates );
     // What each template holds, in the answer's own format, so the client can open one for editing.
+    // Templates that don't load are left out.
+    prune_template_cache( templates );
     jo.member( "template_choices" );
     jo.start_object();
-    for( const std::string &t : list_templates() ) {
-        write_template_choices( jo, t );
+    for( const std::string &t : templates ) {
+        if( const template_info *ti = cached_template_info( t ) ) {
+            write_template_choices( jo, t, *ti );
+        }
     }
     jo.end_object();
 
@@ -446,7 +694,8 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
                 return "no template " + sanitize_text( del, 64 );
             }
             std::error_code ec;
-            std::filesystem::remove( std::filesystem::u8path( PATH_INFO::templatedir() + del + ".template" ), ec );
+            std::filesystem::remove( template_path( del ), ec );
+            template_cache().entries.erase( del );
             return ec ? "cannot delete template " + del : "deleted template " + del;
         }
         const std::string tmpl = jo.get_string( "template", "" );
@@ -456,6 +705,8 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
                 return "no template " + sanitize_text( tmpl, 64 );
             }
             u = avatar();
+            u.prof = profession::generic();
+            set_scenario( scenario::generic() );
             pool_type pool = pool_type::FREEFORM;
             if( !u.load_template( tmpl, pool ) ) {
                 return "cannot load template " + tmpl;
@@ -463,16 +714,20 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
             if( get_scenario() == nullptr || find_scenario( get_scenario()->ident().str() ) == nullptr ) {
                 return "the template's scenario isn't available";
             }
-            // As avatar::create( TEMPLATE ): recipes are relearnt in game.
-            u.forget_all_recipes();
+            // As avatar::create( TEMPLATE ): a transfer template ("Character to Template") is a played
+            // character and keeps its recipes and setup; other templates relearn recipes in game.
+            const bool transfer = pool == pool_type::TRANSFER;
+            if( !transfer ) {
+                u.forget_all_recipes();
+            }
             const std::string name = checked_name( jo.get_string( "name", "" ) );
             if( !name.empty() ) {
                 u.name = name;
-            }
-            if( u.name.empty() ) {
+            } else if( !stored_name_ok( u.name ) ) {
+                // The template's own name is file data: a random one if the game couldn't save under it.
                 u.pick_name();
             }
-            if( u.name.empty() || u.name.front() == '#' ) {
+            if( !name_ok( u.name ) ) {
                 return "bad name";
             }
             if( world_generator->active_world != nullptr &&
@@ -480,7 +735,9 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
                 return "a character named " + u.name + " already exists in this world";
             }
             u.set_body();
-            u.initialize( character_type::CUSTOM );
+            if( !transfer ) {
+                u.initialize( character_type::CUSTOM );
+            }
             return "";
         }
 
@@ -627,7 +884,7 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
             u.pick_name();
             name = u.name;
         }
-        if( name.empty() || name.front() == '#' ) {
+        if( !name_ok( name ) ) {
             return "bad name";
         }
         u.name = name;
@@ -654,7 +911,11 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
             if( !template_name_ok( save_as ) ) {
                 return "bad template name";
             }
-            u.save_template( save_as, chosen_pool() );
+            const bool saved = save_template_checked( u, save_as );
+            template_cache().entries.erase( save_as );
+            if( !saved ) {
+                return "cannot save template " + save_as;
+            }
         }
     }
     u.initialize( character_type::CUSTOM );
