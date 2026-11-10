@@ -823,6 +823,8 @@ int check_data_check()
         failed += ok ? 0 : 1;
     };
     std::printf( "  data check: this boot %s CDDA's check\n", fp3d::data_check_skipped() ? "skipped" : "ran" );
+    check( !fp3d::data_check_skipped(), "test programs always check (seeded RNG)" );
+    fp3d::allow_data_check_skip_in_tests( true );
     const std::vector<mod_id> mods = world_generator->active_world->active_mod_order;
     const std::optional<std::string> fp = fp3d::data_fingerprint( mods );
     check( fp && fp == fp3d::data_fingerprint( mods ), "same data, same fingerprint" );
@@ -884,6 +886,7 @@ int check_data_check()
     if( had_marker ) {
         fs::rename( kept, marker, ec );
     }
+    fp3d::allow_data_check_skip_in_tests( false );
     return failed;
 }
 

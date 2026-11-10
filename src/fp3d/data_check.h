@@ -28,6 +28,10 @@ void prepare_data_check( const std::vector<mod_id> &mods );
 void finish_data_check();
 // Whether the last prepare_data_check skipped the check (for tests and the boot log).
 bool data_check_skipped();
+// Test programs (CDDA's test_mode) check every boot and remember nothing: they build their scenes on a seeded RNG,
+// and CDDA's check draws random numbers, so skipping it would change everything after it. A test of the skip
+// itself allows it here for a while.
+void allow_data_check_skip_in_tests( bool allowed );
 
 // The fingerprint of `mods` (as load_world_modfiles loads them), or nullopt when the data must be checked
 // every time (a mod from outside the data folder, a world mods folder, too many files, an unreadable folder,

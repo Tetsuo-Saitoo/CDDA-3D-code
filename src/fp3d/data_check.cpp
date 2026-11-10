@@ -8,6 +8,7 @@
 #include <string_view>
 #include <system_error>
 
+#include "cached_options.h"
 #include "cata_path.h"
 #include "debug.h"
 #include "get_version.h"
@@ -40,6 +41,7 @@ constexpr size_t max_files = 100000;
 std::string pending;    // fingerprint to remember once the check has passed
 bool skipped = false;   // this boot skipped the check
 bool option_set = false;    // SKIP_VERIFICATION is "true" because of us, not the player
+bool test_skip_allowed = false;   // see allow_data_check_skip_in_tests
 
 void restore_option()
 {
@@ -324,8 +326,8 @@ void prepare_data_check( const std::vector<mod_id> &mods )
     restore_option();   // left over when the last boot failed before finish_data_check
     pending.clear();
     skipped = false;
-    if( get_option<bool>( "SKIP_VERIFICATION" ) ) {
-        return;   // the player's own choice
+    if( ( test_mode && !test_skip_allowed ) || get_option<bool>( "SKIP_VERIFICATION" ) ) {
+        return;   // a test program, or the player's own choice
     }
     const std::optional<std::string> fp = data_fingerprint( mods );
     if( !fp ) {
@@ -362,6 +364,11 @@ void finish_data_check()
 bool data_check_skipped()
 {
     return skipped;
+}
+
+void allow_data_check_skip_in_tests( bool allowed )
+{
+    test_skip_allowed = allowed;
 }
 
 } // namespace fp3d
