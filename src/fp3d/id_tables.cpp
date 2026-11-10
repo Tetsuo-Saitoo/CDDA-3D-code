@@ -14,7 +14,9 @@
 #include "damage.h"
 #include "field_type.h"
 #include "fp3d/snapshot.h"
+#include "fp3d/bridge.h"
 #include "item_factory.h"
+#include "item_pocket.h"
 #include "itype.h"
 #include "json.h"
 #include "mapdata.h"
@@ -244,6 +246,30 @@ void build_id_tables()
         }
         d.volume_ml = static_cast<int>( units::to_milliliter( it.volume ) );
         d.weight_g = static_cast<int>( units::to_gram( it.weight ) );
+        for( const pocket_data &p : it.pockets ) {
+            if( d.pockets.size() >= max_itype_pockets ) {
+                break;
+            }
+            if( p.type != pocket_type::CONTAINER ) {
+                continue;
+            }
+            pocket_def pd;
+            pd.name = sanitize_text( utf8_truncate( p.pocket_name.translated(), max_pocket_name_columns ),
+                                     4 * max_pocket_name_columns );
+            pd.volume_ml = std::clamp<int64_t>( units::to_milliliter( p.volume_capacity ), 0, 1000000000 );
+            pd.max_weight_g = std::clamp<int64_t>( units::to_gram( p.max_contains_weight ), 0, 10000000000LL );
+            if( p.max_item_volume ) {
+                pd.max_item_ml = std::clamp<int64_t>( units::to_milliliter( *p.max_item_volume ), 0, 1000000000 );
+            }
+            pd.flags = ( p.rigid ? pocket_rigid : 0 ) | ( p.watertight ? pocket_watertight : 0 ) |
+                       ( p.airtight ? pocket_airtight : 0 ) | ( p.holster ? pocket_holster : 0 ) |
+                       ( p.open_container ? pocket_open : 0 ) | ( p.sealed_data ? pocket_sealable : 0 ) |
+                       ( !p.ammo_restriction.empty() ? pocket_ammo_only : 0 ) |
+                       ( !p.item_id_restriction.empty() || !p.material_restriction.empty() ||
+                         !p.get_flag_restrictions().empty() ? pocket_restricted : 0 ) |
+                       ( p.forbidden ? pocket_forbidden : 0 );
+            d.pockets.push_back( std::move( pd ) );
+        }
     }
     const std::vector<std::string> mon_names = id_names( id_kind::mtype );
     t->monsters.resize( mon_names.size() );
@@ -348,6 +374,24 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         }
         jo.member( "volume_ml", d.volume_ml );
         jo.member( "weight_g", d.weight_g );
+        if( !d.pockets.empty() ) {
+            jo.member( "pockets" );
+            jo.start_array();
+            for( const pocket_def &p : d.pockets ) {
+                jo.start_object();
+                if( !p.name.empty() ) {
+                    jo.member( "name", p.name );
+                }
+                jo.member( "volume_ml", p.volume_ml );
+                jo.member( "max_weight_g", p.max_weight_g );
+                if( p.max_item_ml >= 0 ) {
+                    jo.member( "max_item_ml", p.max_item_ml );
+                }
+                jo.member( "flags", static_cast<int>( p.flags ) );
+                jo.end_object();
+            }
+            jo.end_array();
+        }
         jo.end_object();
     }
     jo.end_array();
