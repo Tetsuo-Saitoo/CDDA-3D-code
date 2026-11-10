@@ -1548,7 +1548,9 @@ static bool run_combat_checks()
     const std::shared_ptr<state> st = std::make_shared<state>();
     const auto hook = [st]() {
         std::optional<scene> sc;
-        {
+        // Only at the main loop's request: a prompt inside an action (a grab's torn pocket, say) comes while CDDA
+        // still holds references to the avatar's effects and items, which building a scene would clear.
+        if( fp3d::next_is_timed() ) {
             std::lock_guard<std::mutex> lk( st->mx );
             sc.swap( st->want );
         }
@@ -1728,16 +1730,38 @@ static bool run_combat_checks()
     const auto run = [&]( const scene & sc, const char *action, answer_with with, const claim & plan, bool fly,
     const std::optional<claim> &per ) {
         result r;
-        std::optional<fp3d::ui_request> q = fp3d::wait_request( 5000 );
-        if( !q || !q->timed ) {
-            return r;
+        // A stray prompt (a debug message, say) is printed and answered, and the scene built again.
+        const auto settle = [&]( std::optional<fp3d::ui_request> s ) {
+            for( int k = 0; k < 5 && s && !s->timed; k++ ) {
+                fp3d::ui_answer a;
+                a.id = s->id;
+                if( s->kind == fp3d::request_kind::popup && !s->actions.empty() ) {
+                    a.action = s->actions.front();
+                } else {
+                    a.cancel = true;
+                }
+                print_request( *s, "unexpected, " + ( a.cancel ? std::string( "cancel" ) : a.action ) );
+                fp3d::answer( a );
+                s = fp3d::wait_request( 20000, s->id );
+            }
+            return s;
+        };
+        std::optional<fp3d::ui_request> q = settle( fp3d::wait_request( 5000 ) );
+        for( int attempt = 0; attempt < 3; attempt++ ) {
+            if( !q || !q->timed ) {
+                return r;
+            }
+            {
+                std::lock_guard<std::mutex> lk( st->mx );
+                st->want = sc;
+            }
+            fp3d::queue_action( "pause" );
+            const std::optional<fp3d::ui_request> built = fp3d::wait_request( 20000, q->id );
+            q = settle( built );
+            if( built && built->timed ) {
+                break;
+            }
         }
-        {
-            std::lock_guard<std::mutex> lk( st->mx );
-            st->want = sc;
-        }
-        fp3d::queue_action( "pause" );
-        q = fp3d::wait_request( 20000, q->id );
         if( !q || !q->timed ) {
             return r;
         }
@@ -2150,7 +2174,7 @@ static bool run_combat_checks()
                std::to_string( w_used ) + " used, " + std::to_string( stopped ) + " stopped" );
     }
     // The main-loop reload through the action queue: a pistol with 3 rounds and a full spare magazine carried; any
-    // ammo menu gets its first entry.
+    // ammo menu (CDDA's ammo selector, an item_select) gets its first entry.
     {
         scene reload = point_blank;
         reload.zx = 0;
