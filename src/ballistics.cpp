@@ -319,11 +319,13 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
     double extend_to_range = no_overshoot ? range : proj_arg.range;
 
     tripoint_bub_ms target = target_arg;
-    if( fp3d_out != nullptr ) { // FP3D: fly to where the client's bullet stopped
+    if( fp3d_out != nullptr ) { // FP3D: a hit stops at its creature; a miss flies CDDA's line (fp3d/shot.h)
         target = fp3d_out->end;
+        if( !fp3d_out->stop && !no_overshoot ) {
+            target = fp3d_out->beyond;     // CDDA's overshoot, straight along the line
+        }
         range = rl_dist( source, target );
-        // a hit, or a miss stopped by what stands at its end, goes no further; other misses keep CDDA's overshoot
-        if( fp3d_out->hit_uid != 0 || here->impassable( target ) ) {
+        if( fp3d_out->stop || !no_overshoot ) {
             extend_to_range = range;
         }
         aim.missed_by_tiles = 0.0;

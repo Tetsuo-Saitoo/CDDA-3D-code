@@ -82,7 +82,11 @@ class firing_scope
 // The outcome of one projectile.
 struct shot_outcome {
     uint64_t hit_uid = 0;       // the creature hit; 0 = a miss
-    tripoint_bub_ms end;        // where the projectile stops (the creature's square for a hit)
+    // A hit: the creature's square, where it stops. A miss: CDDA's line (never the client's) at the aimed distance;
+    // `beyond` is the same line at the gun's range, for a miss that flies on (overshoot) in that exact direction.
+    tripoint_bub_ms end;
+    tripoint_bub_ms beyond;
+    bool stop = false;          // a miss that stops at `end`: the line's square there is impassable
     double goodhit = 1.0;       // missed_by for the hit
     std::string part;           // the client's part; checked again when the hit lands
 };
@@ -122,9 +126,9 @@ std::optional<bodypart_id> planned_body_part( const Creature &target, const Crea
 // Counters for tests and diagnostics; any thread.
 struct shot_counts {
     uint64_t asked = 0;         // `shot` requests sent
-    uint64_t accepted = 0;      // `shot` answers used
+    uint64_t accepted = 0;      // `shot` answers that passed the checks
     uint64_t refused = 0;       // `shot` answers cancelled, without a shot, or failing a check
-    uint64_t planned = 0;       // FIRE-answer outcomes used (first projectile)
+    uint64_t planned = 0;       // FIRE-answer outcomes that passed the checks (first projectile)
     uint64_t parts = 0;         // client parts that landed
 };
 shot_counts get_shot_counts();

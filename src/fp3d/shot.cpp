@@ -75,8 +75,9 @@ bool near_line( const tripoint_bub_ms &source, const tripoint_bub_ms &p, double 
 }
 
 // A hit must name a creature the request offered (the cursor creature or a candidate) that is alive and seen
-// now; it stops at that creature's square. A miss stops at `end_abs`. Either square must be on the shooter's
-// level, in the bubble, within the gun's range and near the line.
+// now; it stops at that creature's square. A miss's `end_abs` only gives a distance along CDDA's line
+// (miss_outcome). Either square must be on the shooter's level, in the bubble, within the gun's range and near the
+// line.
 std::optional<claim> check_claim( map &here, const Character &you, const shot_plan &p,
                                   const tripoint_bub_ms &source, double ux, double uy, double max_off,
                                   uint64_t hit_uid, const tripoint_abs_ms &end_abs, double quality,
@@ -113,39 +114,93 @@ std::optional<claim> check_claim( map &here, const Character &you, const shot_pl
     return c;
 }
 
-// The roll projectile_attack makes for the aimed creature, made for `c` at `range` squares with the error CDDA
-// rolled: that error over the range against its size (WIDE ammo takes a monster's plain size), the worse of two
-// rolls for a HARDTOHIT character. 1 = a miss.
-double own_missed_by( const Creature &c, double range, const projectile &proj, const dispersion_sources &dispersion,
-                      double rolled_arcmin )
+// The square `dist` squares from `source` along the unit direction (vx, vy), on the source's level, kept in the map
+// as CDDA's wild misses are.
+tripoint_bub_ms along( const tripoint_bub_ms &source, double vx, double vy, double dist )
+{
+    const double x = std::clamp( source.x() + vx * dist, 0.0, MAPSIZE_X - 1.0 );
+    const double y = std::clamp( source.y() + vy * dist, 0.0, MAPSIZE_Y - 1.0 );
+    return tripoint_bub_ms( static_cast<int>( std::lround( x ) ), static_cast<int>( std::lround( y ) ), source.z() );
+}
+
+// CDDA's line from `source` along the unit direction (vx, vy): how far `at` lies along it and how far off it.
+struct line_offset {
+    double along = 0.0;
+    double off = 0.0;
+};
+line_offset offset_from( const tripoint_bub_ms &source, const tripoint_bub_ms &at, double vx, double vy )
+{
+    const double px = at.x() - source.x();
+    const double py = at.y() - source.y();
+    return { px * vx + py * vy, std::abs( px * vy - py * vx ) };
+}
+
+// The roll projectile_attack makes for the aimed creature, made for `c` at `at` from what is known of CDDA's
+// projectile, which flies the line (vx, vy): the square's distance off that line combined with the error's vertical
+// part `vert_arcmin` over the distance along it (shot answers: CDDA's deviated line), plus `unknown_arcmin` over that
+// distance in the worst direction (a FIRE answer: the aim line, the error's direction unknown), against its size
+// (WIDE ammo takes a monster's plain size); the worse of two rolls for a HARDTOHIT character. 1 = a miss. Never
+// better than the creature's square standing exactly where the projectile went.
+double own_missed_by( const Creature &c, const tripoint_bub_ms &source, const tripoint_bub_ms &at, double vx,
+                      double vy, double vert_arcmin, double unknown_arcmin, const projectile &proj,
+                      const dispersion_sources &dispersion )
 {
     const monster *mon = c.as_monster();
     const double size = mon != nullptr && proj.proj_effects.count( ammo_effect_WIDE ) ?
                         occupied_tile_fraction( mon->get_size() ) : c.ranged_target_size();
+    const line_offset lo = offset_from( source, at, vx, vy );
+    const double along_line = std::max( lo.along, 0.0 );
     double missed_by = 1.0;
-    if( size > 0.0 && std::isfinite( rolled_arcmin ) ) {
-        missed_by = std::min( 1.0, iso_tangent( range, units::from_arcmin( rolled_arcmin ) ) / size );
+    if( size > 0.0 && std::isfinite( vert_arcmin ) && std::isfinite( unknown_arcmin ) ) {
+        const double vert = iso_tangent( along_line, units::from_arcmin( std::abs( vert_arcmin ) ) );
+        const double unknown = iso_tangent( along_line, units::from_arcmin( std::abs( unknown_arcmin ) ) );
+        missed_by = std::min( 1.0, ( std::hypot( lo.off, vert ) + unknown ) / size );
     }
     const Character *ch = c.as_character();
     if( ch != nullptr && ch->has_flag( json_flag_HARDTOHIT ) ) {
-        missed_by = std::max( missed_by, projectile_attack_roll( dispersion, range, size ).missed_by );
+        missed_by = std::max( missed_by, projectile_attack_roll( dispersion, rl_dist( source, at ), size ).missed_by );
     }
     return std::isfinite( missed_by ) ? missed_by : 1.0;
 }
 
-// CDDA's roll decides: a client hit needs the creature's own roll `own` to hit (else CDDA's own path: nullopt),
-// goodhit = max(own, quality); a client miss flies to its end.
-std::optional<shot_outcome> outcome_of( const claim &c, double own )
+// A client hit counts only if the creature's own roll `own` hits (else CDDA's own path: nullopt); goodhit =
+// max(own, quality).
+std::optional<shot_outcome> hit_outcome( const claim &c, double own )
 {
+    if( c.hit_uid == 0 || !( own < 1.0 ) ) {
+        return std::nullopt;
+    }
     shot_outcome o;
     o.end = c.end;
-    if( c.hit_uid != 0 ) {
-        if( !( own < 1.0 ) ) {
-            return std::nullopt;
-        }
-        o.hit_uid = c.hit_uid;
-        o.goodhit = std::max( own, c.quality );
-        o.part = c.part;
+    o.beyond = c.end;
+    o.stop = true;
+    o.hit_uid = c.hit_uid;
+    o.goodhit = std::max( own, c.quality );
+    o.part = c.part;
+    return o;
+}
+
+// A client miss flies CDDA's line (vx, vy), never toward the client's end: to the aimed distance and, past it, as
+// CDDA's overshoot would (`beyond`, the line at the gun's range). The client's end only stops it early, at the
+// distance it lies along the line, where the line's square there is impassable (a wall, a closed door).
+shot_outcome miss_outcome( const map &here, const tripoint_bub_ms &source, const tripoint_bub_ms &target,
+                           double vx, double vy, const claim &c, int range )
+{
+    shot_outcome o;
+    const tripoint_bub_ms stop_at = along( source, vx, vy, offset_from( source, c.end, vx, vy ).along );
+    if( stop_at != source && here.impassable( stop_at ) ) {
+        o.end = stop_at;
+        o.beyond = stop_at;
+        o.stop = true;
+        return o;
+    }
+    o.end = along( source, vx, vy, std::hypot( target.x() - source.x(), target.y() - source.y() ) );
+    o.beyond = along( source, vx, vy, std::max( range, 1 ) );
+    if( o.end == source ) {
+        o.end = target;
+    }
+    if( o.beyond == source ) {
+        o.beyond = o.end;
     }
     return o;
 }
@@ -243,21 +298,20 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
     const double dx = target.x() - source.x();
     const double dy = target.y() - source.y();
     const double len = std::hypot( dx, dy );
-    if( !( len > 0.0 ) ) {
-        return;     // straight up or down: CDDA's own path
+    if( !( len > 0.0 ) || target.z() != source.z() ) {
+        return;     // up or down: CDDA's own path
     }
     const double ux = dx / len;
     const double uy = dy / len;
-    const double rolled_arcmin = aim.dispersion;
+    const double rolled_arcmin = std::isfinite( aim.dispersion ) ? aim.dispersion : 1800.0;
     const double dispersion_max = dispersion.max();
-    // The claim's outcome: a hit on the aimed square's creature uses CDDA's roll for it; on any other creature
-    // that creature's own roll.
-    const auto decide = [&]( const claim & c ) {
-        double own = aim.missed_by;
-        if( c.hit != nullptr && c.end != target ) {
-            own = own_missed_by( *c.hit, rl_dist( source, c.end ), proj, dispersion, rolled_arcmin );
+    // A hit on the aimed square's creature uses CDDA's roll for it; on any other creature that creature's own roll
+    // from its square's place off the projectile's line (vx, vy).
+    const auto own_roll = [&]( const claim & c, double vx, double vy, double vert_arcmin, double unknown_arcmin ) {
+        if( c.end == target ) {
+            return aim.missed_by;
         }
-        return outcome_of( c, own );
+        return own_missed_by( *c.hit, source, c.end, vx, vy, vert_arcmin, unknown_arcmin, proj, dispersion );
     };
     try {
         std::optional<shot_outcome> out;
@@ -293,7 +347,10 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
                                                a->shot->hit_uid, to_abs_ms( a->shot->end ), a->shot->quality,
                                                a->shot->part );
                 if( c ) {
-                    out = decide( *c );
+                    // the error's vertical part, err * cos(angle), is known: the line itself is the horizontal part
+                    const double vert = err * std::cos( units::to_radians( units::from_degrees( angle ) ) );
+                    out = c->hit != nullptr ? hit_outcome( *c, own_roll( *c, vx, vy, vert, 0.0 ) ) :
+                          std::optional<shot_outcome>( miss_outcome( here, source, target, vx, vy, *c, proj.range ) );
                     used = true;
                     n_accepted++;
                 }
@@ -304,9 +361,15 @@ projectile_scope::projectile_scope( map &here, const Creature *origin, const tri
         } else if( first && p->turn == calendar::turn ) {
             const std::optional<claim> c = check_claim( here, you, *p, source, ux, uy, fire_line_tiles, p->hit_uid,
                                            p->end, p->quality, p->part );
+            // A miss keeps the aim line, as CDDA's near miss does; CDDA's wild miss (a square or more off) keeps its
+            // own path. A hit's creature off the aimed square: the error's direction is unknown, so the worst.
+            if( c && c->hit != nullptr ) {
+                out = hit_outcome( *c, own_roll( *c, ux, uy, 0.0, rolled_arcmin ) );
+            } else if( c && aim.missed_by_tiles < 1.0 ) {
+                out = miss_outcome( here, source, target, ux, uy, *c, proj.range );
+            }
             if( c ) {
-                out = decide( *c );
-                n_planned++;
+                n_planned++;     // passed the checks, as n_accepted (CDDA's roll may still leave it to its own path)
             }
         }
         current = std::move( out );
