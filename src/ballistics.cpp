@@ -279,8 +279,7 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
     }
 
     // FP3D: the client's outcome for this projectile (fp3d/shot.h); the roll above decides whether it can hit
-    const fp3d::projectile_scope fp3d_shot( *here, origin, source, target_arg, aim.dispersion, dispersion.max(),
-                                            aim.missed_by );
+    const fp3d::projectile_scope fp3d_shot( *here, origin, source, target_arg, proj_arg, dispersion, aim );
     const fp3d::shot_outcome *fp3d_out = fp3d_shot.outcome();
 
     // TODO: move to-hit roll back in here
@@ -320,10 +319,13 @@ void projectile_attack( dealt_projectile_attack &attack, const projectile &proj_
     double extend_to_range = no_overshoot ? range : proj_arg.range;
 
     tripoint_bub_ms target = target_arg;
-    if( fp3d_out != nullptr ) { // FP3D: stop where the client's bullet stopped
+    if( fp3d_out != nullptr ) { // FP3D: fly to where the client's bullet stopped
         target = fp3d_out->end;
         range = rl_dist( source, target );
-        extend_to_range = range;
+        // a hit, or a miss stopped by what stands at its end, goes no further; other misses keep CDDA's overshoot
+        if( fp3d_out->hit_uid != 0 || here->impassable( target ) ) {
+            extend_to_range = range;
+        }
         aim.missed_by_tiles = 0.0;
     }
     std::vector<tripoint_bub_ms> trajectory;

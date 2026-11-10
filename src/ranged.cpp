@@ -1016,7 +1016,7 @@ int Character::fire_gun( map &here, const tripoint_bub_ms &target, int shots, it
                          item_location ammo )
 {
     // FP3D: the client's shot plan covers the avatar's one trigger pull with its wielded gun
-    const fp3d::firing_scope fp3d_firing( *this, gun );
+    const fp3d::firing_scope fp3d_firing( *this, gun, here, target );
     if( !gun.is_gun() ) {
         debugmsg( "%s tried to fire non-gun (%s).", get_name(), gun.tname() );
         return 0;
@@ -3020,7 +3020,9 @@ std::string target_ui::fp3d_ask()
     // CDDA's aim panel does (fire_gun rolls total_gun_dispersion with the recoil reached).
     const bool gun_fire = mode == TargetMode::Fire && relevant != nullptr && relevant->is_gun();
     const item_location wielded = you->get_wielded_item();
-    req.weapon_wielded = gun_fire && wielded && wielded.get_item() == relevant;
+    // the wielded gun firing itself in its current mode, not an attached gunmod
+    req.weapon_wielded = gun_fire && wielded && wielded.get_item() == relevant &&
+                         relevant->gun_current_mode().target == relevant;
     if( gun_fire ) {
         const item *gun = relevant->gun_current_mode().target;
         gun = gun != nullptr ? gun : relevant;
@@ -3060,6 +3062,8 @@ std::string target_ui::fp3d_ask()
         p.quality = a.shot->quality;
         p.turn = calendar::turn;
         p.fly = a.shot->fly;
+        p.gun = relevant;
+        p.target = here.get_abs( dst );
         p.range = range;
         p.targets = fp3d::shot_targets( dst_critter, targets );   // after the answer moved the cursor
         fp3d::set_shot_plan( p );

@@ -150,7 +150,9 @@ ui_answer ask( ui_request req )
         }
         hook = c.before_ask;
     }
-    if( hook ) {
+    // A shot request skips it: the client flies the shot against the figures it already shows, and a burst asks
+    // once per round while the game waits.
+    if( hook && req.kind != request_kind::shot ) {
         hook();
     }
     const bool timed = std::exchange( next_timed, false );
