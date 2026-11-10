@@ -17,6 +17,7 @@
 #include "activity_actor_definitions.h"
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/events.h" // FP3D:
+#include "fp3d/gun_faults.h" // FP3D:
 #include "fp3d/shot.h" // FP3D:
 #include "fp3d/points.h" // FP3D:
 #include "avatar.h"
@@ -1085,6 +1086,10 @@ int Character::fire_gun( map &here, const tripoint_bub_ms &target, int shots, it
                                   get_option<int>( "PLAYER_MAX_STAMINA_BASE" ) ) );
         }
 
+        // FP3D: a jam from an earlier round of this pull (CDDA's failure to cycle) stops the avatar's burst
+        if( fp3d::stop_jammed_burst( *this, gun ) ) {
+            break;
+        }
         if( !handle_gun_damage( gun ) ) {
             break;
         }
