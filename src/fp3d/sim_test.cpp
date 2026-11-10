@@ -7,11 +7,13 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
 #include <mutex>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -27,11 +29,15 @@
 #include "coordinates.h"
 #include "debug.h"
 #include "do_turn.h"
+#include "field_type.h"
+#include "flexbuffer_json.h"
 #include "fp3d/boot.h"
 #include "fp3d/bridge.h"
 #include "fp3d/cheats.h"
+#include "fp3d/cooking.h"
 #include "fp3d/game_access.h"
 #include "fp3d/held.h"
+#include "fp3d/item_hands.h"
 #include "fp3d/points.h"
 #include "fp3d/shot.h"
 #include "fp3d/events.h"
@@ -39,6 +45,7 @@
 #include "game.h"
 #include "item.h"
 #include "math_parser_diag_value.h"
+#include "json_loader.h"
 #include "map.h"
 #include "mapdata.h"
 #include "messages.h"
@@ -79,6 +86,10 @@ const vpart_id vpart_tank_small( "tank_small" );
 const ter_str_id ter_t_door_c( "t_door_c" );
 const ter_str_id ter_t_floor( "t_floor" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
+const itype_id itype_pot( "pot" );
+const itype_id itype_meat( "meat" );
+const furn_str_id furn_f_fireplace( "f_fireplace" );
+const furn_str_id furn_f_woodstove( "f_woodstove" );
 
 // Game state the driver checks; copied on the sim thread right before every request.
 struct observed {
@@ -126,8 +137,17 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 // wielded (the hose in hand gone), 9 = shallow water east and a puddle of 2 L of water south, 10 = a new empty
 // jerrycan wielded, 11 = a zombie 3 squares west and a loaded pistol in hand, 12 = item checks: empty hands, two
 // rocks, a plastic bottle and a plastic bag west, a rock 3 squares west, a rock with a hostile save's handle and
-// spot north-west, 1 L of gold and a bottle of water carried. Done on the sim thread right before its next request.
+// spot north-west, 1 L of gold and a bottle of water carried, 13 = cooking checks (run_cooking_checks): a
+// fireplace with a fire and a pot of 1 L of water south-west, an unlit wood stove south-east, a pot of raw meat 2
+// west 1 north, a rock 2 west 1 south, a pot 8 west (out of reach), a pot put 2 west 2 south and taken away again.
+// Done on the sim thread right before its next request.
 std::atomic<int> hand_setup{ 0 };
+// Cooking checks: what scene 14 left for the driver (sim thread writes, driver reads).
+std::atomic<uint64_t> cook_far_uid{ 0 };      // the pot out of reach
+std::atomic<uint64_t> cook_gone_uid{ 0 };     // the pot taken away again (a stale handle)
+std::atomic<double> cook_capture_ms{ 0 };     // one full capture of the scene
+std::atomic<double> cook_heat_ms{ 0 };        // the heat and cookware part of it
+std::atomic<size_t> cook_heat_squares{ 0 };   // squares it built a crafting inventory for
 
 void observe()
 {
@@ -276,6 +296,47 @@ void observe()
             item marked( itype_rock );
             marked.set_var( "fp3d_offhand", diag_value( std::string( "x" ) ) );
             get_avatar().i_add( marked );
+            break;
+        }
+        case 14: {
+            // The item scene's gun safe and dresser go first.
+            here.furn_set( p + tripoint_rel_ms( 0, 1, 0 ), furn_str_id::NULL_ID() );
+            here.furn_set( p + tripoint_rel_ms( 0, -3, 0 ), furn_str_id::NULL_ID() );
+            g->clear_zombies();
+            for( int dx = -9; dx <= 4; dx++ ) {
+                for( int dy = -4; dy <= 4; dy++ ) {
+                    here.i_clear( p + tripoint_rel_ms( dx, dy, 0 ) );
+                }
+            }
+            for( int dx = -9; dx <= -5; dx++ ) {
+                here.ter_set( p + tripoint_rel_ms( dx, 0, 0 ), ter_t_floor );
+                here.furn_set( p + tripoint_rel_ms( dx, 0, 0 ), furn_str_id::NULL_ID() );
+            }
+            const tripoint_bub_ms fire_at = p + tripoint_rel_ms( -1, 1, 0 );
+            here.furn_set( fire_at, furn_f_fireplace );
+            here.furn_set( p + tripoint_rel_ms( 1, 1, 0 ), furn_f_woodstove );
+            here.add_field( fire_at, fd_fire, 2 );
+            item water_pot( itype_pot );
+            water_pot.put_in( item( itype_water, calendar::turn, 4 ), pocket_type::CONTAINER );
+            here.add_item( fire_at, water_pot );
+            item meat_pot( itype_pot );
+            meat_pot.put_in( item( itype_meat, calendar::turn ), pocket_type::CONTAINER );
+            here.add_item( p + tripoint_rel_ms( -2, -1, 0 ), meat_pot );
+            here.add_item( p + tripoint_rel_ms( -2, 1, 0 ), item( itype_rock ) );
+            item &far_pot = here.add_item( p + tripoint_rel_ms( -8, 0, 0 ), item( itype_pot ) );
+            cook_far_uid = far_pot.is_null() ? 0 : fp3d::item_handle( far_pot );
+            const tripoint_bub_ms gone_at = p + tripoint_rel_ms( -2, 2, 0 );
+            item &gone_pot = here.add_item( gone_at, item( itype_pot ) );
+            cook_gone_uid = gone_pot.is_null() ? 0 : fp3d::item_handle( gone_pot );
+            here.i_clear( gone_at );
+            // One capture of this scene timed (the hook below captures again and publishes).
+            fp3d::take_heat_capture_ms();
+            const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+            fp3d::capture_snapshot();
+            cook_capture_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+            size_t squares = 0;
+            cook_heat_ms = fp3d::take_heat_capture_ms( &squares );
+            cook_heat_squares = squares;
             break;
         }
         default:
@@ -1414,6 +1475,302 @@ static bool run_item_checks()
     return failed == 0;
 }
 
+// L9 (fp3d/cooking.h): heat sources and cookware in the snapshot, and recipe queries from a container's contents:
+// CDDA's recipes, read-only, answered by the main loop, refused when the container is gone, wrong or out of reach.
+static bool run_cooking_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  cooking: %-44s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct parsed_match {
+        std::string recipe;
+        std::string result;
+        std::string name;
+        int batch_max = 0;
+        int time_s = 0;
+        bool known = false;
+        bool skills_ok = false;
+        bool tools_ok = false;
+        bool can_start = false;
+        std::vector<std::string> missing;
+    };
+    struct parsed {
+        bool valid = false;
+        bool ok = false;
+        std::string error;
+        int64_t id = 0;
+        int64_t container = 0;
+        std::vector<parsed_match> matches;
+    };
+    const auto parse = []( const std::string & text ) {
+        parsed out;
+        try {
+            const JsonValue root = json_loader::from_string( text );
+            JsonObject jo = root.get_object();
+            jo.allow_omitted_members();
+            out.ok = jo.get_bool( "ok" );
+            out.error = jo.get_string( "error" );
+            out.id = jo.get_member( "id" ).get_int64();
+            out.container = jo.get_member( "container" ).get_int64();
+            for( JsonObject m : jo.get_array( "matches" ) ) {
+                m.allow_omitted_members();
+                parsed_match pm;
+                pm.recipe = m.get_string( "recipe" );
+                pm.result = m.get_string( "result" );
+                pm.name = m.get_string( "name" );
+                pm.batch_max = m.get_int( "batch_max" );
+                pm.time_s = m.get_int( "time_s" );
+                pm.known = m.get_bool( "known" );
+                pm.skills_ok = m.get_bool( "skills_ok" );
+                pm.tools_ok = m.get_bool( "tools_ok" );
+                pm.can_start = m.get_bool( "can_start" );
+                for( const JsonValue v : m.get_array( "missing" ) ) {
+                    pm.missing.push_back( v.get_string() );
+                }
+                out.matches.push_back( pm );
+            }
+            out.valid = true;
+        } catch( const std::exception & ) {
+            out.valid = false;
+        }
+        return out;
+    };
+    // Posts a query and waits for its result; "refused" when the bridge says no.
+    const auto query = []( uint64_t uid, uint32_t type, const fp3d::ui_point & pos ) {
+        const uint64_t id = fp3d::post_recipe_query( fp3d::item_ref{ uid, type }, pos );
+        if( id == 0 ) {
+            return std::string( "refused" );
+        }
+        const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        while( ms_since( t0 ) < 20000 ) {
+            if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
+                return *res;
+            }
+            std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
+        }
+        return std::string( "timeout" );
+    };
+    const auto type_of = []( const char *id ) {
+        return fp3d::intern_id( fp3d::id_kind::itype, id );
+    };
+
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 14;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point me = s0->player.pos;
+    const auto at = [&me]( int dx, int dy ) {
+        return fp3d::ui_point{ me.x + dx, me.y + dy, me.z };
+    };
+    const fp3d::ui_point fire_at = at( -1, 1 );
+    const fp3d::ui_point stove_at = at( 1, 1 );
+    const fp3d::ui_point meat_at = at( -2, -1 );
+    const fp3d::ui_point rock_at = at( -2, 1 );
+    const fp3d::ui_point far_at = at( -8, 0 );
+    const fp3d::ui_point gone_at = at( -2, 2 );
+    const uint32_t t_pot = type_of( "pot" );
+    const uint32_t t_water = type_of( "water" );
+    const uint32_t t_rock = type_of( "rock" );
+    // The submap of absolute square `p` in s0 and the tile index in it.
+    const auto submap_at = [&s0]( const fp3d::ui_point & p, int &tile ) -> const fp3d::submap_view * {
+        const auto floor_div = []( int a )
+        {
+            return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+        };
+        const int sx = floor_div( p.x );
+        const int sy = floor_div( p.y );
+        tile = ( p.y - sy * fp3d::sm_size ) * fp3d::sm_size + ( p.x - sx * fp3d::sm_size );
+        for( const std::shared_ptr<const fp3d::submap_view> &sm : s0->submaps )
+        {
+            if( sm->pos.x == sx && sm->pos.y == sy && sm->pos.z == p.z ) {
+                return sm.get();
+            }
+        }
+        return nullptr;
+    };
+    const auto heat_at = [&]( const fp3d::ui_point & p ) {
+        int tile = 0;
+        if( const fp3d::submap_view *sm = submap_at( p, tile ) ) {
+            for( const fp3d::heat_view &h : sm->heat ) {
+                if( h.tile == tile ) {
+                    return std::optional<fp3d::heat_view>( h );
+                }
+            }
+        }
+        return std::optional<fp3d::heat_view>();
+    };
+    const auto heat_text = []( const std::optional<fp3d::heat_view> &h ) {
+        return h ? "source " + std::to_string( h->source ) + " tool " + std::to_string( h->tool ) + " fire " +
+               std::to_string( h->fire ) + " charges " + std::to_string( h->charges ) + ( h->lit ? " lit" : " unlit" ) :
+               std::string( "none" );
+    };
+
+    // Heat sources: the fireplace burns (CDDA's `fire`), the wood stove has no fuel.
+    const std::optional<fp3d::heat_view> fh = heat_at( fire_at );
+    check( fh && fh->lit && fh->fire > 0 && fh->source == fp3d::heat_from_furniture &&
+           fh->tool == type_of( "fake_fireplace" ), "fireplace with a fire: lit", heat_text( fh ) );
+    const std::optional<fp3d::heat_view> sh = heat_at( stove_at );
+    check( sh && !sh->lit && sh->fire == 0 && sh->charges == 0 && sh->source == fp3d::heat_from_furniture &&
+           sh->tool == type_of( "fake_woodstove" ), "wood stove without fuel: unlit", heat_text( sh ) );
+    check( !heat_at( meat_at ) && !heat_at( at( 0, 0 ) ), "no heat where there is none", "" );
+
+    // Cookware on the fire: the pot, its handle as the pile lists it, the water inside.
+    fp3d::cookware_view pot;
+    {
+        int tile = 0;
+        if( const fp3d::submap_view *sm = submap_at( fire_at, tile ) ) {
+            for( const fp3d::cookware_view &cw : sm->cookware ) {
+                if( cw.tile == tile && cw.type == t_pot ) {
+                    pot = cw;
+                }
+            }
+        }
+    }
+    uint64_t pile_pot = 0;
+    for( const fp3d::item_handle_view &h : handles_at( fire_at ) ) {
+        pile_pot = h.type == t_pot ? h.uid : pile_pot;
+    }
+    const bool water_in = pot.contents.size() == 1 && pot.contents[0].type == t_water && pot.contents[0].count == 4 &&
+                          pot.contents[0].uid != 0;
+    check( pot.uid != 0 && pot.uid == pile_pot && water_in && pot.craft_result == 0 && pot.craft_recipe.empty(),
+           "pot on the fire listed with its water", "uid " + std::to_string( pot.uid ) + " pile " +
+           std::to_string( pile_pot ) + ", " + std::to_string( pot.contents.size() ) + " inside" );
+    int meat_tile = 0;
+    const fp3d::submap_view *meat_sm = submap_at( meat_at, meat_tile );
+    check( meat_sm != nullptr && std::none_of( meat_sm->cookware.begin(), meat_sm->cookware.end(),
+    [&]( const fp3d::cookware_view & cw ) {
+        return cw.tile == meat_tile;
+    } ), "a pot off the heat is no cookware entry", "" );
+    std::ostringstream js;
+    fp3d::write_snapshot_json( js, *s0, me.z, me.z );
+    const std::string json = js.str();
+    check( json.find( "\"heat\":[[" ) != std::string::npos && json.find( "\"cookware\":[{\"tile\":" ) !=
+           std::string::npos && json.find( "\"craft_recipe\":\"\"" ) != std::string::npos, "snapshot JSON: heat and cookware",
+           "" );
+    check( cook_heat_squares.load() >= 2, "capture cost", std::to_string( cook_capture_ms.load() ) +
+           " ms capture, heat + cookware " + std::to_string( cook_heat_ms.load() ) + " ms, " +
+           std::to_string( cook_heat_squares.load() ) + " squares" );
+
+    // Queries, answered while the main loop waits.
+    const std::chrono::steady_clock::time_point tq = std::chrono::steady_clock::now();
+    const parsed water = parse( query( pot.uid, t_pot, fire_at ) );
+    const double water_ms = ms_since( tq );
+    size_t checked = 0;
+    const double sim_ms = fp3d::last_recipe_query_ms( &checked );
+    const auto find_result = []( const parsed & p, const char *result ) {
+        for( const parsed_match &m : p.matches ) {
+            if( m.result == result ) {
+                return std::optional<parsed_match>( m );
+            }
+        }
+        return std::optional<parsed_match>();
+    };
+    const std::optional<parsed_match> boil = find_result( water, "water_clean" );
+    check( water.valid && water.ok && water.container == static_cast<int64_t>( pot.uid ) && boil &&
+           boil->time_s > 0 && boil->tools_ok && boil->batch_max == 4, "pot of water: boiling it (water_clean)",
+           boil ? boil->recipe + " \"" + boil->name + "\" " + std::to_string( boil->time_s ) + " s, batch " +
+           std::to_string( boil->batch_max ) + ( boil->can_start ? ", can start" : ", can't start" ) +
+           ", " + std::to_string( water.matches.size() ) + " matches" : "none" );
+    check( water_ms < 2000, "query cost", std::to_string( sim_ms ) + " ms in the sim, " + std::to_string( checked ) +
+           " recipes checked, " + std::to_string( water_ms ) + " ms round trip" );
+    uint64_t meat_pot = 0;
+    for( const fp3d::item_handle_view &h : handles_at( meat_at ) ) {
+        meat_pot = h.type == t_pot ? h.uid : meat_pot;
+    }
+    const parsed meat = parse( query( meat_pot, t_pot, meat_at ) );
+    const std::optional<parsed_match> cooked = find_result( meat, "meat_cooked" );
+    std::string missing;
+    if( cooked ) {
+        for( const std::string &m : cooked->missing ) {
+            missing += " [" + m + "]";
+        }
+    }
+    check( meat.valid && meat.ok && cooked && cooked->time_s > 0 && cooked->tools_ok, "pot of raw meat: cooked meat",
+           cooked ? cooked->recipe + " " + std::to_string( cooked->time_s ) + " s" + missing + ", " +
+           std::to_string( meat.matches.size() ) + " matches" : "none" );
+
+    // Refusals: malformed refs never get posted; wrong or gone items, wrong squares, far ones say why.
+    check( fp3d::post_recipe_query( { 0, t_pot }, fire_at ) == 0 && fp3d::post_recipe_query( { pot.uid, 0 }, fire_at ) == 0 &&
+           fp3d::post_recipe_query( { fp3d::max_item_uid + 1, t_pot }, fire_at ) == 0 &&
+           fp3d::post_recipe_query( { pot.uid, t_pot }, fp3d::ui_point{ INT32_MAX, 0, 0 } ) == 0,
+           "malformed queries refused", "" );
+    const auto refused = [&]( const parsed & p, const char *error ) {
+        return p.valid && !p.ok && p.error == error && p.matches.empty();
+    };
+    const parsed wrong_type = parse( query( pot.uid, t_rock, fire_at ) );
+    check( refused( wrong_type, "not found" ), "wrong itype for the uid: not found", wrong_type.error );
+    const parsed wrong_square = parse( query( pot.uid, t_pot, meat_at ) );
+    check( refused( wrong_square, "not found" ), "wrong square: not found", wrong_square.error );
+    const parsed stale = parse( query( cook_gone_uid.load(), t_pot, gone_at ) );
+    check( cook_gone_uid.load() != 0 && refused( stale, "not found" ), "item gone (stale handle): not found",
+           stale.error );
+    const parsed far_away = parse( query( cook_far_uid.load(), t_pot, far_at ) );
+    check( cook_far_uid.load() != 0 && refused( far_away, "out of reach" ), "8 squares away: out of reach",
+           far_away.error );
+    uint64_t rock = 0;
+    for( const fp3d::item_handle_view &h : handles_at( rock_at ) ) {
+        rock = h.type == t_rock ? h.uid : rock;
+    }
+    const parsed not_cont = parse( query( rock, t_rock, rock_at ) );
+    check( rock != 0 && refused( not_cont, "not a container" ), "a rock: not a container", not_cont.error );
+
+    // Posted during another prompt (the wait menu): they wait for the main loop; a 9th is refused; each result
+    // is taken once.
+    r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting again", "" );
+        return false;
+    }
+    fp3d::ui_answer wait;
+    wait.id = r->id;
+    wait.action = "wait";
+    fp3d::answer( wait );
+    std::optional<fp3d::ui_request> prompt = fp3d::wait_request( 5000, r->id );
+    std::vector<uint64_t> ids;
+    uint64_t ninth = 1;
+    if( prompt && !prompt->timed ) {
+        for( size_t i = 0; i < fp3d::max_pending_queries; i++ ) {
+            ids.push_back( fp3d::post_recipe_query( { pot.uid, t_pot }, fire_at ) );
+        }
+        ninth = fp3d::post_recipe_query( { pot.uid, t_pot }, fire_at );
+    }
+    std::this_thread::sleep_for( std::chrono::milliseconds( 300 ) );
+    const bool held = fp3d::pending_queries() == fp3d::max_pending_queries && !ids.empty() &&
+                      !fp3d::take_query_result( ids.front() );
+    check( prompt && !prompt->timed && ninth == 0 && std::count( ids.begin(), ids.end(), uint64_t{ 0 } ) == 0,
+           "a 9th pending query refused", prompt ? std::string( fp3d::kind_name( prompt->kind ) ) + " prompt" : "no prompt" );
+    // Back to the main loop: cancel whatever the wait action asked.
+    for( int i = 0; i < 10 && prompt && !prompt->timed; i++ ) {
+        fp3d::ui_answer cancel;
+        cancel.id = prompt->id;
+        cancel.cancel = true;
+        fp3d::answer( cancel );
+        prompt = fp3d::wait_request( 5000, prompt->id );
+    }
+    int taken = 0;
+    int again = 0;
+    for( const uint64_t id : ids ) {
+        const std::optional<std::string> res = fp3d::take_query_result( id );
+        taken += res && parse( *res ).ok && parse( *res ).id == static_cast<int64_t>( id ) ? 1 : 0;
+        again += fp3d::take_query_result( id ) ? 1 : 0;
+    }
+    check( held && prompt && prompt->timed && taken == static_cast<int>( ids.size() ),
+           "held during a prompt, run by the main loop", std::to_string( taken ) + " results" );
+    check( again == 0 && !fp3d::take_query_result( 999999 ), "a result is taken once", "" );
+    return failed == 0;
+}
+
 static bool run_queue_checks()
 {
     int failed = 0;
@@ -1733,7 +2090,8 @@ int main()
     const bool siphon_ok = hands_ok && run_siphon_checks();
     const bool shoot_ok = siphon_ok && run_shoot_checks();
     const bool items_ok = shoot_ok && run_item_checks();
-    const bool cheats_ok = items_ok && run_cheat_checks();
+    const bool cooking_ok = items_ok && run_cooking_checks();
+    const bool cheats_ok = cooking_ok && run_cheat_checks();
 
     fp3d::shutdown();
     sim.join();
@@ -1768,11 +2126,12 @@ int main()
     std::printf( "siphon: %s\n", siphon_ok ? "ok" : "BAD" );
     std::printf( "shoot: %s\n", shoot_ok ? "ok" : "BAD" );
     std::printf( "items: %s\n", items_ok ? "ok" : "BAD" );
+    std::printf( "cooking: %s\n", cooking_ok ? "ok" : "BAD" );
     std::printf( "cheats: %s\n", cheats_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
-           shoot_ok && items_ok && cheats_ok && worlds_ok ?
+           shoot_ok && items_ok && cooking_ok && cheats_ok && worlds_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -80,10 +80,41 @@ struct field_view {
     bool operator==( const field_view &o ) const;
 };
 
+// L9 (fp3d/cooking.h): a square that heats food for CDDA's crafting.
+constexpr uint8_t heat_from_fire = 0, heat_from_furniture = 1, heat_from_vehicle = 2;
+struct heat_view {
+    uint8_t tile = 0;
+    uint8_t source = heat_from_fire;              // heat_from_*: a fire alone, furniture, a vehicle part
+    uint32_t tool = 0;                            // itype index of the heat pseudo tool; 0 = only a fire
+    uint8_t fire = 0;                             // fd_fire intensity on the tile, 0..3
+    int32_t charges = 0;                          // what CDDA's crafting inventory gives the tool there (fuel, power)
+    bool lit = false;                             // usable for crafting now: a fire burns or the tool has charges
+    bool operator==( const heat_view &o ) const;
+};
+
+struct cookware_item_view {
+    uint64_t uid = 0;                             // handle (item_hands.h)
+    uint32_t type = 0;                            // itype index
+    int32_t count = 0;                            // charges if counted by charges, else 1
+    bool operator==( const cookware_item_view &o ) const;
+};
+
+// An item with the COOK or BOIL quality lying on a heat square (top level of the map stack).
+struct cookware_view {
+    uint8_t tile = 0;
+    uint64_t uid = 0;                             // handle, the same as the pile's
+    uint32_t type = 0;                            // itype index
+    std::vector<cookware_item_view> contents;     // its CONTAINER pockets, one level; cap 16
+    uint32_t craft_result = 0;                    // an in-progress craft inside: itype index of the result, 0 none
+    std::string craft_recipe;                     // its recipe id, "" none
+    uint16_t craft_progress = 0;                  // permille
+    bool operator==( const cookware_view &o ) const;
+};
+
 struct submap_view {
     ui_point pos;                                 // absolute submap
     uint32_t revision = 0;                        // bumps when ter/furn/trap/flags change: rebuild the mesh
-    uint32_t detail_revision = 0;                 // bumps when light/vis/items/fields change
+    uint32_t detail_revision = 0;                 // bumps when light/vis/items/fields/heat/cookware change
     std::array<uint32_t, sm_tiles> ter{};
     std::array<uint32_t, sm_tiles> furn{};
     std::array<uint32_t, sm_tiles> trap{};        // only traps the player knows about or sees
@@ -92,6 +123,8 @@ struct submap_view {
     std::array<uint8_t, sm_tiles> flags{};
     std::vector<item_pile_view> items;            // tiles seen now only (cap 144)
     std::vector<field_view> fields;               // tiles seen now only (cap 4 per tile)
+    std::vector<heat_view> heat;                  // tiles seen now only (cap 32)
+    std::vector<cookware_view> cookware;          // on those heat tiles (cap 16)
     bool same_shape( const submap_view &o ) const;
     bool same_detail( const submap_view &o ) const;
 };

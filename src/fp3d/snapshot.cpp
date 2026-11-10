@@ -19,6 +19,7 @@
 #include "enums.h"
 #include "type_id.h"
 #include "field.h"
+#include "fp3d/cooking.h"
 #include "fp3d/held.h"
 #include "fp3d/id_tables.h"
 #include "fp3d/item_hands.h"
@@ -291,6 +292,8 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
             }
         }
     }
+    // L9: heat sources and the cookware on them, after the piles gave their items handles.
+    capture_heat_and_cookware( here, u, corner, *sm, seen );
     return sm;
 }
 
@@ -534,6 +537,23 @@ bool field_view::operator==( const field_view &o ) const
     return tile == o.tile && type == o.type && intensity == o.intensity && age_turns == o.age_turns;
 }
 
+bool heat_view::operator==( const heat_view &o ) const
+{
+    return tile == o.tile && source == o.source && tool == o.tool && fire == o.fire && charges == o.charges &&
+           lit == o.lit;
+}
+
+bool cookware_item_view::operator==( const cookware_item_view &o ) const
+{
+    return uid == o.uid && type == o.type && count == o.count;
+}
+
+bool cookware_view::operator==( const cookware_view &o ) const
+{
+    return tile == o.tile && uid == o.uid && type == o.type && contents == o.contents &&
+           craft_result == o.craft_result && craft_recipe == o.craft_recipe && craft_progress == o.craft_progress;
+}
+
 bool submap_view::same_shape( const submap_view &o ) const
 {
     return ter == o.ter && furn == o.furn && trap == o.trap && flags == o.flags;
@@ -541,7 +561,8 @@ bool submap_view::same_shape( const submap_view &o ) const
 
 bool submap_view::same_detail( const submap_view &o ) const
 {
-    return light == o.light && vis == o.vis && items == o.items && fields == o.fields;
+    return light == o.light && vis == o.vis && items == o.items && fields == o.fields && heat == o.heat &&
+           cookware == o.cookware;
 }
 
 uint32_t intern_id( id_kind kind, const std::string &id )
@@ -813,6 +834,43 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
             jo.write( static_cast<int>( f.intensity ) );
             jo.write( static_cast<int>( f.age_turns ) );
             jo.end_array();
+        }
+        jo.end_array();
+        // L9: [tile, source, tool, fire, charges, lit (0/1)]
+        jo.member( "heat" );
+        jo.start_array();
+        for( const heat_view &h : sm.heat ) {
+            jo.start_array();
+            jo.write( static_cast<int>( h.tile ) );
+            jo.write( static_cast<int>( h.source ) );
+            jo.write( static_cast<int64_t>( h.tool ) );
+            jo.write( static_cast<int>( h.fire ) );
+            jo.write( static_cast<int64_t>( h.charges ) );
+            jo.write( h.lit ? 1 : 0 );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "cookware" );
+        jo.start_array();
+        for( const cookware_view &cw : sm.cookware ) {
+            jo.start_object();
+            jo.member( "tile", static_cast<int>( cw.tile ) );
+            jo.member( "uid", static_cast<int64_t>( cw.uid ) );
+            jo.member( "type", static_cast<int64_t>( cw.type ) );
+            jo.member( "contents" );
+            jo.start_array();
+            for( const cookware_item_view &c : cw.contents ) {
+                jo.start_array();
+                jo.write( static_cast<int64_t>( c.uid ) );
+                jo.write( static_cast<int64_t>( c.type ) );
+                jo.write( static_cast<int64_t>( c.count ) );
+                jo.end_array();
+            }
+            jo.end_array();
+            jo.member( "craft_result", static_cast<int64_t>( cw.craft_result ) );
+            jo.member( "craft_recipe", cw.craft_recipe );
+            jo.member( "craft_progress", static_cast<int>( cw.craft_progress ) );
+            jo.end_object();
         }
         jo.end_array();
         jo.end_object();
