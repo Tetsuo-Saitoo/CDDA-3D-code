@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -21,7 +22,9 @@
 #include "calendar.h"
 #include "character.h"
 #include "coordinates.h"
+#include "creature.h"
 #include "creature_tracker.h"
+#include "damage.h"
 #include "effect.h"
 #include "effect_on_condition.h"
 #include "enums.h"
@@ -86,6 +89,20 @@ const field_type_str_id field_fire( "fd_fire" );
 const itype_id itype_gasoline( "gasoline" );
 // Planted in the gallery's plant furniture (any seed will do).
 const itype_id itype_plant_seed( "seed_wheat" );
+// Zone builders: armory tables, hall racks, lot paint, pen glass and water, lane paint.
+const furn_str_id furn_table( "f_table" );
+const furn_str_id furn_rack( "f_rack" );
+const ter_str_id ter_pavement( "t_pavement" );
+const ter_str_id ter_paint( "t_pavement_y" );
+const ter_str_id ter_pen_glass( "t_reinforced_glass" );
+const ter_str_id ter_pen_water( "t_water_dp" );
+const ter_str_id ter_pen_dirt( "t_dirt" );
+const ter_str_id ter_pen_shade( "t_thconc_floor" );   // INDOORS: no sunlight
+const item_category_id item_category_weapons_range( "weapons" );
+const flag_id flag_grenade_range( "GRENADE" );
+const damage_type_id damage_bash_range( "bash" );
+// A liquid without a default container goes into one of these to lie on a shelf.
+const itype_id itype_liquid_fallback( "jerrycan" );
 
 // Overmap square of zone 0; zone i is zone_spacing_omt * i further east.
 const tripoint_abs_omt range_origin( 20, 90, 0 );
@@ -146,12 +163,66 @@ struct registry {
     std::vector<piece_id> gallery_normal;     // sorted
     std::vector<piece_id> gallery_emitters;   // sorted
     uint64_t version = 1;                     // bumps on any change the range info shows
+    // The lists the other kinds slice (zone first/count), ids sorted.
+    std::vector<itype_id> armory;             // guns, then melee weapons, then throwables
+    size_t armory_guns = 0;
+    size_t armory_melee = 0;
+    std::map<std::string, std::vector<itype_id>> halls;   // by category id
+    std::vector<vproto_id> vehicles;
+    std::vector<mtype_id> monsters;           // by species (the first by id), then id
 };
 
 registry &reg()
 {
     static registry r;
     return r;
+}
+
+// boot_test_range's seed: zone builds are seeded from it (game thread).
+unsigned range_seed = 0;
+
+// CDDA's RNG during a build: seeded from the boot seed and the zone id, so a zone comes out the same each time it is
+// built (item variants, vehicle contents, ...); the game's own stream is put back afterwards, untouched.
+class build_rng
+{
+    public:
+        explicit build_rng( const std::string &zone_id ) : saved( rng_get_engine() ) {
+            uint32_t h = 2166136261u ^ range_seed;   // FNV-1a
+            for( const char c : zone_id ) {
+                h ^= static_cast<unsigned char>( c );
+                h *= 16777619u;
+            }
+            rng_get_engine().seed( h );
+        }
+        ~build_rng() {
+            rng_get_engine() = saved;
+        }
+        build_rng( const build_rng & ) = delete;
+        build_rng &operator=( const build_rng & ) = delete;
+    private:
+        cata_default_random_engine saved;
+};
+
+bool by_id( const itype_id &a, const itype_id &b )
+{
+    return a.str() < b.str();
+}
+
+// The armory's thrown weapons: bombs, grenades and anything whose data gives it thrown damage (item_factory fills a
+// missing one with 3/4 of the melee bash: that one doesn't count).
+bool throwable( const itype &t )
+{
+    if( t.has_flag( flag_BOMB ) || t.has_flag( flag_grenade_range ) ) {
+        return true;
+    }
+    const std::vector<damage_unit> &units = t.thrown_damage.damage_units;
+    if( units.size() != 1 ) {
+        return !units.empty();
+    }
+    const auto bash = t.melee.damage_map.find( damage_bash_range );
+    const float melee_bash = bash == t.melee.damage_map.end() ? 0.0f : bash->second;
+    return units.front().type != damage_bash_range ||
+           units.front().amount != static_cast<float>( melee_bash * 0.75 );
 }
 
 std::atomic<bool> frozen{ false };
@@ -211,28 +282,72 @@ bool avatar_flag( const std::string &name )
 void build_registry()
 {
     registry &r = reg();
-    r = registry{ false, {}, {}, {}, {}, r.version + 1 };
+    const uint64_t version = r.version + 1;
+    r = registry();
+    r.version = version;
     fp3d::range_counts &c = r.counts;
 
     std::map<std::string, size_t> per_category;
+    std::vector<itype_id> guns;
+    std::vector<itype_id> melee;
+    std::vector<itype_id> thrown;
     for( const itype *t : item_controller->all() ) {
         if( t == nullptr || t->get_id().is_null() || t->has_flag( range_pseudo ) ) {
             continue;
         }
         if( t->gun && !t->gunmod ) {
             c.guns++;
+            guns.push_back( t->get_id() );
             continue;
         }
         c.items++;
         per_category[t->category_force.str()]++;
+        r.halls[t->category_force.str()].push_back( t->get_id() );
+        if( t->category_force == item_category_weapons_range ) {
+            ( throwable( *t ) ? thrown : melee ).push_back( t->get_id() );
+        }
     }
     c.items_per_category.assign( per_category.begin(), per_category.end() );
+    for( auto &cat_list : r.halls ) {
+        std::sort( cat_list.second.begin(), cat_list.second.end(), by_id );
+    }
+    for( std::vector<itype_id> *list : {
+             &guns, &melee, &thrown
+         } ) {
+        std::sort( list->begin(), list->end(), by_id );
+        r.armory.insert( r.armory.end(), list->begin(), list->end() );
+    }
+    r.armory_guns = guns.size();
+    r.armory_melee = melee.size();
+    c.melee = melee.size();
+    c.throwables = thrown.size();
     for( const vehicle_prototype &p : vehicles::get_all_prototypes() ) {
-        c.vehicles += p.id.str() == "none" ? 0 : 1;
+        if( p.id.str() != "none" ) {
+            r.vehicles.push_back( p.id );
+        }
     }
+    std::sort( r.vehicles.begin(), r.vehicles.end(), []( const vproto_id & a, const vproto_id & b ) {
+        return a.str() < b.str();
+    } );
+    c.vehicles = r.vehicles.size();
+    std::vector<std::pair<std::string, mtype_id>> mons;
     for( const mtype &m : MonsterGenerator::generator().get_all_mtypes() ) {
-        c.monsters += m.id.is_null() ? 0 : 1;
+        if( m.id.is_null() ) {
+            continue;
+        }
+        std::string species = "~";   // none: last
+        for( const species_id &sp : m.species ) {
+            species = std::min( species, sp.str() );
+        }
+        mons.emplace_back( species, m.id );
     }
+    std::sort( mons.begin(), mons.end(), []( const auto & a, const auto & b ) {
+        return a.first != b.first ? a.first < b.first : a.second.str() < b.second.str();
+    } );
+    for( const auto &sp_id : mons ) {
+        r.monsters.push_back( sp_id.second );
+    }
+    c.monsters = r.monsters.size();
     for( int i = 1; i < static_cast<int>( ter_t::count() ); i++ ) {
         const ter_t &t = ter_id( i ).obj();
         ( t.emissions.empty() ? r.gallery_normal : r.gallery_emitters ).push_back( { t.id.str(), false } );
@@ -267,7 +382,7 @@ void build_registry()
         z.count = std::min( gallery_slots().size(), r.gallery_normal.size() - z.first );
         zones.push_back( std::move( z ) );
     }
-    add_parts( zones, fp3d::zone_kind::armory, "armory", "Armory", c.guns, fp3d::armory_guns_per_zone );
+    add_parts( zones, fp3d::zone_kind::armory, "armory", "Armory", r.armory.size(), fp3d::armory_items_per_zone );
     std::vector<std::string> cats;
     cats.reserve( c.items_per_category.size() );
     for( const auto &cat_n : c.items_per_category ) {
@@ -288,11 +403,13 @@ void build_registry()
     lanes.kind = fp3d::zone_kind::lanes;
     lanes.id = "lanes";
     lanes.name = "Target lanes";
+    lanes.count = fp3d::lane_targets().size();
     zones.push_back( lanes );
     fp3d::range_zone kitchen;
     kitchen.kind = fp3d::zone_kind::kitchen;
     kitchen.id = "kitchen";
     kitchen.name = "Kitchen";
+    kitchen.count = fp3d::kitchen_props().size();
     zones.push_back( kitchen );
     std::sort( zones.begin(), zones.end(), []( const fp3d::range_zone & a, const fp3d::range_zone & b ) {
         return a.id < b.id;
@@ -382,9 +499,75 @@ void set_ter( const tripoint_abs_ms &p, const ter_str_id &t )
     }
 }
 
-void build_hub( const tripoint_abs_ms &s )
+// Places `props` around `s` (hub_prop: terrain, furniture, items with what is inside, monsters, vehicles, fields);
+// returns how many were placed.
+size_t place_props( const tripoint_abs_ms &s, const std::vector<fp3d::hub_prop> &props )
 {
     map &here = get_map();
+    size_t placed = 0;
+    for( const fp3d::hub_prop &prop : props ) {
+        const tripoint_abs_ms abs = at( s, prop.at );
+        const tripoint_bub_ms p = here.get_bub( abs );
+        if( !here.inbounds( p ) ) {
+            continue;
+        }
+        bool ok = false;
+        switch( prop.kind ) {
+            case fp3d::prop_kind::terrain:
+                here.ter_set( p, ter_str_id( prop.id ).id() );
+                ok = here.ter( p ).id().str() == prop.id;
+                break;
+            case fp3d::prop_kind::furniture:
+                here.furn_set( p, furn_str_id( prop.id ).id() );
+                ok = here.furn( p ).id().str() == prop.id;
+                break;
+            case fp3d::prop_kind::field:
+                ok = here.add_field( p, field_type_str_id( prop.id ).id(), prop.count, 0_turns, false );
+                break;
+            case fp3d::prop_kind::item: {
+                const itype_id type( prop.id );
+                if( !type.is_valid() ) {
+                    break;
+                }
+                item it( type, calendar::turn );
+                const itype_id inside( *prop.contents != '\0' ? prop.contents : "null" );
+                if( !inside.is_null() && inside.is_valid() ) {
+                    if( it.is_gun() ) {
+                        it.ammo_set( inside, prop.contents_count );
+                    } else {
+                        it.put_in( item( inside, calendar::turn, prop.contents_count ), pocket_type::CONTAINER );
+                    }
+                }
+                if( it.count_by_charges() ) {
+                    it.charges = prop.count;
+                    ok = !here.add_item( p, it ).is_null();
+                } else {
+                    ok = true;
+                    for( int i = 0; i < prop.count; i++ ) {
+                        ok = !here.add_item( p, it ).is_null() && ok;
+                    }
+                }
+                break;
+            }
+            case fp3d::prop_kind::monster: {
+                const mtype_id type( prop.id );
+                ok = type.is_valid() && g->place_critter_at( type, p ) != nullptr;
+                break;
+            }
+            case fp3d::prop_kind::vehicle: {
+                const vproto_id type( prop.id );
+                // Intact, no faults or security; `count` = fuel percent.
+                ok = type.is_valid() && here.add_vehicle( type, p, 0_degrees, prop.count, 2, false, true ) != nullptr;
+                break;
+            }
+        }
+        placed += ok ? 1 : 0;
+    }
+    return placed;
+}
+
+void build_hub( const tripoint_abs_ms &s )
+{
     // Walls round a 29x29 room, the door in the east wall (props). Nothing stands between the start square and the
     // props: the player sees them all, and the zombie sees the player.
     for( int y = -15; y <= 15; y++ ) {
@@ -413,63 +596,7 @@ void build_hub( const tripoint_abs_ms &s )
             set_ter( at( s, { x, y, -1 } ), ter_cellar_floor );
         }
     }
-    for( const fp3d::hub_prop &prop : fp3d::hub_props() ) {
-        const tripoint_abs_ms abs = at( s, prop.at );
-        const tripoint_bub_ms p = here.get_bub( abs );
-        if( !here.inbounds( p ) ) {
-            continue;
-        }
-        switch( prop.kind ) {
-            case fp3d::prop_kind::terrain:
-                here.ter_set( p, ter_str_id( prop.id ).id() );
-                break;
-            case fp3d::prop_kind::furniture:
-                here.furn_set( p, furn_str_id( prop.id ).id() );
-                break;
-            case fp3d::prop_kind::field:
-                here.add_field( p, field_type_str_id( prop.id ).id(), prop.count, 0_turns, false );
-                break;
-            case fp3d::prop_kind::item: {
-                const itype_id type( prop.id );
-                if( !type.is_valid() ) {
-                    break;
-                }
-                item it( type, calendar::turn );
-                const itype_id inside( *prop.contents != '\0' ? prop.contents : "null" );
-                if( !inside.is_null() && inside.is_valid() ) {
-                    if( it.is_gun() ) {
-                        it.ammo_set( inside, prop.contents_count );
-                    } else {
-                        it.put_in( item( inside, calendar::turn, prop.contents_count ), pocket_type::CONTAINER );
-                    }
-                }
-                if( it.count_by_charges() ) {
-                    it.charges = prop.count;
-                    here.add_item( p, it );
-                } else {
-                    for( int i = 0; i < prop.count; i++ ) {
-                        here.add_item( p, it );
-                    }
-                }
-                break;
-            }
-            case fp3d::prop_kind::monster: {
-                const mtype_id type( prop.id );
-                if( type.is_valid() ) {
-                    g->place_critter_at( type, p );
-                }
-                break;
-            }
-            case fp3d::prop_kind::vehicle: {
-                const vproto_id type( prop.id );
-                if( type.is_valid() ) {
-                    // Intact, no faults or security; `count` = fuel percent.
-                    here.add_vehicle( type, p, 0_degrees, prop.count, 2, false, true );
-                }
-                break;
-            }
-        }
-    }
+    place_props( s, fp3d::hub_props() );
 }
 
 void build_gallery( size_t index, const tripoint_abs_ms &s )
@@ -512,6 +639,241 @@ void build_gallery( size_t index, const tripoint_abs_ms &s )
     set_ter( at( s, { st.x, st.y, 1 } ), ter_stairs_down );
 }
 
+// Items an armory or hall lays out: not the armed bombs (DANGEROUS), nothing that never lies on a square by itself
+// (NO_DROP), no corpse that would rise again.
+bool layable( const itype_id &type )
+{
+    if( !type.is_valid() || type.is_null() ) {
+        return false;
+    }
+    const itype &t = *type;
+    if( t.has_flag( flag_DANGEROUS ) || t.has_flag( flag_NO_DROP ) ) {
+        return false;
+    }
+    return t.source_monster.is_null() || !t.source_monster.is_valid() ||
+           !t.source_monster->has_flag( mon_flag_REVIVES );
+}
+
+// An item as it can lie on a shelf: a liquid or gas in its default container (a liquid without one in a jerrycan);
+// nullopt when there is nothing to hold it.
+std::optional<item> ground_form( const item &it )
+{
+    if( it.made_of( phase_id::SOLID ) ) {
+        return it;
+    }
+    item held = it.in_its_container();
+    if( held.typeId() == it.typeId() && it.made_of( phase_id::LIQUID ) && itype_liquid_fallback.is_valid() ) {
+        held = it.in_container( itype_liquid_fallback );
+    }
+    if( held.typeId() == it.typeId() || held.all_items_top().empty() ) {
+        return std::nullopt;
+    }
+    return held;
+}
+
+// On that square only, if it fits (volume, item count).
+bool put_item( const tripoint_bub_ms &p, const item &it )
+{
+    return !get_map().add_item_or_charges( p, it, false ).is_null();
+}
+
+// Whether `gun` can be loaded with `ammo` by ammo_set: an integral magazine, or a default magazine to fill.
+bool loadable( const item &gun, const itype_id &ammo )
+{
+    if( ammo.is_null() || !ammo.is_valid() || !ammo->ammo ) {
+        return false;
+    }
+    if( gun.magazine_integral() ) {
+        return true;
+    }
+    const itype_id mag = gun.magazine_default();
+    return !mag.is_null() && mag.is_valid() && mag->magazine;
+}
+
+// What the current build left out (the first few, for the log); game thread.
+std::vector<std::string> build_skips;
+void skip( const std::string &id )
+{
+    if( build_skips.size() < 64 ) {
+        build_skips.push_back( id );
+    }
+}
+
+// Armory: each item type on its own table; a gun loaded (its default magazine, or its own ammo) with a stack of its
+// default ammo next to it on the table.
+size_t build_armory( size_t index, const tripoint_abs_ms &s )
+{
+    map &here = get_map();
+    size_t placed = 0;
+    for( const fp3d::zone_piece &piece : fp3d::zone_pieces( index ) ) {
+        const tripoint_bub_ms p = here.get_bub( at( s, piece.at ) );
+        if( !here.inbounds( p ) ) {
+            continue;
+        }
+        here.furn_set( p, furn_table.id() );
+        const itype_id type( piece.id );
+        if( !layable( type ) ) {
+            skip( piece.id );
+            continue;
+        }
+        item it( type, calendar::turn );
+        std::optional<item> stack;
+        if( piece.what == "gun" ) {
+            const itype_id ammo = it.ammo_default();
+            if( loadable( it, ammo ) ) {
+                it.ammo_set( ammo, -1 );
+                stack = ground_form( item( ammo, calendar::turn ) );
+            }
+        }
+        if( !put_item( p, it ) ) {
+            skip( piece.id );
+            continue;
+        }
+        placed++;
+        if( stack ) {
+            put_item( p, *stack );
+        }
+    }
+    return placed;
+}
+
+// Halls: one item type per display rack (on the floor when the rack can't take it).
+size_t build_halls( size_t index, const tripoint_abs_ms &s )
+{
+    map &here = get_map();
+    size_t placed = 0;
+    for( const fp3d::zone_piece &piece : fp3d::zone_pieces( index ) ) {
+        const tripoint_bub_ms p = here.get_bub( at( s, piece.at ) );
+        if( !here.inbounds( p ) ) {
+            continue;
+        }
+        here.furn_set( p, furn_rack.id() );
+        const itype_id type( piece.id );
+        if( !layable( type ) ) {
+            skip( piece.id );
+            continue;
+        }
+        const std::optional<item> it = ground_form( item( type, calendar::turn ) );
+        if( !it ) {
+            skip( piece.id );
+            continue;
+        }
+        if( !put_item( p, *it ) ) {
+            here.furn_set( p, furn_str_id::NULL_ID() );
+            if( !put_item( p, *it ) ) {
+                skip( piece.id );
+                continue;
+            }
+        }
+        placed++;
+    }
+    return placed;
+}
+
+// Lots: each bay paved and painted round, its vehicle facing east, intact, half a tank.
+size_t build_lots( size_t index, const tripoint_abs_ms &s )
+{
+    map &here = get_map();
+    size_t placed = 0;
+    for( const fp3d::zone_piece &piece : fp3d::zone_pieces( index ) ) {
+        for( int y = piece.min.y - 1; y <= piece.max.y + 1; y++ ) {
+            for( int x = piece.min.x - 1; x <= piece.max.x + 1; x++ ) {
+                const bool border = x < piece.min.x || x > piece.max.x || y < piece.min.y || y > piece.max.y;
+                set_ter( at( s, { x, y, 0 } ), border ? ter_paint : ter_pavement );
+            }
+        }
+        const tripoint_bub_ms p = here.get_bub( at( s, piece.at ) );
+        const vproto_id type( piece.id );
+        if( here.inbounds( p ) && type.is_valid() &&
+            here.add_vehicle( type, p, 0_degrees, 50, 2, false, true ) != nullptr ) {
+            placed++;
+        } else {
+            skip( piece.id );
+        }
+    }
+    return placed;
+}
+
+// Pens: each monster in its reinforced glass cell, on the floor it can stand on (water, dirt to dig in, an indoor
+// floor out of the sun). A new monster's timers start at the beginning of time, so the first reload would catch up
+// (dung on the floor, ...): caught up here, the cell swept. The cells are laid first and the map caches rebuilt, so a
+// monster the sun kills sees the indoor floor as shelter.
+size_t build_pens( size_t index, const tripoint_abs_ms &s )
+{
+    map &here = get_map();
+    size_t placed = 0;
+    const std::vector<fp3d::zone_piece> pieces = fp3d::zone_pieces( index );
+    for( const fp3d::zone_piece &piece : pieces ) {
+        const ter_str_id &inside = piece.what == "water" ? ter_pen_water : piece.what == "dirt" ? ter_pen_dirt :
+                                   piece.what == "shade" ? ter_pen_shade : ter_floor;
+        for( int y = piece.min.y - 1; y <= piece.max.y + 1; y++ ) {
+            for( int x = piece.min.x - 1; x <= piece.max.x + 1; x++ ) {
+                const bool wall = x < piece.min.x || x > piece.max.x || y < piece.min.y || y > piece.max.y;
+                set_ter( at( s, { x, y, 0 } ), wall ? ter_pen_glass : inside );
+            }
+        }
+    }
+    here.build_map_cache( here.get_bub( s ).z(), true );
+    for( const fp3d::zone_piece &piece : pieces ) {
+        const tripoint_bub_ms p = here.get_bub( at( s, piece.at ) );
+        const mtype_id type( piece.id );
+        monster *m = here.inbounds( p ) && type.is_valid() ? g->place_critter_at( type, p ) : nullptr;
+        if( m == nullptr ) {
+            skip( piece.id );
+            continue;
+        }
+        // Evolution is off in the range world (quiet_world_options): on_load can't change its type.
+        m->on_load();
+        for( int y = piece.min.y; y <= piece.max.y; y++ ) {
+            for( int x = piece.min.x; x <= piece.max.x; x++ ) {
+                const tripoint_bub_ms q = here.get_bub( at( s, { x, y, 0 } ) );
+                if( here.inbounds( q ) ) {
+                    here.i_clear( q );
+                }
+            }
+        }
+        placed++;
+    }
+    return placed;
+}
+
+// Lanes: the shooting line, lane lines, the wall behind, then the targets.
+size_t build_lanes( const tripoint_abs_ms &s )
+{
+    map &here = get_map();
+    const std::vector<fp3d::lane_target> &lanes = fp3d::lane_targets();
+    int min_x = 0;
+    int max_x = 0;
+    for( const fp3d::lane_target &t : lanes ) {
+        min_x = std::min( min_x, t.shooter.x - 2 );
+        max_x = std::max( max_x, t.shooter.x + 2 );
+    }
+    for( int x = min_x; x <= max_x; x++ ) {
+        set_ter( at( s, { x, 0, 0 } ), ter_paint );
+        set_ter( at( s, { x, fp3d::lane_backstop_y, 0 } ), ter_wall );
+        if( ( x - min_x ) % 4 == 0 ) {
+            for( int y = fp3d::lane_backstop_y + 1; y < 0; y++ ) {
+                set_ter( at( s, { x, y, 0 } ), ter_paint );
+            }
+        }
+    }
+    size_t placed = 0;
+    for( const fp3d::lane_target &t : lanes ) {
+        const tripoint_bub_ms p = here.get_bub( at( s, t.target ) );
+        if( !here.inbounds( p ) ) {
+            continue;
+        }
+        if( t.monster ) {
+            const mtype_id type( t.id );
+            placed += type.is_valid() && g->place_critter_at( type, p ) != nullptr ? 1 : 0;
+        } else {
+            here.furn_set( p, furn_str_id( t.id ).id() );
+            placed += here.furn( p ).id().str() == t.id ? 1 : 0;
+        }
+    }
+    return placed;
+}
+
 // Builds zone `index` around its centre (which must be in the bubble) and marks it built.
 void build_zone( size_t index )
 {
@@ -519,7 +881,10 @@ void build_zone( size_t index )
     fp3d::range_zone &z = r.zones[index];
     const tripoint_abs_ms s = fp3d::zone_centre( z );
     const auto t0 = std::chrono::steady_clock::now();
+    const build_rng seeded( z.id );
+    build_skips.clear();
     clear_area( s );
+    size_t placed = z.count;
     switch( z.kind ) {
         case fp3d::zone_kind::hub:
             build_hub( s );
@@ -527,17 +892,23 @@ void build_zone( size_t index )
         case fp3d::zone_kind::gallery:
             build_gallery( index, s );
             break;
-        // TODO(K7 slice 2): armory (every gun on a table square with its loaded default magazine and a stack of its
-        // ammo, melee and throwables in rows), halls (items of z.category, z.first .. +z.count, in aisles), lots
-        // (z.count vehicle prototypes in marked bays), pens (z.count monsters in glass cells, by species), lanes
-        // (frozen targets at 5/10/25/50 m) and kitchen (stoves, ovens, a lit fireplace and brazier, fridge, sink,
-        // pots and food). Until then they are empty cleared floors.
         case fp3d::zone_kind::armory:
+            placed = build_armory( index, s );
+            break;
         case fp3d::zone_kind::halls:
+            placed = build_halls( index, s );
+            break;
         case fp3d::zone_kind::lots:
+            placed = build_lots( index, s );
+            break;
         case fp3d::zone_kind::pens:
+            placed = build_pens( index, s );
+            break;
         case fp3d::zone_kind::lanes:
+            placed = build_lanes( s );
+            break;
         case fp3d::zone_kind::kitchen:
+            placed = place_props( s, fp3d::kitchen_props() );
             break;
     }
     map &here = get_map();
@@ -546,10 +917,20 @@ void build_zone( size_t index )
     }
     here.rebuild_vehicle_level_caches();
     z.built = true;
+    z.placed = std::min( placed, z.count );
+    z.skipped = z.count - z.placed;
+    z.build_ms = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
     get_avatar().set_value( built_prefix + z.id, 1.0 );
     r.version++;
-    std::printf( "range: built zone %s in %.0f ms\n", z.id.c_str(),
-                 std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count() );
+    std::string skipped;
+    for( size_t i = 0; i < build_skips.size() && i < 8; i++ ) {
+        skipped += " " + build_skips[i];
+    }
+    if( z.skipped > std::min<size_t>( build_skips.size(), 8 ) ) {
+        skipped += " ...";
+    }
+    std::printf( "range: built zone %s in %.0f ms (%zu of %zu placed%s%s)\n", z.id.c_str(), z.build_ms, z.placed,
+                 z.count, skipped.empty() ? "" : "; skipped:", skipped.c_str() );
 }
 
 // After the avatar moved within the loaded bubble: recentre it and refresh what the turn would.
@@ -616,6 +997,10 @@ void quiet_world_options()
     }
     if( has( "NPC_SPAWNTIME" ) ) {
         opts.get_option( "NPC_SPAWNTIME" ).setValue( 0.0f );
+    }
+    // Pen monsters keep their type: no evolution.
+    if( has( "EVOLUTION_INVERSE_MULTIPLIER" ) ) {
+        opts.get_option( "EVOLUTION_INVERSE_MULTIPLIER" ).setValue( 0.0f );
     }
     for( const char *name : {
              "WANDER_SPAWNS", "BLACK_ROAD"
@@ -866,6 +1251,277 @@ std::vector<gallery_piece> gallery_pieces( size_t zone )
     return out;
 }
 
+namespace
+{
+// The armory's and halls' item squares: rows y % 3 != 0 (aisles between pairs of rows, the centre row among them),
+// columns x % 14 != 0 (cross aisles, the centre column among them), within x -56..55, y -58..58. The rows nearest
+// the centre are used, read top-down and left to right; each group starts a new row. At most what fits.
+std::vector<range_offset> grid_slots( const std::vector<size_t> &groups )
+{
+    const auto mod = []( int v, int m ) {
+        return ( ( v % m ) + m ) % m;
+    };
+    std::vector<int> columns;
+    for( int x = -56; x <= 55; x++ ) {
+        if( mod( x, 14 ) != 0 ) {
+            columns.push_back( x );
+        }
+    }
+    std::vector<int> rows;
+    for( int y = -58; y <= 58; y++ ) {
+        if( mod( y, 3 ) != 0 ) {
+            rows.push_back( y );
+        }
+    }
+    size_t rows_needed = 0;
+    for( const size_t n : groups ) {
+        rows_needed += ( n + columns.size() - 1 ) / columns.size();
+    }
+    std::stable_sort( rows.begin(), rows.end(), []( int a, int b ) {
+        return std::abs( a ) < std::abs( b );
+    } );
+    rows.resize( std::min( rows.size(), rows_needed ) );
+    std::sort( rows.begin(), rows.end() );
+    std::vector<range_offset> out;
+    size_t row = 0;
+    for( const size_t n : groups ) {
+        size_t col = 0;
+        for( size_t i = 0; i < n && row < rows.size(); i++ ) {
+            out.push_back( { columns[col], rows[row], 0 } );
+            if( ++col == columns.size() ) {
+                col = 0;
+                row++;
+            }
+        }
+        if( col > 0 ) {
+            row++;
+        }
+    }
+    return out;
+}
+
+// Lot bays, shelf-packed from the north-west corner: each bay is the vehicle's mount rectangle with a painted border
+// (bays side by side share it), a free row between rows of bays, the centre's 5x5 kept free.
+void lot_layout( const std::vector<vproto_id> &list, std::vector<zone_piece> &out )
+{
+    constexpr int lo = -58;
+    constexpr int hi = 57;
+    constexpr int plaza = 2;
+    int x = lo;
+    int y = lo;
+    int row_h = 0;
+    for( const vproto_id &id : list ) {
+        if( !id.is_valid() || id->parts.empty() ) {
+            continue;
+        }
+        int min_x = INT_MAX;
+        int min_y = INT_MAX;
+        int max_x = INT_MIN;
+        int max_y = INT_MIN;
+        for( const vehicle_prototype::part_def &pt : id->parts ) {
+            min_x = std::min( min_x, pt.pos.x() );
+            min_y = std::min( min_y, pt.pos.y() );
+            max_x = std::max( max_x, pt.pos.x() );
+            max_y = std::max( max_y, pt.pos.y() );
+        }
+        // With the border; a prototype's parts are close to its origin, but its data is a mod's: bounded.
+        const int64_t w64 = int64_t{ max_x } - min_x + 3;
+        const int64_t h64 = int64_t{ max_y } - min_y + 3;
+        if( w64 > hi - lo + 1 || h64 > hi - lo + 1 ) {
+            continue;
+        }
+        const int w = static_cast<int>( w64 );
+        const int h = static_cast<int>( h64 );
+        while( true ) {
+            if( x + w - 1 > hi ) {
+                x = lo;
+                y += row_h + 1;
+                row_h = 0;
+            }
+            if( y + h - 1 > hi ) {
+                break;
+            }
+            if( x <= plaza && x + w - 1 >= -plaza && y <= plaza && y + h - 1 >= -plaza ) {
+                x = plaza + 1;
+                continue;
+            }
+            zone_piece piece;
+            piece.id = id.str();
+            piece.min = { x + 1, y + 1, 0 };
+            piece.max = { x + w - 2, y + h - 2, 0 };
+            piece.at = { x + 1 - min_x, y + 1 - min_y, 0 };
+            out.push_back( std::move( piece ) );
+            x += w - 1;
+            row_h = std::max( row_h, h );
+            break;
+        }
+    }
+}
+
+// Pen cells in strips south of the centre: a glass wall row, 3 rows inside, a glass wall row, then 2 free rows;
+// cells side by side share their glass walls.
+void pen_layout( const std::vector<mtype_id> &list, std::vector<zone_piece> &out )
+{
+    constexpr int lo_x = -56;
+    constexpr int hi_x = 55;
+    constexpr int hi_y = 58;
+    int x = lo_x;
+    int y = 2;
+    for( const mtype_id &id : list ) {
+        if( !id.is_valid() ) {
+            continue;
+        }
+        const mtype &t = *id;
+        const int w = t.size >= creature_size::huge ? 3 : t.size >= creature_size::large ? 2 : 1;
+        if( x + w + 1 > hi_x ) {
+            x = lo_x;
+            y += 7;
+        }
+        if( y + 4 > hi_y ) {
+            break;
+        }
+        zone_piece piece;
+        piece.id = id.str();
+        piece.min = { x + 1, y + 1, 0 };
+        piece.max = { x + w, y + 3, 0 };
+        piece.at = { x + 1 + ( w - 1 ) / 2, y + 2, 0 };
+        piece.what = t.has_flag( mon_flag_AQUATIC ) ? "water" : t.has_flag( mon_flag_DIGS ) ? "dirt" :
+                     t.has_flag( mon_flag_SUNDEATH ) ? "shade" : "";
+        out.push_back( std::move( piece ) );
+        x += w + 1;
+    }
+}
+} // namespace
+
+std::vector<zone_piece> zone_pieces( size_t zone )
+{
+    std::vector<zone_piece> out;
+    const std::vector<range_zone> &zones = range_zones();
+    if( zone >= zones.size() ) {
+        return out;
+    }
+    const registry &r = reg();
+    const range_zone &z = zones[zone];
+    // The zone's slice of a list (clamped: the zone came from the same data, but stay inside).
+    const auto slice = [&z]( const auto & list ) {
+        const size_t first = std::min( z.first, list.size() );
+        const size_t end = std::min( list.size(), first + std::min( z.count, list.size() - first ) );
+        return std::make_pair( first, end );
+    };
+    switch( z.kind ) {
+        case zone_kind::armory: {
+            const auto [first, end] = slice( r.armory );
+            std::vector<size_t> groups( 3, 0 );
+            for( size_t i = first; i < end; i++ ) {
+                groups[i < r.armory_guns ? 0 : i < r.armory_guns + r.armory_melee ? 1 : 2]++;
+            }
+            const std::vector<range_offset> slots = grid_slots( groups );
+            for( size_t i = first; i < end && i - first < slots.size(); i++ ) {
+                const range_offset &o = slots[i - first];
+                const char *what = i < r.armory_guns ? "gun" : i < r.armory_guns + r.armory_melee ? "melee" : "thrown";
+                out.push_back( { r.armory[i].str(), o, o, o, what } );
+            }
+            break;
+        }
+        case zone_kind::halls: {
+            const auto it = r.halls.find( z.category );
+            if( it == r.halls.end() ) {
+                break;
+            }
+            const auto [first, end] = slice( it->second );
+            const std::vector<range_offset> slots = grid_slots( { end - first } );
+            for( size_t i = first; i < end && i - first < slots.size(); i++ ) {
+                const range_offset &o = slots[i - first];
+                out.push_back( { it->second[i].str(), o, o, o, "" } );
+            }
+            break;
+        }
+        case zone_kind::lots: {
+            const auto [first, end] = slice( r.vehicles );
+            lot_layout( std::vector<vproto_id>( r.vehicles.begin() + static_cast<std::ptrdiff_t>( first ),
+                                                r.vehicles.begin() + static_cast<std::ptrdiff_t>( end ) ), out );
+            break;
+        }
+        case zone_kind::pens: {
+            const auto [first, end] = slice( r.monsters );
+            pen_layout( std::vector<mtype_id>( r.monsters.begin() + static_cast<std::ptrdiff_t>( first ),
+                                               r.monsters.begin() + static_cast<std::ptrdiff_t>( end ) ), out );
+            break;
+        }
+        case zone_kind::hub:
+        case zone_kind::gallery:
+        case zone_kind::lanes:
+        case zone_kind::kitchen:
+            break;
+    }
+    return out;
+}
+
+const std::vector<lane_target> &lane_targets()
+{
+    // Eight lanes 4 squares apart (none on the centre column, where the player arrives): zombies at 5, 10, 25 and
+    // 50 squares, then practice targets at the same distances.
+    static const std::vector<lane_target> lanes = [] {
+        std::vector<lane_target> v;
+        const int distances[] = { 5, 10, 25, 50 };
+        for( int i = 0; i < 8; i++ )
+        {
+            const int x = -14 + 4 * i;
+            const int d = distances[i % 4];
+            const bool monster = i < 4;
+            v.push_back( { { x, 0, 0 }, { x, -d, 0 }, d, monster, monster ? "mon_zombie" : "f_target" } );
+        }
+        return v;
+    }();
+    return lanes;
+}
+
+const std::vector<hub_prop> &kitchen_props()
+{
+    // Along a counter row north of the centre: two lit wood stoves, an oven, a fridge with food, a sink with water,
+    // counters with cookware, food and water; a lit fireplace and brazier to the south, apart.
+    static const std::vector<hub_prop> props = {
+        { "wood stove", { -6, -5, 0 }, prop_kind::furniture, "f_woodstove" },
+        { "firewood in the wood stove", { -6, -5, 0 }, prop_kind::item, "2x4", 6 },
+        { "fire in the wood stove", { -6, -5, 0 }, prop_kind::field, "fd_fire", 1 },
+        { "second wood stove", { -4, -5, 0 }, prop_kind::furniture, "f_woodstove" },
+        { "firewood in the second stove", { -4, -5, 0 }, prop_kind::item, "2x4", 6 },
+        { "fire in the second stove", { -4, -5, 0 }, prop_kind::field, "fd_fire", 1 },
+        { "oven", { -2, -5, 0 }, prop_kind::furniture, "f_oven" },
+        { "refrigerator", { 0, -5, 0 }, prop_kind::furniture, "f_fridge" },
+        { "jug of milk in the fridge", { 0, -5, 0 }, prop_kind::item, "jug_plastic", 1, "milk", 8 },
+        { "cheese in the fridge", { 0, -5, 0 }, prop_kind::item, "cheese", 2 },
+        { "raw meat in the fridge", { 0, -5, 0 }, prop_kind::item, "meat", 2 },
+        { "eggs in the fridge", { 0, -5, 0 }, prop_kind::item, "egg_chicken", 6 },
+        { "sink", { 2, -5, 0 }, prop_kind::furniture, "f_sink" },
+        { "bucket of clean water in the sink", { 2, -5, 0 }, prop_kind::item, "bucket", 1, "water_clean", 20 },
+        { "counter by the sink", { 4, -5, 0 }, prop_kind::furniture, "f_counter" },
+        { "cooking pot", { 4, -5, 0 }, prop_kind::item, "pot" },
+        { "frying pan", { 4, -5, 0 }, prop_kind::item, "pan" },
+        { "counter", { 5, -5, 0 }, prop_kind::furniture, "f_counter" },
+        { "kettle", { 5, -5, 0 }, prop_kind::item, "kettle" },
+        { "large kitchen knife", { 5, -5, 0 }, prop_kind::item, "knife_huge" },
+        { "spatula", { 5, -5, 0 }, prop_kind::item, "spatula" },
+        { "ladle", { 5, -5, 0 }, prop_kind::item, "ladle" },
+        { "third counter", { 6, -5, 0 }, prop_kind::furniture, "f_counter" },
+        { "bread", { 6, -5, 0 }, prop_kind::item, "bread", 2 },
+        { "apples", { 6, -5, 0 }, prop_kind::item, "apple", 3 },
+        { "fourth counter", { 7, -5, 0 }, prop_kind::furniture, "f_counter" },
+        { "jug of clean water", { 7, -5, 0 }, prop_kind::item, "jug_plastic", 1, "water_clean", 15 },
+        { "bottle of clean water", { 7, -5, 0 }, prop_kind::item, "bottle_plastic", 1, "water_clean", 2 },
+        { "fifth counter", { 8, -5, 0 }, prop_kind::furniture, "f_counter" },
+        { "empty jerrycan", { 8, -5, 0 }, prop_kind::item, "jerrycan" },
+        { "empty plastic bottles", { 8, -5, 0 }, prop_kind::item, "bottle_plastic", 2 },
+        { "fireplace", { -8, 4, 0 }, prop_kind::furniture, "f_fireplace" },
+        { "firewood in the fireplace", { -8, 4, 0 }, prop_kind::item, "2x4", 8 },
+        { "fire in the fireplace", { -8, 4, 0 }, prop_kind::field, "fd_fire", 1 },
+        { "brazier", { 8, 4, 0 }, prop_kind::furniture, "f_brazier" },
+        { "firewood in the brazier", { 8, 4, 0 }, prop_kind::item, "2x4", 6 },
+        { "fire in the brazier", { 8, 4, 0 }, prop_kind::field, "fd_fire", 1 },
+    };
+    return props;
+}
+
 void boot_test_range( unsigned seed )
 {
     if( g == nullptr || world_generator->active_world == nullptr ) {
@@ -879,6 +1535,7 @@ void boot_test_range( unsigned seed )
     const auto t0 = std::chrono::steady_clock::now();
     rng_set_engine_seed( seed );
     reset_test_range();
+    range_seed = seed;
     session.store( true );
     quiet_world_options();
     calendar::start_of_cataclysm = calendar::turn_zero;

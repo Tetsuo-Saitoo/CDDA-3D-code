@@ -2,15 +2,19 @@
 // drives it like a client. Checks the zone registry (unique ids), every hub prop, the gallery (every terrain and
 // furniture id, working stairs), the range operations (and that bad input is refused, the clock's end, a full square),
 // teleport arrival next to a taken centre, rebuilding a zone, frozen AI (and that unfreezing lets the hub zombie act),
-// and the median turn time in the hub and the gallery. Range operations run on the sim thread, in the hook that runs
-// before each request. Exit code 0 only if every check passed.
+// the median turn time in the hub and the gallery, and one zone of each other kind (armory, halls, lots, pens, lanes,
+// kitchen: what is placed against the zone's slice, and that a rebuild gives the same zone). Range operations run on
+// the sim thread, in the hook that runs before each request. Exit code 0 only if every check passed.
 //
-// usage: fp3d-range-test   (run from the cdda/ folder)
+// usage: fp3d-range-test [--all-zones]   (run from the cdda/ folder)
+//   --all-zones   also builds every zone once (rebuild_zone from the hub) and checks placed + skipped == count
 #include <algorithm>
 #include <chrono>
+#include <climits>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <functional>
 #include <iostream>
@@ -42,11 +46,13 @@
 #include "fp3d/test_range.h"
 #include "game.h"
 #include "item.h"
+#include "itype.h"
 #include "map.h"
 #include "mapdata.h"
 #include "monster.h"
 #include "mtype.h"
 #include "npc.h"
+#include "string_formatter.h"
 #include "type_id.h"
 #include "vehicle.h"
 #include "vpart_position.h"
@@ -309,10 +315,10 @@ size_t check_registry()
         frozen = fp3d::ai_frozen();
         zone = fp3d::current_zone();
     } ), "sim ran a job" );
-    std::printf( "    content: %zu guns, %zu other items in %zu categories, %zu vehicle prototypes, %zu monsters, "
-                 "%zu terrain, %zu furniture (%zu emit fields)\n", counts.guns, counts.items,
-                 counts.items_per_category.size(), counts.vehicles, counts.monsters, counts.terrain,
-                 counts.furniture, counts.emitters );
+    std::printf( "    content: %zu guns, %zu other items in %zu categories (%zu melee weapons, %zu throwables), %zu "
+                 "vehicle prototypes, %zu monsters, %zu terrain, %zu furniture (%zu emit fields)\n", counts.guns,
+                 counts.items, counts.items_per_category.size(), counts.melee, counts.throwables, counts.vehicles,
+                 counts.monsters, counts.terrain, counts.furniture, counts.emitters );
     std::string cats;
     for( const auto &[cat, n] : counts.items_per_category ) {
         cats += cat + "=" + std::to_string( n ) + " ";
@@ -403,20 +409,82 @@ void check_zone_ids()
     check( fp3d::hall_id_bases( cats ) == bases, "hall id bases: the same categories give the same ids" );
 }
 
+struct prop_result {
+    std::string what;
+    bool ok = false;
+    std::string detail;
+};
+
+// Each prop where it should be (hub_props, kitchen_props) around `s` (sim thread).
+std::vector<prop_result> props_at( const tripoint_abs_ms &s, const std::vector<fp3d::hub_prop> &props )
+{
+    std::vector<prop_result> results;
+    map &here = get_map();
+    for( const fp3d::hub_prop &p : props ) {
+        const tripoint_abs_ms abs = offset( s, p.at.x, p.at.y, p.at.z );
+        const tripoint_bub_ms b = here.get_bub( abs );
+        prop_result r;
+        r.what = p.what;
+        switch( p.kind ) {
+            case fp3d::prop_kind::terrain:
+                r.detail = here.ter( b ).id().str();
+                r.ok = r.detail == p.id;
+                break;
+            case fp3d::prop_kind::furniture:
+                r.detail = here.furn( b ).id().str();
+                r.ok = r.detail == p.id;
+                break;
+            case fp3d::prop_kind::field:
+                r.ok = here.has_field_at( b, field_type_str_id( p.id ).id() );
+                break;
+            case fp3d::prop_kind::item: {
+                int n = 0;
+                bool inside_ok = *p.contents == '\0';
+                for( const item &it : here.i_at( b ) ) {
+                    if( it.typeId().str() != p.id ) {
+                        continue;
+                    }
+                    n += it.count();
+                    if( it.is_gun() ) {
+                        inside_ok = inside_ok || it.ammo_remaining() == p.contents_count;
+                    } else {
+                        for( const item *c : it.all_items_top() ) {
+                            inside_ok = inside_ok || ( c->typeId().str() == p.contents &&
+                                                       c->charges == p.contents_count );
+                        }
+                    }
+                }
+                r.ok = n >= p.count && inside_ok;
+                r.detail = std::to_string( n ) + "x " + p.id + ( *p.contents ? std::string( " + " ) + p.contents : "" );
+                break;
+            }
+            case fp3d::prop_kind::monster: {
+                const monster *m = get_creature_tracker().creature_at<monster>( b );
+                r.ok = m != nullptr && m->type->id.str() == p.id;
+                r.detail = m != nullptr ? m->type->id.str() : "nobody";
+                break;
+            }
+            case fp3d::prop_kind::vehicle: {
+                const optional_vpart_position vp = here.veh_at( b );
+                const int fuel = vp ? vp->vehicle().fuel_left( here, itype_id( "gasoline" ) ) : -1;
+                r.ok = vp && vp->vehicle().type.str() == p.id && fuel > 0;
+                r.detail = vp ? vp->vehicle().type.str() + ", gasoline " + std::to_string( fuel ) : "none";
+                break;
+            }
+        }
+        results.push_back( r );
+    }
+    return results;
+}
+
 void check_hub()
 {
     std::printf( "hub:\n" );
-    struct prop_result {
-        std::string what;
-        bool ok = false;
-        std::string detail;
-    };
     std::vector<prop_result> results;
     bool at_centre = false;
     size_t npcs = 99;
     mon_state mons;
     on_sim( [&] {
-        map &here = get_map();
         const tripoint_abs_ms s = centre_of( 0 );
         at_centre = get_avatar().pos_abs() == s;
         npcs = 0;
@@ -424,61 +492,7 @@ void check_hub()
             npcs += n.is_dead() ? 0 : 1;
         }
         mons = monsters_now();
-        for( const fp3d::hub_prop &p : fp3d::hub_props() )
-        {
-            const tripoint_abs_ms abs = offset( s, p.at.x, p.at.y, p.at.z );
-            const tripoint_bub_ms b = here.get_bub( abs );
-            prop_result r;
-            r.what = p.what;
-            switch( p.kind ) {
-                case fp3d::prop_kind::terrain:
-                    r.detail = here.ter( b ).id().str();
-                    r.ok = r.detail == p.id;
-                    break;
-                case fp3d::prop_kind::furniture:
-                    r.detail = here.furn( b ).id().str();
-                    r.ok = r.detail == p.id;
-                    break;
-                case fp3d::prop_kind::field:
-                    r.ok = here.has_field_at( b, field_type_str_id( p.id ).id() );
-                    break;
-                case fp3d::prop_kind::item: {
-                    int n = 0;
-                    bool inside_ok = *p.contents == '\0';
-                    for( const item &it : here.i_at( b ) ) {
-                        if( it.typeId().str() != p.id ) {
-                            continue;
-                        }
-                        n += it.count();
-                        if( it.is_gun() ) {
-                            inside_ok = inside_ok || it.ammo_remaining() == p.contents_count;
-                        } else {
-                            for( const item *c : it.all_items_top() ) {
-                                inside_ok = inside_ok || ( c->typeId().str() == p.contents &&
-                                                           c->charges == p.contents_count );
-                            }
-                        }
-                    }
-                    r.ok = n >= p.count && inside_ok;
-                    r.detail = std::to_string( n ) + "x " + p.id + ( *p.contents ? std::string( " + " ) + p.contents : "" );
-                    break;
-                }
-                case fp3d::prop_kind::monster: {
-                    const monster *m = get_creature_tracker().creature_at<monster>( b );
-                    r.ok = m != nullptr && m->type->id.str() == p.id;
-                    r.detail = m != nullptr ? m->type->id.str() : "nobody";
-                    break;
-                }
-                case fp3d::prop_kind::vehicle: {
-                    const optional_vpart_position vp = here.veh_at( b );
-                    const int fuel = vp ? vp->vehicle().fuel_left( here, itype_id( "gasoline" ) ) : -1;
-                    r.ok = vp && vp->vehicle().type.str() == p.id && fuel > 0;
-                    r.detail = vp ? vp->vehicle().type.str() + ", gasoline " + std::to_string( fuel ) : "none";
-                    break;
-                }
-            }
-            results.push_back( r );
-        }
+        results = props_at( s, fp3d::hub_props() );
     } );
     for( const prop_result &r : results ) {
         check( r.ok, "hub: " + r.what, r.detail );
@@ -1034,6 +1048,579 @@ void check_info( size_t gallery )
            std::to_string( info.zones.size() ) + " zones, " + std::to_string( built ) + " built" );
 }
 
+// ---- the other zone kinds ----
+
+bool in_zone( const tripoint_abs_ms &c, const tripoint_abs_ms &p )
+{
+    const int h = fp3d::zone_half_squares;
+    return p.x() - c.x() >= -h && p.x() - c.x() < h && p.y() - c.y() >= -h && p.y() - c.y() < h &&
+           p.z() - c.z() >= -1 && p.z() - c.z() <= 1;
+}
+
+// Everything a zone holds, as one hash: terrain, furniture, items (type, count, ammo, contents) but on burning
+// squares (the fire eats its fuel), fire, monsters and vehicles (type and square). Two builds of a zone give the same
+// (sim thread). `things` counts what went in.
+uint64_t zone_fingerprint( const tripoint_abs_ms &c, size_t &things, std::string *what = nullptr )
+{
+    uint64_t h = 1469598103934665603ull;
+    const auto mix = [&h]( const std::string & s ) {
+        for( const char ch : s ) {
+            h ^= static_cast<unsigned char>( ch );
+            h *= 1099511628211ull;
+        }
+        h ^= 0xff;
+        h *= 1099511628211ull;
+    };
+    things = 0;
+    map &here = get_map();
+    const int half = fp3d::zone_half_squares;
+    for( int z = -1; z <= 1; z++ ) {
+        for( int y = -half; y < half; y++ ) {
+            for( int x = -half; x < half; x++ ) {
+                const tripoint_bub_ms b = here.get_bub( offset( c, x, y, z ) );
+                mix( here.ter( b ).id().str() );
+                mix( here.furn( b ).id().str() );
+                const bool fire = here.has_field_at( b, field_type_str_id( "fd_fire" ).id() );
+                mix( fire ? "fire" : "-" );
+                if( fire ) {
+                    continue;
+                }
+                for( const item &it : here.i_at( b ) ) {
+                    things++;
+                    if( what != nullptr && what->size() < 2000 ) {
+                        *what += it.typeId().str() + "@" + std::to_string( x ) + "," + std::to_string( y ) + " ";
+                    }
+                    std::string s = it.typeId().str() + "x" + std::to_string( it.count() );
+                    if( it.is_gun() || it.is_magazine() ) {
+                        s += "/" + std::to_string( it.ammo_remaining() );
+                    }
+                    for( const item *in : it.all_items_top() ) {
+                        s += "+" + in->typeId().str() + "x" + std::to_string( in->count() );
+                    }
+                    mix( s );
+                }
+            }
+        }
+    }
+    std::vector<std::string> mons;
+    for( monster &m : g->all_monsters() ) {
+        if( in_zone( c, m.pos_abs() ) ) {
+            const tripoint_abs_ms p = m.pos_abs();
+            mons.push_back( m.type->id.str() + "@" + std::to_string( p.x() - c.x() ) + "," +
+                            std::to_string( p.y() - c.y() ) );
+        }
+    }
+    std::vector<std::string> vehs;
+    for( const wrapped_vehicle &w : here.get_vehicles() ) {
+        const tripoint_abs_ms p = w.v->pos_abs();
+        if( in_zone( c, p ) ) {
+            vehs.push_back( w.v->type.str() + "@" + std::to_string( p.x() - c.x() ) + "," +
+                            std::to_string( p.y() - c.y() ) + "#" + std::to_string( w.v->part_count() ) );
+        }
+    }
+    std::sort( mons.begin(), mons.end() );
+    std::sort( vehs.begin(), vehs.end() );
+    for( const std::string &s : mons ) {
+        mix( s );
+    }
+    for( const std::string &s : vehs ) {
+        mix( s );
+    }
+    things += mons.size() + vehs.size();
+    if( what != nullptr ) {
+        *what = std::to_string( mons.size() ) + " monsters, " + std::to_string( vehs.size() ) + " vehicles; items: " +
+                *what;
+    }
+    return h;
+}
+
+struct kind_result {
+    std::vector<prop_result> checks;   // the kind's own checks
+    std::string summary;               // counts for the log
+};
+
+bool has_item( const tripoint_bub_ms &b, const std::string &id )
+{
+    for( const item &it : get_map().i_at( b ) ) {
+        if( it.typeId().str() == id || it.has_item_with( [&id]( const item & e ) {
+        return e.typeId().str() == id;
+        } ) ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Armory: every type on its table (or skipped), guns loaded with a stack of their ammo.
+kind_result verify_armory( size_t index, const fp3d::range_zone &z, const tripoint_abs_ms &c )
+{
+    kind_result out;
+    map &here = get_map();
+    const std::vector<fp3d::zone_piece> pieces = fp3d::zone_pieces( index );
+    size_t present = 0;
+    size_t tables = 0;
+    size_t guns = 0;
+    size_t guns_present = 0;
+    size_t loadable = 0;
+    size_t loaded = 0;
+    size_t need_mag = 0;
+    size_t with_mag = 0;
+    size_t stacks = 0;
+    size_t want_stacks = 0;
+    size_t melee = 0;
+    size_t thrown = 0;
+    std::string unloaded;
+    std::string skipped_ids;
+    for( const fp3d::zone_piece &p : pieces ) {
+        const tripoint_bub_ms b = here.get_bub( offset( c, p.at.x, p.at.y, p.at.z ) );
+        tables += here.furn( b ).id().str() == "f_table" ? 1 : 0;
+        guns += p.what == "gun" ? 1 : 0;
+        melee += p.what == "melee" ? 1 : 0;
+        thrown += p.what == "thrown" ? 1 : 0;
+        const item *found = nullptr;
+        for( const item &it : here.i_at( b ) ) {
+            if( it.typeId().str() == p.id ) {
+                found = &it;
+                break;
+            }
+        }
+        if( found == nullptr ) {
+            if( skipped_ids.size() < 300 ) {
+                skipped_ids += p.id + " ";
+            }
+            continue;
+        }
+        present++;
+        if( p.what != "gun" ) {
+            continue;
+        }
+        guns_present++;
+        const itype_id ammo = found->ammo_default();
+        const itype_id mag = found->magazine_default();
+        const bool can_load = !ammo.is_null() && ammo->ammo && ( found->magazine_integral() ||
+                              ( !mag.is_null() && mag->magazine ) );
+        if( !can_load ) {
+            continue;
+        }
+        loadable++;
+        loaded += found->ammo_remaining() > 0 ? 1 : 0;
+        if( found->ammo_remaining() <= 0 && unloaded.size() < 120 ) {
+            unloaded += p.id + " ";
+        }
+        if( !found->magazine_integral() ) {
+            need_mag++;
+            with_mag += found->magazine_current() != nullptr ? 1 : 0;
+        }
+        // Ammo that never lies loose (NO_DROP: only inside its gun) gets no stack.
+        if( ammo->has_flag( flag_id( "NO_DROP" ) ) ) {
+            continue;
+        }
+        want_stacks++;
+        bool stack = false;
+        for( const item &it : here.i_at( b ) ) {
+            if( &it != found && ( it.typeId() == ammo || it.has_item_with( [&ammo]( const item & e ) {
+            return e.typeId() == ammo;
+        } ) ) ) {
+                stack = true;
+                break;
+            }
+        }
+        stacks += stack ? 1 : 0;
+        if( !stack && unloaded.size() < 120 ) {
+            unloaded += "(no stack: " + p.id + " " + ammo.str() + ") ";
+        }
+    }
+    out.summary = string_format( "%zu of %zu placed (%zu guns, %zu melee, %zu thrown), %zu skipped; guns: %zu "
+                                 "loadable, %zu loaded, %zu of %zu with a magazine, %zu of %zu ammo stacks", present,
+                                 z.count, guns, melee, thrown, z.skipped, loadable, loaded, with_mag, need_mag, stacks,
+                                 want_stacks ) + "; skipped: " + skipped_ids;
+    out.checks.push_back( { "every item type on its table (or counted skipped)", pieces.size() == z.count &&
+                            tables == pieces.size() && present == z.placed && present + z.skipped == z.count && present > 0,
+                            std::to_string( present ) + " + " + std::to_string( z.skipped ) + " of " + std::to_string( z.count ) } );
+    out.checks.push_back( { "guns loaded (default magazine or own ammo), a stack of ammo each", guns_present > 0 &&
+                            loadable > guns_present / 2 && loaded == loadable && with_mag == need_mag &&
+                            stacks == want_stacks && want_stacks + 5 >= loadable,
+                            std::to_string( loaded ) + "/" + std::to_string( loadable ) + " loaded, " +
+                            std::to_string( stacks ) + " stacks " + unloaded } );
+    return out;
+}
+
+// Halls: every type on its rack (or the floor), each item square next to an aisle.
+kind_result verify_halls( size_t index, const fp3d::range_zone &z, const tripoint_abs_ms &c )
+{
+    kind_result out;
+    map &here = get_map();
+    const std::vector<fp3d::zone_piece> pieces = fp3d::zone_pieces( index );
+    size_t present = 0;
+    size_t racks = 0;
+    size_t reachable = 0;
+    size_t most = 0;
+    std::set<std::pair<int, int>> squares;
+    for( const fp3d::zone_piece &p : pieces ) {
+        const tripoint_bub_ms b = here.get_bub( offset( c, p.at.x, p.at.y, p.at.z ) );
+        squares.emplace( p.at.x, p.at.y );
+        racks += here.furn( b ).id().str() == "f_rack" ? 1 : 0;
+        present += has_item( b, p.id ) ? 1 : 0;
+        most = std::max( most, here.i_at( b ).size() );
+        bool aisle = false;
+        for( const int dy : { -1, 1 } ) {
+            const tripoint_bub_ms n = here.get_bub( offset( c, p.at.x, p.at.y + dy, p.at.z ) );
+            aisle = aisle || ( here.passable( n ) && here.furn( n ) == furn_str_id::NULL_ID() );
+        }
+        reachable += aisle ? 1 : 0;
+    }
+    out.summary = string_format( "%s: %zu of %zu placed, %zu skipped, %zu on racks, at most %zu items a square",
+                                 z.category, present, z.count, z.skipped, racks, most );
+    out.checks.push_back( { "every item type on its own square (or counted skipped)", pieces.size() == z.count &&
+                            squares.size() == pieces.size() && present == z.placed && present + z.skipped == z.count &&
+                            present > 0 && most <= 1, std::to_string( present ) + " + " + std::to_string( z.skipped ) +
+                            " of " + std::to_string( z.count ) } );
+    out.checks.push_back( { "every item square next to a walkable aisle", reachable == pieces.size(),
+                            std::to_string( reachable ) + " of " + std::to_string( pieces.size() ) } );
+    return out;
+}
+
+// Lots: each vehicle whole in its painted bay, none overlapping; placed + skipped == count.
+kind_result verify_lots( size_t index, const fp3d::range_zone &z, const tripoint_abs_ms &c )
+{
+    kind_result out;
+    map &here = get_map();
+    const std::vector<fp3d::zone_piece> pieces = fp3d::zone_pieces( index );
+    size_t found = 0;
+    size_t whole = 0;
+    size_t painted = 0;
+    std::string missing;
+    std::string outside;
+    std::set<const vehicle *> seen;
+    for( const fp3d::zone_piece &p : pieces ) {
+        const tripoint_bub_ms b = here.get_bub( offset( c, p.at.x, p.at.y, p.at.z ) );
+        bool border_ok = true;
+        for( int y = p.min.y - 1; y <= p.max.y + 1; y++ ) {
+            for( int x = p.min.x - 1; x <= p.max.x + 1; x++ ) {
+                if( x < p.min.x || x > p.max.x || y < p.min.y || y > p.max.y ) {
+                    border_ok = border_ok && here.ter( here.get_bub( offset( c, x, y ) ) ).id().str() == "t_pavement_y";
+                }
+            }
+        }
+        painted += border_ok ? 1 : 0;
+        const optional_vpart_position vp = here.veh_at( b );
+        if( !vp || vp->vehicle().type.str() != p.id ) {
+            missing += p.id + " ";
+            continue;
+        }
+        const vehicle &v = vp->vehicle();
+        found++;
+        seen.insert( &v );
+        bool inside = true;
+        int lo_x = INT_MAX;
+        int lo_y = INT_MAX;
+        int hi_x = INT_MIN;
+        int hi_y = INT_MIN;
+        for( const tripoint_abs_ms &q : v.get_points( true, true ) ) {
+            lo_x = std::min( lo_x, q.x() - c.x() );
+            lo_y = std::min( lo_y, q.y() - c.y() );
+            hi_x = std::max( hi_x, q.x() - c.x() );
+            hi_y = std::max( hi_y, q.y() - c.y() );
+        }
+        inside = lo_x >= p.min.x && hi_x <= p.max.x && lo_y >= p.min.y && hi_y <= p.max.y;
+        whole += inside ? 1 : 0;
+        if( !inside && outside.size() < 200 ) {
+            outside += string_format( "%s (%d,%d)-(%d,%d) in bay (%d,%d)-(%d,%d) ", p.id, lo_x, lo_y, hi_x, hi_y,
+                                      p.min.x, p.min.y, p.max.x, p.max.y );
+        }
+    }
+    size_t in_zone_vehicles = 0;
+    for( const wrapped_vehicle &w : here.get_vehicles() ) {
+        in_zone_vehicles += in_zone( c, w.v->pos_abs() ) ? 1 : 0;
+    }
+    out.summary = string_format( "%zu of %zu placed, %zu skipped (%zu bays laid out), %zu vehicles in the zone; "
+                                 "missing: %s", found, z.count, z.skipped, pieces.size(), in_zone_vehicles,
+                                 missing.empty() ? "none" : missing.substr( 0, 200 ) );
+    out.checks.push_back( { "vehicles placed + skipped == count", found == z.placed && found + z.skipped == z.count &&
+                            found > 0 && seen.size() == found && in_zone_vehicles == found,
+                            std::to_string( found ) + " + " + std::to_string( z.skipped ) + " of " + std::to_string( z.count ) } );
+    out.checks.push_back( { "each vehicle whole inside its painted bay", whole == found && painted == pieces.size(),
+                            std::to_string( whole ) + " whole, " + std::to_string( painted ) + " bays painted " + outside } );
+    return out;
+}
+
+// Pens: each monster in its glass cell; placed + skipped == count.
+kind_result verify_pens( size_t index, const fp3d::range_zone &z, const tripoint_abs_ms &c )
+{
+    kind_result out;
+    map &here = get_map();
+    const std::vector<fp3d::zone_piece> pieces = fp3d::zone_pieces( index );
+    size_t present = 0;
+    size_t enclosed = 0;
+    size_t water = 0;
+    size_t wide = 0;
+    std::string missing;
+    for( const fp3d::zone_piece &p : pieces ) {
+        bool glass = true;
+        for( int y = p.min.y - 1; y <= p.max.y + 1; y++ ) {
+            for( int x = p.min.x - 1; x <= p.max.x + 1; x++ ) {
+                if( x < p.min.x || x > p.max.x || y < p.min.y || y > p.max.y ) {
+                    glass = glass && here.ter( here.get_bub( offset( c, x, y ) ) ).id().str() == "t_reinforced_glass";
+                }
+            }
+        }
+        water += p.what == "water" ? 1 : 0;
+        wide += p.max.x > p.min.x ? 1 : 0;
+        const tripoint_bub_ms b = here.get_bub( offset( c, p.at.x, p.at.y, p.at.z ) );
+        const monster *m = get_creature_tracker().creature_at<monster>( b );
+        if( m == nullptr || m->type->id.str() != p.id ) {
+            missing += p.id + " ";
+            continue;
+        }
+        present++;
+        enclosed += glass ? 1 : 0;
+    }
+    size_t in_zone_monsters = 0;
+    for( monster &m : g->all_monsters() ) {
+        in_zone_monsters += in_zone( c, m.pos_abs() ) ? 1 : 0;
+    }
+    out.summary = string_format( "%zu of %zu placed, %zu skipped, %zu monsters in the zone, %zu wide cells, %zu "
+                                 "flooded; missing: %s", present, z.count, z.skipped, in_zone_monsters, wide, water,
+                                 missing.empty() ? "none" : missing.substr( 0, 200 ) );
+    out.checks.push_back( { "monsters placed + skipped == count, no strays", present == z.placed &&
+                            present + z.skipped == z.count && present > 0 && in_zone_monsters == present,
+                            std::to_string( present ) + " + " + std::to_string( z.skipped ) + " of " + std::to_string( z.count ) } );
+    out.checks.push_back( { "every monster inside reinforced glass", enclosed == present,
+                            std::to_string( enclosed ) + " of " + std::to_string( present ) } );
+    return out;
+}
+
+// Lanes: each target at its distance from its shooting square, in plain view; zombies and practice targets at 5,
+// 10, 25 and 50.
+kind_result verify_lanes( const fp3d::range_zone &z, const tripoint_abs_ms &c )
+{
+    kind_result out;
+    map &here = get_map();
+    size_t present = 0;
+    size_t in_view = 0;
+    std::set<int> mon_d;
+    std::set<int> furn_d;
+    std::string detail;
+    for( const fp3d::lane_target &t : fp3d::lane_targets() ) {
+        const tripoint_abs_ms from = offset( c, t.shooter.x, t.shooter.y, t.shooter.z );
+        const tripoint_abs_ms to = offset( c, t.target.x, t.target.y, t.target.z );
+        const tripoint_bub_ms b = here.get_bub( to );
+        bool there = false;
+        if( t.monster ) {
+            const monster *m = get_creature_tracker().creature_at<monster>( b );
+            there = m != nullptr && m->type->id.str() == t.id;
+        } else {
+            there = here.furn( b ).id().str() == t.id;
+        }
+        const bool line = here.ter( here.get_bub( from ) ).id().str() == "t_pavement_y";
+        if( there && line && rl_dist( from, to ) == t.distance ) {
+            present++;
+            ( t.monster ? mon_d : furn_d ).insert( t.distance );
+        } else {
+            detail += string_format( "[%s at %d missing] ", t.id, t.distance );
+        }
+        in_view += here.sees( here.get_bub( from ), b, 60 ) ? 1 : 0;
+    }
+    const std::set<int> want = { 5, 10, 25, 50 };
+    out.summary = string_format( "%zu of %zu targets, %zu in view; %s", present, z.count, in_view, detail );
+    out.checks.push_back( { "targets at 5, 10, 25 and 50 from the shooting line (zombies and practice targets)",
+                            present == z.count && present == z.placed && z.skipped == 0 && mon_d == want && furn_d == want,
+                            std::to_string( present ) + " of " + std::to_string( z.count ) + " " + detail } );
+    out.checks.push_back( { "every target in view from its shooting square", in_view == z.count,
+                            std::to_string( in_view ) } );
+    return out;
+}
+
+// Kitchen: every prop (stoves, oven, fridge, sink, counters, fires, food, water).
+kind_result verify_kitchen( const fp3d::range_zone &z, const tripoint_abs_ms &c )
+{
+    kind_result out;
+    const std::vector<prop_result> results = props_at( c, fp3d::kitchen_props() );
+    size_t ok = 0;
+    size_t fires = 0;
+    std::string bad;
+    for( size_t i = 0; i < results.size(); i++ ) {
+        ok += results[i].ok ? 1 : 0;
+        if( results[i].ok && fp3d::kitchen_props()[i].kind == fp3d::prop_kind::field ) {
+            fires++;
+        }
+        if( !results[i].ok ) {
+            bad += "[" + results[i].what + ": " + results[i].detail + "] ";
+        }
+    }
+    out.summary = string_format( "%zu of %zu props, %zu fires lit", ok, z.count, fires );
+    out.checks.push_back( { "every prop: stoves, oven, fridge, sink, counters, food, water", ok == results.size() &&
+                            ok == z.count && z.placed == z.count, std::to_string( ok ) + " of " +
+                            std::to_string( results.size() ) + " " + bad } );
+    out.checks.push_back( { "stoves, fireplace and brazier lit", fires == 4, std::to_string( fires ) + " fires" } );
+    return out;
+}
+
+kind_result verify_kind( size_t index, const fp3d::range_zone &z, const tripoint_abs_ms &c )
+{
+    switch( z.kind ) {
+        case fp3d::zone_kind::armory:
+            return verify_armory( index, z, c );
+        case fp3d::zone_kind::halls:
+            return verify_halls( index, z, c );
+        case fp3d::zone_kind::lots:
+            return verify_lots( index, z, c );
+        case fp3d::zone_kind::pens:
+            return verify_pens( index, z, c );
+        case fp3d::zone_kind::lanes:
+            return verify_lanes( z, c );
+        case fp3d::zone_kind::kitchen:
+            return verify_kitchen( z, c );
+        case fp3d::zone_kind::hub:
+        case fp3d::zone_kind::gallery:
+            break;
+    }
+    return {};
+}
+
+// One zone of a kind: teleport there (built on arrival), check what it holds, then from the hub rebuild it and
+// check the same again, and that both builds give the same zone.
+void check_zone_kind( size_t index )
+{
+    const tripoint_abs_ms c = centre_of( index );
+    std::string tp;
+    int zone = -1;
+    fp3d::range_zone z;
+    kind_result first;
+    uint64_t print1 = 0;
+    size_t things1 = 0;
+    std::string what1;
+    on_sim( [&] {
+        tp = fp3d::teleport_to_zone( index );
+        zone = fp3d::current_zone();
+        z = fp3d::range_zones()[index];
+        first = verify_kind( index, z, c );
+        print1 = zone_fingerprint( c, things1, &what1 );
+    } );
+    const std::string kind = fp3d::zone_kind_name( z.kind );
+    std::printf( "%s (%s): built in %.0f ms; %s\n", kind.c_str(), z.id.c_str(), z.build_ms, first.summary.c_str() );
+    check( tp.empty() && zone == static_cast<int>( index ) && z.built, kind + ": teleport there, built",
+           ok_or( tp ) + " zone " + std::to_string( zone ) + " " + z.id );
+    for( const prop_result &r : first.checks ) {
+        check( r.ok, kind + ": " + r.what, r.detail );
+    }
+    check( z.build_ms > 0.0 && z.build_ms < 5000.0, kind + ": build under 5 s",
+           std::to_string( static_cast<int>( z.build_ms ) ) + " ms" );
+
+    std::string back;
+    std::string rebuilt;
+    std::string again;
+    fp3d::range_zone z2;
+    kind_result second;
+    uint64_t print2 = 0;
+    size_t things2 = 0;
+    std::string what2;
+    on_sim( [&] {
+        back = fp3d::teleport_to_zone( 0 );
+        rebuilt = fp3d::rebuild_zone( index );
+        again = fp3d::teleport_to_zone( index );
+        z2 = fp3d::range_zones()[index];
+        second = verify_kind( index, z2, c );
+        print2 = zone_fingerprint( c, things2, &what2 );
+    } );
+    bool second_ok = !second.checks.empty();
+    for( const prop_result &r : second.checks ) {
+        second_ok = second_ok && r.ok;
+    }
+    check( back.empty() && rebuilt.empty() && again.empty() && second_ok && z2.placed == z.placed &&
+           z2.skipped == z.skipped, kind + ": rebuilt from the hub, checks pass again", ok_or( back ) + ok_or( rebuilt ) +
+           ok_or( again ) + " " + second.summary.substr( 0, 100 ) );
+    check( print1 == print2 && things1 == things2 && things1 > 0, kind + ": the rebuild gives the same zone",
+           std::to_string( things1 ) + " vs " + std::to_string( things2 ) + " things" );
+    if( print1 != print2 ) {
+        std::printf( "    first: %.600s\n    again: %.600s\n", what1.c_str(), what2.c_str() );
+    }
+}
+
+void check_zone_kinds()
+{
+    std::printf( "zone kinds:\n" );
+    std::vector<fp3d::range_zone> zones;
+    on_sim( [&] {
+        zones = fp3d::range_zones();
+    } );
+    // The first zone of each kind; for halls the biggest (the slowest build).
+    std::map<fp3d::zone_kind, size_t> pick;
+    for( size_t i = 0; i < zones.size(); i++ ) {
+        const fp3d::zone_kind k = zones[i].kind;
+        if( k == fp3d::zone_kind::hub || k == fp3d::zone_kind::gallery ) {
+            continue;
+        }
+        const auto it = pick.find( k );
+        if( it == pick.end() || ( k == fp3d::zone_kind::halls && zones[i].count > zones[it->second].count ) ) {
+            pick[k] = i;
+        }
+    }
+    check( pick.size() == 6, "a zone of each kind to check", std::to_string( pick.size() ) );
+    for( const fp3d::zone_kind k : {
+             fp3d::zone_kind::armory, fp3d::zone_kind::halls, fp3d::zone_kind::lots, fp3d::zone_kind::pens,
+             fp3d::zone_kind::lanes, fp3d::zone_kind::kitchen
+         } ) {
+        if( pick.count( k ) ) {
+            check_zone_kind( pick[k] );
+        }
+    }
+}
+
+// Every zone built once (rebuild_zone from the hub): placed + skipped == count, the build times and what each kind
+// left out.
+void check_all_zones()
+{
+    std::printf( "all zones:\n" );
+    std::string tp;
+    std::vector<std::string> refused;
+    std::vector<fp3d::range_zone> zones;
+    double secs = 0.0;
+    on_sim( [&] {
+        tp = fp3d::teleport_to_zone( 0 );
+        const auto t = std::chrono::steady_clock::now();
+        const size_t n = fp3d::range_zones().size();
+        for( size_t i = 1; i < n; i++ ) {
+            const std::string why = fp3d::rebuild_zone( i );
+            if( !why.empty() ) {
+                refused.push_back( fp3d::range_zones()[i].id + ": " + why );
+            }
+        }
+        secs = ms_since( t ) / 1000.0;
+        zones = fp3d::range_zones();
+    }, 900000 );
+    struct per_kind {
+        size_t zones = 0;
+        size_t count = 0;
+        size_t placed = 0;
+        size_t skipped = 0;
+        double max_ms = 0.0;
+        std::string slowest;
+    };
+    std::map<std::string, per_kind> kinds;
+    bool sums = !zones.empty();
+    for( size_t i = 1; i < zones.size(); i++ ) {
+        const fp3d::range_zone &z = zones[i];
+        per_kind &k = kinds[fp3d::zone_kind_name( z.kind )];
+        k.zones++;
+        k.count += z.count;
+        k.placed += z.placed;
+        k.skipped += z.skipped;
+        if( z.build_ms > k.max_ms ) {
+            k.max_ms = z.build_ms;
+            k.slowest = z.id;
+        }
+        sums = sums && z.built && z.placed + z.skipped == z.count;
+    }
+    for( const auto &[name, k] : kinds ) {
+        std::printf( "    %-8s %2zu zones: %zu of %zu placed, %zu skipped; slowest build %s %.0f ms\n", name.c_str(),
+                     k.zones, k.placed, k.count, k.skipped, k.slowest.c_str(), k.max_ms );
+    }
+    std::printf( "    every zone built in %.1f s\n", secs );
+    check( tp.empty() && refused.empty() && sums, "every zone built: placed + skipped == count",
+           ok_or( tp ) + " " + ( refused.empty() ? "" : refused.front() ) );
+}
+
 void check_back_to_hub()
 {
     std::printf( "back to the hub:\n" );
@@ -1055,9 +1642,13 @@ void check_back_to_hub()
 }
 } // namespace
 
-int main()
+int main( int argc, char **argv )
 {
     std::setvbuf( stdout, nullptr, _IONBF, 0 );
+    bool all_zones = false;
+    for( int i = 1; i < argc; i++ ) {
+        all_zones = all_zones || std::strcmp( argv[i], "--all-zones" ) == 0;
+    }
 #if defined(_WIN32)
     // CDDA's crash handler shows a message box; a test must print the stack and exit instead.
     AddVectoredExceptionHandler( 1, on_fatal_exception );
@@ -1090,6 +1681,10 @@ int main()
     check_info( gallery );
     check_back_to_hub();
     check_rebuild( gallery );
+    check_zone_kinds();
+    if( all_zones ) {
+        check_all_zones();
+    }
 
     fp3d::shutdown();
     sim.join();

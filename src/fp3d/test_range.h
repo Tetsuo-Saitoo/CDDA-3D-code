@@ -6,13 +6,14 @@
 // out in zones, monsters frozen, and a small hub with what the tests need. The CDDA simulation still decides every
 // outcome; the range only builds the scene and offers a few operations (spawn, teleport, time, heal, AI freeze).
 //
-// World: `fp3d-range`, quiet world options (no cities, monster spawns, hordes or random NPCs), a fixed seed and start
-// time. The avatar value `fp3d_range` marks a range game (saves keep it, but a loaded save is never a range game: see
-// range_active). Zones lie 8 OMT apart on one row, so only one is in the reality bubble at a time; each uses at most
-// 120x120 squares around its centre square (the north-west corner of its centre OMT), z -1..+1. A zone is built the
-// first time the player teleports there, or again on rebuild_zone (avatar value
+// World: `fp3d-range`, quiet world options (no cities, monster spawns, hordes, random NPCs or monster evolution), a
+// fixed seed and start time. The avatar value `fp3d_range` marks a range game (saves keep it, but a loaded save is
+// never a range game: see range_active). Zones lie 8 OMT apart on one row, so only one is in the reality bubble at a
+// time; each uses at most 120x120 squares around its centre square (the north-west corner of its centre OMT),
+// z -1..+1. A zone is built the first time the player teleports there, or again on rebuild_zone (avatar value
 // `fp3d_range_built_<id>`): the area is cleared (floor, solid ground below, open air above, no furniture, items,
-// vehicles, traps, fields or creatures) and the content placed.
+// vehicles, traps, fields or creatures) and the content placed. A build runs with CDDA's RNG seeded from the boot
+// seed and the zone id (the game's own RNG stream put back after), so a zone comes out the same every time.
 //
 // Everything here runs on the game thread, except range info (latest_range_info) and ai_frozen(). Operations
 // validate their own input (it comes from the client: hostile) and return "" on success, else why not.
@@ -46,14 +47,21 @@ struct range_zone {
     int part = 0;                // 0-based part of its kind (halls: of its category)
     int parts = 1;
     std::string category;        // halls: the item category id
-    size_t first = 0;            // the slice of the kind's content list this zone shows
-    size_t count = 0;
+    size_t first = 0;            // the slice of the kind's content list this zone shows (lanes and kitchen: 0, and
+    size_t count = 0;            // the number of their targets or props)
     bool built = false;
+    // The last build in this session (0 before one): what it placed of `count` and what it left out (didn't fit,
+    // refused by CDDA, or not safe to lay out); placed + skipped == count. Not kept in saves.
+    size_t placed = 0;
+    size_t skipped = 0;
+    double build_ms = 0.0;
 };
 
 // Content the registry was sized from (loaded data, mods included).
 struct range_counts {
     size_t guns = 0;
+    size_t melee = 0;            // the weapons category's items but the throwables (the armory shows them too)
+    size_t throwables = 0;       // the weapons category's thrown weapons and bombs
     size_t items = 0;            // other items (not guns, not pseudo items)
     std::vector<std::pair<std::string, size_t>> items_per_category;   // sorted by category id
     size_t vehicles = 0;         // prototypes
@@ -66,7 +74,8 @@ struct range_counts {
 // Zone layout constants.
 constexpr int zone_spacing_omt = 8;
 constexpr int zone_half_squares = 60;            // a zone uses centre - 60 .. centre + 59
-constexpr size_t armory_guns_per_zone = 400;
+// The armory's list: guns, then melee weapons, then throwables (each sorted by id); a zone shows a slice of it.
+constexpr size_t armory_items_per_zone = 1000;
 constexpr size_t hall_items_per_zone = 2500;     // ~5000 squares with aisles
 constexpr size_t lot_vehicles_per_zone = 25;
 constexpr size_t pen_monsters_per_zone = 100;
@@ -130,6 +139,46 @@ struct gallery_piece {
 };
 std::vector<gallery_piece> gallery_pieces( size_t zone );
 constexpr range_offset gallery_stairs{ 1, 0, 0 };
+
+// The layout of an armory, halls, lots or pens zone (empty for other kinds or a bad index), in the order of its
+// slice, for builders and tests. Game thread. Every zone keeps its centre square free (the arrival square).
+//  - armory: `what` "gun", "melee" or "thrown", one item type per table square (a gun with its default magazine
+//    loaded, or its ammo loaded when it takes no magazine, and a stack of its default ammo); each group starts a
+//    new row.
+//  - halls: one item type per display rack square.
+//  - lots: a vehicle prototype; `at` is its (0,0) mount (facing east), `min`..`max` its bay (inclusive), painted
+//    round; bays never overlap each other or the centre. A prototype that doesn't fit the zone gets no piece.
+//  - pens: a monster type standing on `at` in a reinforced glass cell whose inside is `min`..`max`; `what` names
+//    the cell's floor when it isn't concrete: "water" (deep, for a monster that lives in water), "dirt" (for a
+//    digger) or "shade" (an indoor floor, for a monster the sun kills). Ordered by species, then id; large monsters
+//    get cells 2 squares wide, huge ones 3. Cells only south of the centre.
+// Tables and racks stand in rows with walkable aisles between them (rows y % 3 == 0 and columns x % 14 == 0).
+struct zone_piece {
+    std::string id;
+    range_offset at;
+    range_offset min;
+    range_offset max;
+    std::string what;
+};
+std::vector<zone_piece> zone_pieces( size_t zone );
+
+// The target lanes: a painted shooting line through the centre (y 0), lanes 4 squares apart running north, a wall
+// behind them (y lane_backstop_y). Each lane has one target `distance` squares north of its shooting square: a
+// zombie (frozen like every range monster) or a practice target (furniture). Either thread (constant).
+struct lane_target {
+    range_offset shooter;
+    range_offset target;
+    int distance = 0;
+    bool monster = false;
+    const char *id = "";
+};
+const std::vector<lane_target> &lane_targets();
+constexpr int lane_backstop_y = -53;
+
+// The kitchen's props (as hub_props): two wood stoves, a fireplace and a brazier lit (firewood and fire), an oven, a
+// fridge with food, a sink with a bucket of clean water, counters with pots, pans, food and water containers.
+// Either thread (constant).
+const std::vector<hub_prop> &kitchen_props();
 
 // Operations (game thread). Squares are absolute (tripoint_abs_ms), like the bridge's ui_point. All refuse
 // ("Only between turns.") unless called from the before-ask hook of a main-loop (timed) request (in_timed_hook):
