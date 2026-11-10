@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -148,8 +149,17 @@ ui_answer ask( ui_request req )
         }
         hook = c.before_ask;
     }
-    if( hook ) {
-        hook();
+    // Not again from a request asked inside the hook itself (CDDA's debug message prompt, say).
+    static thread_local bool in_hook = false;
+    if( hook && !in_hook ) {
+        in_hook = true;
+        try {
+            hook();
+        } catch( ... ) {
+            in_hook = false;
+            throw;
+        }
+        in_hook = false;
     }
     const bool timed = std::exchange( next_timed, false );
     req.timed = timed;
@@ -247,7 +257,8 @@ ui_answer ask( ui_request req )
     }
     if( a.shot ) {
         a.shot->part = sanitize_text( a.shot->part, 64 );
-        a.shot->quality = std::clamp( a.shot->quality, 0.0f, 0.99f );
+        // Not a number is not a quality: the worst one.
+        a.shot->quality = std::isfinite( a.shot->quality ) ? std::clamp( a.shot->quality, 0.0f, 0.99f ) : 0.99f;
     }
     return a;
 }

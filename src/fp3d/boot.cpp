@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cstdio>
+#include <filesystem>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -98,14 +99,60 @@ void boot_common( bool headless )
 }
 } // namespace
 
-void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless, bool world_setup )
+namespace
+{
+std::string ascii_lower( std::string s )
+{
+    for( char &c : s ) {
+        if( c >= 'A' && c <= 'Z' ) {
+            c = static_cast<char>( c - 'A' + 'a' );
+        }
+    }
+    return s;
+}
+} // namespace
+
+std::optional<std::string> world_name_taken( const std::string &world_name )
+{
+    const std::string want = ascii_lower( world_name );
+    for( const std::string &w : world_generator->all_worldnames() ) {
+        if( ascii_lower( w ) == want ) {
+            return w;
+        }
+    }
+    // Folders CDDA didn't list as worlds (no options file, say) count too.
+    constexpr size_t max_entries = 100000;
+    std::error_code ec;
+    std::filesystem::directory_iterator it( std::filesystem::u8path( PATH_INFO::savedir() ), ec );
+    for( size_t n = 0; !ec && it != std::filesystem::directory_iterator() && n < max_entries; n++ ) {
+        const std::string name = it->path().filename().u8string();
+        if( ascii_lower( name ) == want ) {
+            return name;
+        }
+        it.increment( ec );
+    }
+    return std::nullopt;
+}
+
+bool replaceable_world( const std::string &world_name )
+{
+    return world_name.size() > 5 && world_name.compare( 0, 5, "fp3d-" ) == 0;
+}
+
+void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless, bool world_setup,
+                         bool replace )
 {
     boot_common( headless );
     // As CDDA's main menu: core data (option sliders among it) before a world is made or picked.
     g->load_core_data();
     WORLD *world = nullptr;
     if( fresh_world ) {
-        if( world_generator->has_world( world_name ) ) {
+        // A new world gets a folder of its own; only FP3D's throwaway worlds are replaced, and only by exact name.
+        if( const std::optional<std::string> taken = world_name_taken( world_name ) ) {
+            if( !replace || !replaceable_world( world_name ) || *taken != world_name ||
+                !world_generator->has_world( world_name ) ) {
+                throw std::runtime_error( "world " + *taken + " exists" );
+            }
             world_generator->delete_world( world_name, true );
         }
         if( world_setup ) {
@@ -142,7 +189,7 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
 
 void boot_world( const std::string &world_name, bool headless )
 {
-    boot_new_game_data( world_name, true, headless );
+    boot_new_game_data( world_name, true, headless, false, /*replace=*/true );
     get_avatar().create( character_type::NOW );
     get_map() = map();
 }

@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <filesystem>
 #include <mutex>
 #include <stdexcept>
 #include <string>
@@ -37,11 +38,13 @@
 #include "fp3d/snapshot.h"
 #include "game.h"
 #include "item.h"
+#include "math_parser_diag_value.h"
 #include "map.h"
 #include "mapdata.h"
 #include "messages.h"
 #include "monster.h"
 #include "npc.h"
+#include "path_info.h"
 #include "pocket_type.h"
 #include "rng.h"
 #include "type_id.h"
@@ -99,6 +102,7 @@ struct observed {
     int moves = 0;
     int speed = 100;
     int bag_rocks = 0;       // item checks: rocks inside a plastic bag lying west
+    int carried_9mm = 0;     // item checks 2: 9 mm rounds carried outside guns and magazines
     int carry_kg = 0;        // cheat checks: the avatar's weight capacity
     int torso_hp_lost = -1;  // ... hp the torso lost to a 10 damage hit (-1: not probed)
     int kit_guns = 0;        // ... carried Glock 19, Remington 870 and SCAR-L with ammo loaded
@@ -113,7 +117,9 @@ std::atomic<bool> spawn_zombie{ false };
 std::atomic<bool> clear_zombies_now{ false };  // safe mode checks: remove all monsters before the next request
 std::atomic<int> new_game_safe_mode{ -1 };     // g->safe_mode at the new game's first main-loop request
 std::atomic<int> loaded_safe_mode{ -1 };       // ... and at the first one after the reload
-std::atomic<bool> cheat_probe{ false };         // cheat checks: hit the torso, wield an empty Glock
+std::atomic<bool> cheat_probe{ false };
+std::atomic<int> world_name_failures{ -1 };     // world name checks at boot (-1: not run)
+std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed in the gun safe         // cheat checks: hit the torso, wield an empty Glock
 // Hand checks: 1 = a zombie to the west and a rock in hand, 2 = a two-handed flail in hand, 3 = a hose in hand,
 // an empty jerrycan carried and a one-tile vehicle north with 4 L of gasoline in a small tank, 4 = a zombie west,
 // 5 = zombies gone and a spare hose carried, 6 = the spare hose dropped here, 7 = picked up again, 8 = the jerrycan
@@ -245,6 +251,33 @@ void observe()
             u.i_add( bottle );
             break;
         }
+        case 13: {
+            // A locked gun safe south (sealed: never seen into or reached by hand) with a rock whose handle a
+            // client could know from before, a dresser three squares north (seen into only from next to it), a
+            // zombie corpse east, 20 rounds of 9 mm in the pack.
+            const tripoint_bub_ms s = p + tripoint_rel_ms( 0, 1, 0 );
+            here.i_clear( s );
+            here.furn_set( s, furn_str_id( "f_gunsafe_ml" ) );
+            item hidden( itype_rock );
+            hidden.set_var( "fp3d_uid", "777" );
+            here.add_item( s, hidden );
+            sealed_items = static_cast<int>( here.i_at( s ).size() );
+            const tripoint_bub_ms n = p + tripoint_rel_ms( 0, -3, 0 );
+            here.i_clear( n );
+            here.furn_set( n, furn_str_id( "f_dresser" ) );
+            here.add_item( n, item( itype_rock ) );
+            here.add_item( p + tripoint_rel_ms( 1, 0, 0 ), item::make_corpse( mon_zombie ) );
+            get_avatar().i_add( item( itype_9mm, calendar::turn, 20 ) );
+            // FP3D vars of other types than ours (a save edited by hand): read as none, no debug message.
+            item typed( itype_rock );
+            typed.set_var( "fp3d_uid", diag_value( 5.0 ) );
+            typed.set_var( "fp3d_spot", diag_value( 1.0 ) );
+            here.add_item( p + tripoint_rel_ms( 0, -1, 0 ), typed );
+            item marked( itype_rock );
+            marked.set_var( "fp3d_offhand", diag_value( std::string( "x" ) ) );
+            get_avatar().i_add( marked );
+            break;
+        }
         default:
             break;
     }
@@ -260,6 +293,12 @@ void observe()
         get_avatar().set_wielded_item( empty );
     }
     o.carry_kg = static_cast<int>( units::to_kilogram( u.weight_capacity() ) );
+    for( const item_location &it : get_avatar().all_items_loc() ) {
+        if( it->typeId() == itype_9mm && !( it.has_parent() && ( it.parent_item()->is_gun() ||
+                                            it.parent_item()->is_magazine() ) ) ) {
+            o.carried_9mm += it->charges;
+        }
+    }
     for( const item_location &it : get_avatar().all_items_loc() ) {
         if( ( it->typeId() == itype_glock_19 || it->typeId() == itype_remington_870 ||
               it->typeId() == itype_scar_l ) && it->ammo_remaining() > 0 ) {
@@ -371,10 +410,35 @@ void build_scene()
     g->clear_zombies();
 }
 
+// A fresh world gets a folder of its own (boot.h): names in use are found ignoring case, folders CDDA doesn't
+// list included; only "fp3d-" worlds are replaceable. Run on the sim thread right after boot.
+int check_world_names()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what ) {
+        std::printf( "  worlds: %-38s %s\n", what, ok ? "PASS" : "FAIL" );
+        failed += ok ? 0 : 1;
+    };
+    check( fp3d::world_name_taken( "FP3D-SIM" ) == std::optional<std::string>( "fp3d-sim" ),
+           "a listed world, other case" );
+    check( !fp3d::world_name_taken( "fp3d-sim-free" ), "a free name" );
+    const std::filesystem::path odd = std::filesystem::u8path( PATH_INFO::savedir() ) / "Unlisted-Fp3d";
+    std::error_code ec;
+    std::filesystem::create_directories( odd, ec );
+    check( !ec && fp3d::world_name_taken( "unlisted-fp3d" ) == std::optional<std::string>( "Unlisted-Fp3d" ),
+           "an unlisted folder, other case" );
+    std::filesystem::remove_all( odd, ec );
+    check( fp3d::replaceable_world( "fp3d-live" ) && !fp3d::replaceable_world( "fp3d-" ) &&
+           !fp3d::replaceable_world( "World" ) && !fp3d::replaceable_world( "FP3D-live" ),
+           "only fp3d- worlds replaceable" );
+    return failed;
+}
+
 void sim_main()
 {
     try {
         fp3d::boot_world( "fp3d-sim", true );
+        world_name_failures = check_world_names();
         std::printf( "sim: data loaded, starting game\n" );
         // The real new-game path: calendar, start location, starting items, game mode.
         if( !fp3d_game_access::start_game( *g ) ) {
@@ -1293,6 +1357,60 @@ static bool run_item_checks()
     drop.item = { gold.uid, gold.type };
     res = run( drop );
     check( res.back && res.spent == 0 && has( res.msg, "don't have" ), "drop: not carried any more", show( res ) );
+
+    // Sealed furniture keeps its contents from hands and eyes; closed containers show theirs only from next to
+    // them; a stack put where it already is stays one stack; forbidden pockets (a corpse's) take nothing.
+    r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "second scene", "" );
+        return false;
+    }
+    hand_setup = 13;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const fp3d::ui_point south{ here.x, here.y + 1, here.z };
+    const fp3d::ui_point north3{ here.x, here.y - 3, here.z };
+    const fp3d::ui_point east{ here.x + 1, here.y, here.z };
+    const fp3d::ui_point north{ here.x, here.y - 1, here.z };
+    const std::vector<fp3d::item_handle_view> on_east = handles_at( east );
+    const std::vector<fp3d::item_handle_view> typed = handles_at( north );
+    check( r && typed.size() == 1 && typed[0].uid != 0 && typed[0].uid != 5 && typed[0].spot_x == -1 &&
+           !fp3d::latest_held().off.held, "vars of other types read as none",
+           typed.empty() ? "none" : std::to_string( typed[0].uid ) );
+    check( r && sealed_items == 1 && handles_at( south ).empty() && handles_at( north3 ).empty() &&
+           on_east.size() == 1, "sealed and distant container contents hidden",
+           std::to_string( sealed_items ) + " in the safe" );
+    take.item = { 777, t_rock };
+    take.pos = south;
+    take.hand = fp3d::item_hand::pack;
+    res = run( take );
+    check( res.back && res.spent == 0 && has( res.msg, "get at" ), "take: out of a locked gun safe", show( res ) );
+    put.item = { rock_b.uid, rock_b.type };
+    put.container = { 777, t_rock };
+    put.pos = south;
+    put.pocket = -1;
+    res = run( put );
+    check( res.back && res.spent == 0 && has( res.msg, "get at" ), "put: into a locked gun safe", show( res ) );
+    const fp3d::carried_view rounds = carried_type( type_of( "9mm" ), 0 );
+    const int before = snapshot().carried_9mm;
+    put.item = { rounds.uid, rounds.type };
+    put.container = { rounds.parent, carried( rounds.parent ).type };
+    put.pocket = rounds.pocket;
+    res = run( put );
+    put.pocket = -1;
+    const result again = run( put );
+    const int after = snapshot().carried_9mm;
+    check( rounds.uid != 0 && rounds.parent != 0 && before == 20 && after == 20 && res.spent == 0 &&
+           again.spent == 0 && has( res.msg, "already" ) && has( again.msg, "already" ),
+           "put: a stack where it already is", std::to_string( before ) + " -> " + std::to_string( after ) +
+           " rounds " + show( res ) );
+    put.item = { rock_b.uid, rock_b.type };
+    put.container = { on_east.empty() ? 0 : on_east[0].uid, on_east.empty() ? 0 : on_east[0].type };
+    put.pos = east;
+    put.pocket = 0;
+    res = run( put );
+    check( res.back && res.spent == 0 && has( res.msg, "no such pocket" ) && carried( rock_b.uid ).uid != 0,
+           "put: a corpse's forbidden pocket", show( res ) );
     return failed == 0;
 }
 
@@ -1651,8 +1769,10 @@ int main()
     std::printf( "shoot: %s\n", shoot_ok ? "ok" : "BAD" );
     std::printf( "items: %s\n", items_ok ? "ok" : "BAD" );
     std::printf( "cheats: %s\n", cheats_ok ? "ok" : "BAD" );
+    const bool worlds_ok = world_name_failures == 0;
+    std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
-           shoot_ok && items_ok && cheats_ok ?
+           shoot_ok && items_ok && cheats_ok && worlds_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

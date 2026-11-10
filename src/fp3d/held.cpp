@@ -90,7 +90,8 @@ std::vector<item_location> marked_items( avatar &u )
         if( !loc->has_var( offhand_var ) ) {
             continue;
         }
-        if( token == 0.0 || loc->get_var( offhand_var, 0.0 ) != token ) {
+        const diag_value *mark = loc->maybe_get_value( offhand_var );
+        if( token == 0.0 || mark == nullptr || !mark->is_dbl() || mark->dbl() != token ) {
             loc->erase_var( offhand_var );
         } else if( !( weapon && weapon.get_item() == loc.get_item() ) && !u.is_worn( *loc ) ) {
             out.push_back( loc );
