@@ -1258,8 +1258,9 @@ fp3d::ui_answer answer_for( const fp3d::ui_request &req, const goal &cur, driver
         case fp3d::request_kind::world_setup:
         case fp3d::request_kind::chargen:
         case fp3d::request_kind::shot:
-            // Not asked by these goals (world setup and character creation have their own tests; shots go CDDA's
-            // way): an empty answer.
+        case fp3d::request_kind::swing:
+            // Not asked by these goals (world setup and character creation have their own tests; shots and swings
+            // go CDDA's way): an empty answer.
             break;
         case fp3d::request_kind::direction:
             a.pos = fp3d::ui_point{ cur.dx, cur.dy, 0 };
