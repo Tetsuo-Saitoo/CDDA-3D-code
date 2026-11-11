@@ -5,12 +5,15 @@
 // a car seat: back in it), teleport and rebuild refused in a vehicle or riding, rebuilding a zone (creatures just
 // outside it stay), frozen AI (and that unfreezing lets the hub zombie act),
 // the median turn time in the hub and the gallery, and one zone of each other kind (armory, halls, lots, pens, lanes,
-// kitchen: what is placed against the zone's slice, and that a rebuild gives the same zone). Range operations run on
-// the sim thread, in the hook that runs before each request. Exit code 0 only if every check passed.
+// kitchen: what is placed against the zone's slice, and that a rebuild gives the same zone), then a saved range loaded
+// again in this process and resumed as the bridge does (resume_test_range), and saves or worlds that must not resume.
+// Range operations run on the sim thread, in the hook that runs before each request. Exit code 0 only if every check
+// passed.
 //
 // usage: fp3d-range-test [--all-zones]   (run from the cdda/ folder)
 //   --all-zones   also builds every zone once (rebuild_zone from the hub) and checks placed + skipped == count
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <climits>
 #include <cstdint>
@@ -18,12 +21,16 @@
 #include <cstdlib>
 #include <cstring>
 #include <exception>
+#include <filesystem>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -32,6 +39,7 @@
 #include <windows.h>
 #endif
 
+#include "achievement.h"
 #include "avatar.h"
 #include "bodypart.h"
 #include "cached_options.h"
@@ -44,6 +52,7 @@
 #include "field_type.h"
 #include "fp3d/boot.h"
 #include "fp3d/bridge.h"
+#include "fp3d/game_access.h"
 #include "fp3d/snapshot.h"
 #include "fp3d/test_range.h"
 #include "game.h"
@@ -51,9 +60,11 @@
 #include "itype.h"
 #include "map.h"
 #include "mapdata.h"
+#include "math_parser_diag_value.h"
 #include "monster.h"
 #include "mtype.h"
 #include "npc.h"
+#include "path_info.h"
 #include "point.h"
 #include "string_formatter.h"
 #include "trap.h"
@@ -62,6 +73,7 @@
 #include "vehicle.h"
 #include "vpart_position.h"
 #include "vpart_range.h"
+#include "worldfactory.h"
 
 namespace
 {
@@ -71,6 +83,10 @@ std::vector<double> snapshot_ms;   // capture + publish time per request (job_mu
 std::string sim_error;
 int failed = 0;
 int passed = 0;
+// check_reload: the save sim_main loads once the game has quit (set on the sim thread), and what resume_test_range
+// said after that load (1 resumed, 0 not, -1 not called).
+std::string reload_save;
+std::atomic<int> resumed{ -1 };
 
 void check( bool ok, const std::string &what, const std::string &detail = "" )
 {
@@ -105,6 +121,20 @@ void sim_main()
         fp3d::boot_test_range( 1 );
         fp3d::set_before_ask_hook( before_ask );
         while( !do_turn() ) {
+        }
+        // check_reload saved and quit: load that save the way the main menu does (as boot_saved_game: the range
+        // forgotten, g->setup(), game::load), then resume the range as the bridge does.
+        if( g->uquit == QUIT_SAVED && !reload_save.empty() ) {
+            std::printf( "sim: saved and quit, loading the save again\n" );
+            fp3d::reset_test_range();
+            g->setup();
+            if( !fp3d_game_access::load_game( *g, save_t::from_save_id( reload_save ) ) ) {
+                throw std::runtime_error( "load failed" );
+            }
+            resumed.store( fp3d::resume_test_range() ? 1 : 0 );
+            fp3d::reset_snapshots();
+            while( !do_turn() ) {
+            }
         }
         sim_error = "game ended";
     } catch( const fp3d::shutdown_signal & ) {
@@ -1906,6 +1936,398 @@ void check_back_to_hub()
     check( tp.empty() && zone == 0 && rocks == 5, "teleport back: the hub kept (not rebuilt)",
            ok_or( tp ) + " rocks " + std::to_string( rocks ) + " " + zombie );
 }
+
+// ---- a saved range loaded again (resume_test_range) ----
+
+struct zone_row {
+    std::string id;
+    std::string name;
+    std::string kind;
+    bool built = false;
+    bool operator==( const zone_row &o ) const {
+        return id == o.id && name == o.name && kind == o.kind && built == o.built;
+    }
+};
+
+std::vector<zone_row> zone_rows()
+{
+    std::vector<zone_row> out;
+    for( const fp3d::range_zone &z : fp3d::range_zones() ) {
+        out.push_back( { z.id, z.name, fp3d::zone_kind_name( z.kind ), z.built } );
+    }
+    return out;
+}
+
+// An avatar value as a number, `none` when it is missing or not a number (sim thread).
+double avatar_number( const std::string &name, double none = -12345.0 )
+{
+    const diag_value *v = get_avatar().maybe_get_value( name );
+    return v != nullptr && v->is_dbl() ? v->dbl() : none;
+}
+
+// The range saved in a zone that isn't the hub (the smallest halls zone: items only, nothing there moves; built on
+// arrival unless --all-zones built it), with rocks dropped there and the AI running, then that save loaded in this
+// process (as boot_saved_game) and resumed as the bridge does: a range game again, the same zones, that zone built and
+// not built again (rocks and contents as saved), the seed and AI freeze as saved, achievements off, operations work.
+// Returns the zone, 0 if none.
+size_t check_reload()
+{
+    std::printf( "reload:\n" );
+    const uint32_t rock = fp3d::intern_id( fp3d::id_kind::itype, "rock" );
+    size_t pick = 0;
+    bool was_built = true;
+    std::string tp;
+    int zone_before = -1;
+    tripoint_abs_ms marker;
+    std::string spawned;
+    int rocks_before = -1;
+    uint64_t print_before = 0;
+    size_t things_before = 0;
+    std::string unfreeze;
+    std::vector<zone_row> rows_before;
+    double frozen_value = -1.0;
+    double built_value = -1.0;
+    bool saved = false;
+    on_sim( [&] {
+        const std::vector<fp3d::range_zone> &zones = fp3d::range_zones();
+        for( size_t i = 1; i < zones.size(); i++ ) {
+            if( zones[i].kind == fp3d::zone_kind::halls && ( pick == 0 || zones[i].built < zones[pick].built ||
+                    ( zones[i].built == zones[pick].built && zones[i].count < zones[pick].count ) ) ) {
+                pick = i;
+            }
+        }
+        if( pick == 0 ) {
+            return;
+        }
+        was_built = zones[pick].built;
+        tp = fp3d::teleport_to_zone( pick );
+        zone_before = fp3d::current_zone();
+        avatar &u = get_avatar();
+        marker = u.pos_abs();
+        spawned = fp3d::spawn_item( rock, 7, ui( marker ) );
+        rocks_before = items_of( marker, "rock" );
+        print_before = zone_fingerprint( centre_of( pick ), things_before );
+        unfreeze = fp3d::set_ai_frozen( false );
+        frozen_value = avatar_number( "fp3d_range_ai_frozen" );
+        built_value = avatar_number( "fp3d_range_built_" + fp3d::range_zones()[pick].id );
+        // As if booted with a seed other than the default (1): resume must read it from the save.
+        u.set_value( "fp3d_range_seed", 4242.0 );
+        rows_before = zone_rows();
+        saved = fp3d_game_access::save_game( *g );
+        if( saved ) {
+            // As CDDA's save-and-quit: the game ends on its next turn, and sim_main loads it again.
+            reload_save = u.get_save_id();
+            u.set_moves( 0 );
+            g->uquit = QUIT_SAVED;
+        }
+    } );
+    const std::string zone_id = pick < rows_before.size() ? rows_before[pick].id : "?";
+    check( pick > 0 && tp.empty() && zone_before == static_cast<int>( pick ) && spawned.empty() && rocks_before >= 7 &&
+           unfreeze.empty() && saved, "reload: in " + zone_id + ", rocks dropped, AI running, saved",
+           ok_or( tp ) + ok_or( spawned ) + ok_or( unfreeze ) +
+           ( was_built ? " (built before)" : " (built on arrival)" ) );
+    check( frozen_value == 0.0 && built_value == 1.0, "reload: the AI freeze and the built zone in avatar values",
+           "frozen " + std::to_string( frozen_value ) + ", built " + std::to_string( built_value ) );
+
+    // That turn ends the game; the next main-loop request comes after the load.
+    const auto t = std::chrono::steady_clock::now();
+    const std::optional<fp3d::ui_request> back_in = act( "pause", 600000 );
+    std::printf( "    loaded and resumed in %.1f s\n", ms_since( t ) / 1000.0 );
+    check( back_in.has_value() && resumed.load() == 1, "reload: resume_test_range says yes after the load",
+           "resumed " + std::to_string( resumed.load() ) );
+
+    bool active = false;
+    bool frozen = true;
+    unsigned seed = 0;
+    bool achievements = true;
+    int zone_after = -1;
+    std::vector<zone_row> rows_after;
+    fp3d::range_zone z;
+    int rocks_after = -1;
+    uint64_t print_after = 0;
+    size_t things_after = 0;
+    std::string healed;
+    std::string to_hub;
+    int zone_hub = -1;
+    std::string again;
+    int zone_again = -1;
+    fp3d::range_zone z_again;
+    int rocks_again = -1;
+    uint64_t print_again = 0;
+    size_t things_again = 0;
+    on_sim( [&] {
+        active = fp3d::range_active();
+        frozen = fp3d::ai_frozen();
+        seed = fp3d::range_boot_seed();
+        achievements = get_achievements().is_enabled();
+        rows_after = zone_rows();
+        zone_after = fp3d::current_zone();
+        if( pick < fp3d::range_zones().size() ) {
+            z = fp3d::range_zones()[pick];
+        }
+        rocks_after = items_of( marker, "rock" );
+        print_after = zone_fingerprint( centre_of( pick ), things_after );
+        get_avatar().set_pain( 20 );
+        healed = fp3d::heal();
+        healed += get_avatar().get_pain() == 0 ? "" : " (still in pain)";
+        // To the hub and back: the zone is built, so arriving doesn't build it again.
+        to_hub = fp3d::teleport_to_zone( 0 );
+        zone_hub = fp3d::current_zone();
+        again = fp3d::teleport_to_zone( pick );
+        zone_again = fp3d::current_zone();
+        if( pick < fp3d::range_zones().size() ) {
+            z_again = fp3d::range_zones()[pick];
+        }
+        rocks_again = items_of( marker, "rock" );
+        print_again = zone_fingerprint( centre_of( pick ), things_again );
+    } );
+    check( active && zone_after == static_cast<int>( pick ), "reload: a range game, the player in " + zone_id,
+           "zone " + std::to_string( zone_after ) );
+    check( !rows_after.empty() && rows_after == rows_before, "reload: the same zones, the same built flags",
+           std::to_string( rows_before.size() ) + " vs " + std::to_string( rows_after.size() ) + " zones" );
+    check( z.built && z.placed == 0 && z.build_ms == 0.0 && rocks_after == rocks_before &&
+           print_after == print_before && things_after == things_before,
+           "reload: " + zone_id + " built, not built again, as saved",
+           "rocks " + std::to_string( rocks_before ) + " -> " + std::to_string( rocks_after ) + ", " +
+           std::to_string( things_before ) + " -> " + std::to_string( things_after ) + " things" );
+    check( !frozen && seed == 4242 && !achievements, "reload: AI running and seed as saved, achievements off",
+           "seed " + std::to_string( seed ) );
+    check( healed.empty() && to_hub.empty() && zone_hub == 0, "reload: heal and teleport to the hub work",
+           ok_or( healed ) + ok_or( to_hub ) );
+    check( again.empty() && zone_again == static_cast<int>( pick ) && z_again.placed == 0 &&
+           rocks_again == rocks_before && print_again == print_before, "reload: back in " + zone_id + ", not rebuilt",
+           ok_or( again ) + " rocks " + std::to_string( rocks_again ) );
+    const fp3d::range_info info = fp3d::latest_range_info();
+    check( info.range && !info.ai_frozen && info.zones.size() == rows_before.size() &&
+           info.zone == static_cast<int>( pick ), "reload: range info for the client",
+           std::to_string( info.zones.size() ) + " zones, zone " + std::to_string( info.zone ) );
+    return pick;
+}
+
+namespace fs = std::filesystem;
+
+// The marker file boot puts in the worlds it makes (fp3d/boot.h), here or a folder named like it.
+bool write_marker( const fs::path &dir, bool as_folder )
+{
+    std::error_code ec;
+    fs::create_directories( dir, ec );
+    if( as_folder ) {
+        fs::create_directories( dir / fp3d::owned_world_marker, ec );
+        return !ec;
+    }
+    std::ofstream mark( dir / fp3d::owned_world_marker, std::ios::binary | std::ios::trunc );
+    mark << "fp3d-range-test scratch world\n";
+    return static_cast<bool>( mark );
+}
+
+// Only what write_marker leaves in a folder: safe to remove (a scratch world from an earlier, interrupted run).
+bool only_markers( const fs::path &dir )
+{
+    std::error_code ec;
+    size_t n = 0;
+    for( fs::directory_iterator it( dir, ec ); !ec && it != fs::directory_iterator(); it.increment( ec ) ) {
+        if( ++n > 1 || it->path().filename() != fs::u8path( fp3d::owned_world_marker ) ||
+            ( fs::is_directory( it->symlink_status( ec ) ) && !fs::is_empty( it->path(), ec ) ) ||
+            fs::is_symlink( it->symlink_status( ec ) ) ) {
+            return false;
+        }
+    }
+    return !ec;
+}
+
+// Saves and worlds that must not resume: without `fp3d_range` (or a crafted one), in a range world FP3D didn't make (no
+// marker), in a world of FP3D's with another name; each refused, the game left a normal one (no zones, operations
+// refused). Then the saved seed and AI freeze read back bounded, and range_world's names.
+void check_resume_refusals( size_t pick )
+{
+    std::printf( "resume refusals:\n" );
+    const fs::path saves = fs::u8path( PATH_INFO::savedir() );
+    // Scratch worlds: name, marker (0 none, 1 file, 2 a folder of that name), whether range_world says yes.
+    struct scratch {
+        const char *name;
+        int marker;
+        bool range;
+    };
+    const std::vector<scratch> scratches = {
+        { "fp3d-range-987654321", 1, true },
+        { "fp3d-range-987654320", 0, false },
+        { "fp3d-range-987654322", 2, false },
+        { "fp3d-rangex", 1, false },
+        { "fp3d-range-", 1, false },
+        { "fp3d-range-9x", 1, false },
+        { "fp3d-range--9", 1, false },
+        { "fp3d-range-1234567890", 1, false },
+        { "fp3d-plain-world", 1, false },
+    };
+    std::vector<fs::path> made;
+    std::string setup;
+    for( const scratch &w : scratches ) {
+        const fs::path dir = saves / fs::u8path( w.name );
+        std::error_code ec;
+        if( fs::exists( dir, ec ) ) {
+            if( !only_markers( dir ) ) {
+                setup += std::string( "[" ) + w.name + " exists] ";
+                continue;
+            }
+            fs::remove_all( dir, ec );
+        }
+        if( !( w.marker == 0 ? fs::create_directories( dir, ec ) : write_marker( dir, w.marker == 2 ) ) ) {
+            setup += std::string( "[" ) + w.name + " not made] ";
+        }
+        made.push_back( dir );
+    }
+
+    // range_world on names (any thread).
+    std::string world;
+    on_sim( [&] {
+        world = world_generator->active_world->world_name;
+    } );
+    std::string wrong;
+    const auto expect = [&wrong]( const std::string & name, bool want ) {
+        if( fp3d::range_world( name ) != want ) {
+            wrong += "[" + name + "] ";
+        }
+    };
+    expect( world, true );
+    for( const scratch &w : scratches ) {
+        expect( w.name, w.range );
+    }
+    for( const std::string &name : {
+             std::string(), std::string( "fp3d" ), std::string( "fp3d-ran" ), std::string( "FP3D-range" ),
+             std::string( "Fp3d-Range" ), std::string( "fp3d-range/../fp3d-range" ),
+             std::string( "fp3d-range-1/../../fp3d-range" ), std::string( "fp3d-range" ) + '\0',
+             std::string( "fp3d-range-99999" ) + std::string( 1, '\0' ) + "9", std::string( "fp3d-range-55555" )
+         } ) {
+        expect( name, false );
+    }
+    check( setup.empty() && wrong.empty(), "range_world: fp3d-range(-digits) with FP3D's marker only",
+           "active " + world + " " + setup + wrong );
+
+    struct outcome {
+        bool resumed = true;
+        bool active = true;
+        size_t zones = 1;
+        std::string heal;
+        bool frozen = true;
+    };
+    const auto try_resume = []() {
+        outcome o;
+        o.resumed = fp3d::resume_test_range();
+        o.active = fp3d::range_active();
+        o.zones = fp3d::range_zones().size();
+        o.heal = fp3d::heal();
+        o.frozen = fp3d::ai_frozen();
+        return o;
+    };
+    const auto refused = []( const outcome & o ) {
+        return !o.resumed && !o.active && o.zones == 0 && o.heal == "Only in the test range." && !o.frozen;
+    };
+    std::vector<std::pair<std::string, outcome>> refusals;
+    outcome back;
+    std::vector<std::pair<std::string, unsigned>> seeds;
+    std::vector<std::pair<std::string, bool>> freezes;
+    double seed_written = -1.0;
+    bool marker_moved = false;
+    bool marker_back = false;
+    on_sim( [&] {
+        avatar &u = get_avatar();
+        u.remove_value( "fp3d_range" );
+        refusals.emplace_back( "no fp3d_range", try_resume() );
+        u.set_value( "fp3d_range", std::string( "1" ) );
+        refusals.emplace_back( "fp3d_range a string", try_resume() );
+        u.set_value( "fp3d_range", 0.0 );
+        refusals.emplace_back( "fp3d_range 0", try_resume() );
+        u.set_value( "fp3d_range", 1.0 );
+        // A range world FP3D didn't make: its marker gone.
+        const fs::path mark = saves / fs::u8path( world ) / fp3d::owned_world_marker;
+        fs::path moved = mark;
+        moved += ".moved";
+        std::error_code ec;
+        fs::rename( mark, moved, ec );
+        marker_moved = !ec;
+        refusals.emplace_back( "no marker", try_resume() );
+        fs::rename( moved, mark, ec );
+        marker_back = !ec;
+        // Another world of FP3D's (its marker in place), not a range one: the active world swapped for a stand-in of
+        // that name for the call (resume reads only its name).
+        WORLD plain( "fp3d-plain-world" );
+        WORLD *const active = world_generator->active_world;
+        world_generator->active_world = &plain;
+        refusals.emplace_back( "fp3d-plain-world", try_resume() );
+        world_generator->active_world = active;
+        back = try_resume();
+
+        // The saved seed, bounded.
+        const auto seed_of = [&]( const std::string & what, const std::optional<diag_value> &v ) {
+            if( v ) {
+                u.set_value( "fp3d_range_seed", *v );
+            } else {
+                u.remove_value( "fp3d_range_seed" );
+            }
+            const bool ok = fp3d::resume_test_range();
+            seeds.emplace_back( what, ok ? fp3d::range_boot_seed() : 999u );
+        };
+        seed_of( "missing", std::nullopt );
+        seed_of( "-1", diag_value( -1.0 ) );
+        seed_of( "2^32", diag_value( 4294967296.0 ) );
+        seed_of( "2.5", diag_value( 2.5 ) );
+        seed_of( "NaN", diag_value( std::numeric_limits<double>::quiet_NaN() ) );
+        seed_of( "inf", diag_value( std::numeric_limits<double>::infinity() ) );
+        seed_of( "\"7\"", diag_value( std::string( "7" ) ) );
+        seed_written = avatar_number( "fp3d_range_seed" );
+        seed_of( "0", diag_value( 0.0 ) );
+        seed_of( "2^32-1", diag_value( 4294967295.0 ) );
+        seed_of( "4242", diag_value( 4242.0 ) );
+
+        // The saved AI freeze: off only for 0.
+        const auto freeze_of = [&]( const std::string & what, const std::optional<diag_value> &v ) {
+            if( v ) {
+                u.set_value( "fp3d_range_ai_frozen", *v );
+            } else {
+                u.remove_value( "fp3d_range_ai_frozen" );
+            }
+            const bool ok = fp3d::resume_test_range();
+            freezes.emplace_back( what, ok && fp3d::ai_frozen() );
+        };
+        freeze_of( "missing", std::nullopt );
+        freeze_of( "\"0\"", diag_value( std::string( "0" ) ) );
+        freeze_of( "0.5", diag_value( 0.5 ) );
+        freeze_of( "NaN", diag_value( std::numeric_limits<double>::quiet_NaN() ) );
+        freeze_of( "1", diag_value( 1.0 ) );
+        freeze_of( "0", diag_value( 0.0 ) );
+        // Left as the reload left it: a range, AI running, in the zone.
+        fp3d::resume_test_range();
+    } );
+    for( const fs::path &dir : made ) {
+        std::error_code ec;
+        fs::remove_all( dir, ec );
+    }
+    std::string bad;
+    for( const auto &[what, o] : refusals ) {
+        if( !refused( o ) ) {
+            bad += "[" + what + ( o.resumed ? " resumed" : "" ) + ( o.active ? " active" : "" ) + " " + o.heal + "] ";
+        }
+    }
+    check( refusals.size() == 5 && bad.empty() && marker_moved && marker_back,
+           "resume refused: no or crafted fp3d_range, no marker, not a range world", bad );
+    check( back.resumed && back.active && back.zones > pick && back.heal.empty(),
+           "resume: yes again once the save and world are a range's" );
+    std::string seed_text;
+    bool seeds_ok = seeds.size() == 10;
+    for( size_t i = 0; i < seeds.size(); i++ ) {
+        const unsigned want = i < 7 ? 1u : i == 7 ? 0u : i == 8 ? 4294967295u : 4242u;
+        seeds_ok = seeds_ok && seeds[i].second == want;
+        seed_text += seeds[i].first + "=" + std::to_string( seeds[i].second ) + " ";
+    }
+    check( seeds_ok && seed_written == 1.0, "resume: a bad saved seed reads as 1", seed_text );
+    std::string freeze_text;
+    bool freezes_ok = freezes.size() == 6;
+    for( size_t i = 0; i < freezes.size(); i++ ) {
+        freezes_ok = freezes_ok && freezes[i].second == ( i < 5 );
+        freeze_text += freezes[i].first + "=" + ( freezes[i].second ? "frozen " : "running " );
+    }
+    check( freezes_ok, "resume: the saved AI freeze is off only for 0", freeze_text );
+}
 } // namespace
 
 int main( int argc, char **argv )
@@ -1955,6 +2377,7 @@ int main( int argc, char **argv )
     if( all_zones ) {
         check_all_zones();
     }
+    check_resume_refusals( check_reload() );
 
     fp3d::shutdown();
     sim.join();

@@ -5,6 +5,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdio>
 #include <map>
 #include <memory>
@@ -73,8 +74,11 @@
 
 namespace
 {
+// Avatar values (test_range.h): kept in saves, read back by resume_test_range.
 const std::string range_var = "fp3d_range";
 const std::string built_prefix = "fp3d_range_built_";
+const std::string seed_var = "fp3d_range_seed";
+const std::string frozen_var = "fp3d_range_ai_frozen";
 const activity_id act_wait( "ACT_WAIT" );
 const flag_id range_pseudo( "PSEUDO" );
 // Outdoor concrete: an INDOORS floor (t_thconc_floor) keeps out the daylight, and nobody could see.
@@ -181,7 +185,7 @@ registry &reg()
     return r;
 }
 
-// boot_test_range's seed: zone builds are seeded from it (game thread).
+// boot_test_range's seed (or the saved one resume_test_range read back): zone builds are seeded from it (game thread).
 unsigned range_seed = 0;
 
 // CDDA's RNG during a build: seeded from the boot seed and the zone id, so a zone comes out the same each time it is
@@ -229,7 +233,8 @@ bool throwable( const itype &t )
 }
 
 std::atomic<bool> frozen{ false };
-// Set by boot_test_range for the game it starts, cleared by every boot (reset_test_range).
+// Set by boot_test_range for the game it starts and by resume_test_range for a saved range it resumes; cleared by every
+// boot (reset_test_range).
 std::atomic<bool> session{ false };
 
 std::mutex info_mutex;
@@ -279,6 +284,35 @@ bool avatar_flag( const std::string &name )
 {
     const diag_value *v = get_avatar().maybe_get_value( name );
     return v != nullptr && v->is_dbl() && v->dbl() != 0.0;
+}
+
+// The AI freeze, also in the avatar's values: a saved range comes back as it was (resume_test_range).
+void store_frozen( bool on )
+{
+    frozen.store( on );
+    get_avatar().set_value( frozen_var, on ? 1.0 : 0.0 );
+}
+
+// What a save says (hostile: bounded). The boot seed: an integer 0 .. UINT_MAX, else (missing, not a number, out of
+// range, a fraction) 1.
+unsigned saved_seed()
+{
+    const diag_value *v = get_avatar().maybe_get_value( seed_var );
+    if( v == nullptr || !v->is_dbl() ) {
+        return 1;
+    }
+    const double d = v->dbl();
+    if( !std::isfinite( d ) || d < 0.0 || d > static_cast<double>( UINT_MAX ) || d != std::floor( d ) ) {
+        return 1;
+    }
+    return static_cast<unsigned>( d );
+}
+
+// The AI freeze: off only for 0, else (missing, anything else) frozen.
+bool saved_frozen()
+{
+    const diag_value *v = get_avatar().maybe_get_value( frozen_var );
+    return !( v != nullptr && v->is_dbl() && v->dbl() == 0.0 );
 }
 
 // Builds the registry from the loaded data (mods included); ids sorted, so the layout is stable.
@@ -1198,11 +1232,36 @@ void reset_test_range()
     reg().version = version + 1;
     frozen.store( false );
     session.store( false );
+    range_seed = 0;
 }
 
 bool range_active()
 {
     return session.load() && g != nullptr && avatar_flag( range_var );
+}
+
+bool range_world( const std::string &world_name )
+{
+    // The names boot_new_game_data( "fp3d-range", ..., replace ) gives (replacing_world_name: "-2" .. "-99"), digits
+    // capped; then FP3D's marker in the folder.
+    static const std::string base = "fp3d-range";
+    if( world_name.compare( 0, base.size(), base ) != 0 ) {
+        return false;
+    }
+    const std::string rest = world_name.substr( base.size() );
+    const auto digit = []( char c ) {
+        return c >= '0' && c <= '9';
+    };
+    if( !rest.empty() && ( rest.size() < 2 || rest.size() > 10 || rest[0] != '-' ||
+                           !std::all_of( rest.begin() + 1, rest.end(), digit ) ) ) {
+        return false;
+    }
+    return owned_world( world_name );
+}
+
+unsigned range_boot_seed()
+{
+    return range_seed;
 }
 
 std::vector<std::string> hall_id_bases( const std::vector<std::string> &categories )
@@ -1568,7 +1627,7 @@ void boot_test_range( unsigned seed )
     }
     // The range changes the world's options and clears land: only in the throwaway world boot made for it.
     const std::string &world = world_generator->active_world->world_name;
-    if( world.compare( 0, 10, "fp3d-range" ) != 0 || !owned_world( world ) ) {
+    if( !range_world( world ) ) {
         throw std::runtime_error( "test range: needs its own fp3d-range world (boot_new_game_data with replace)" );
     }
     const auto t0 = std::chrono::steady_clock::now();
@@ -1585,6 +1644,7 @@ void boot_test_range( unsigned seed )
     make_avatar();
     avatar &u = get_avatar();
     u.set_value( range_var, 1.0 );
+    u.set_value( seed_var, static_cast<double>( seed ) );
     const std::vector<range_zone> &zones = range_zones();
     if( zones.empty() ) {
         throw std::runtime_error( "test range: no zones" );
@@ -1594,11 +1654,40 @@ void boot_test_range( unsigned seed )
     build_zone( 0 );
     u.setpos( hub, false );
     settle_avatar();
-    frozen.store( true );
+    store_frozen( true );
     // As CDDA's debug menu: a game with cheats earns no achievements.
     get_achievements().set_enabled( false );
     std::printf( "range: booted with seed %u, %zu zones, in %.1f s\n", seed, zones.size(),
                  std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
+}
+
+bool resume_test_range()
+{
+    // Whatever the save turns out to be, nothing of an earlier range lingers.
+    reset_test_range();
+    // A save is hostile: its avatar values alone never make a range game, only in one of FP3D's own range worlds.
+    if( g == nullptr || world_generator == nullptr || world_generator->active_world == nullptr ||
+        !avatar_flag( range_var ) || !range_world( world_generator->active_world->world_name ) ) {
+        return false;
+    }
+    const auto t0 = std::chrono::steady_clock::now();
+    avatar &u = get_avatar();
+    range_seed = saved_seed();
+    u.set_value( seed_var, static_cast<double>( range_seed ) );
+    session.store( true );
+    // The same zones from the same data, each zone's built flag from the save: built zones are not built again
+    // (what they hold is in the save).
+    build_registry();
+    store_frozen( saved_frozen() );
+    get_achievements().set_enabled( false );
+    size_t built = 0;
+    for( const range_zone &z : reg().zones ) {
+        built += z.built ? 1 : 0;
+    }
+    std::printf( "range: resumed a saved range, seed %u, %zu zones (%zu built), AI %s, in %.1f s\n", range_seed,
+                 reg().zones.size(), built, ai_frozen() ? "frozen" : "running",
+                 std::chrono::duration<double>( std::chrono::steady_clock::now() - t0 ).count() );
+    return true;
 }
 
 namespace
@@ -1869,8 +1958,8 @@ std::string set_ai_frozen( bool on )
     if( const std::string why = op_refusal(); !why.empty() ) {
         return why;
     }
-    // capture_range_info sees the change through ai_frozen().
-    frozen.store( on );
+    // capture_range_info sees the change through ai_frozen(); saves keep it (resume_test_range).
+    store_frozen( on );
     return "";
 }
 

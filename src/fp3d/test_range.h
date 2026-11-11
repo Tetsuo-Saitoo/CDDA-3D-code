@@ -7,14 +7,18 @@
 // outcome; the range only builds the scene and offers a few operations (spawn, teleport, time, heal, AI freeze).
 //
 // World: `fp3d-range`, quiet world options (no cities, monster spawns, hordes, random NPCs or monster evolution), a
-// fixed seed and start time. The avatar value `fp3d_range` marks a range game (saves keep it, but a loaded save is
-// never a range game: see range_active). Zones lie 8 OMT apart on one row, so only one is in the reality bubble at a
-// time; each uses at most 120x120 squares around its centre square (the north-west corner of its centre OMT),
-// z -1..+1. A zone is built the first time the player teleports there, or again on rebuild_zone (avatar value
-// `fp3d_range_built_<id>`): the area is cleared (floor, solid ground below, open air above, no furniture, items,
-// vehicles, traps, fields or creatures; creatures outside the area stay, though the loaded bubble reaches 12 squares
-// past it) and the content placed. A build runs with CDDA's RNG seeded from the boot
-// seed and the zone id (the game's own RNG stream put back after), so a zone comes out the same every time.
+// fixed seed and start time. Avatar values, kept in saves: `fp3d_range` (1) marks a range game, `fp3d_range_seed` holds
+// the boot seed, `fp3d_range_ai_frozen` the AI freeze (1 frozen, 0 not) and `fp3d_range_built_<id>` (1) a built zone.
+// A loaded save is a range game again only through resume_test_range, and only in a range world (range_world): the
+// values alone (a crafted save, a mod) never make one.
+//
+// Zones lie 8 OMT apart on one row, so only one is in the reality bubble at a time; each uses at most 120x120 squares
+// around its centre square (the north-west corner of its centre OMT), z -1..+1. A zone is built the first time the
+// player teleports there, or again on rebuild_zone (avatar value `fp3d_range_built_<id>`): the area is cleared (floor,
+// solid ground below, open air above, no furniture, items, vehicles, traps, fields or creatures; creatures outside the
+// area stay, though the loaded bubble reaches 12 squares past it) and the content placed. A build runs with CDDA's RNG
+// seeded from the boot seed and the zone id (the game's own RNG stream put back after), so a zone comes out the same
+// every time.
 //
 // Everything here runs on the game thread, except range info (latest_range_info) and ai_frozen(). Operations
 // validate their own input (it comes from the client: hostile) and return "" on success, else why not.
@@ -50,9 +54,10 @@ struct range_zone {
     std::string category;        // halls: the item category id
     size_t first = 0;            // the slice of the kind's content list this zone shows (lanes and kitchen: 0, and
     size_t count = 0;            // the number of their targets or props)
-    bool built = false;
+    bool built = false;          // kept in saves (`fp3d_range_built_<id>`)
     // The last build in this session (0 before one): what it placed of `count` and what it left out (didn't fit,
-    // refused by CDDA, or not safe to lay out); placed + skipped == count. Not kept in saves.
+    // refused by CDDA, or not safe to lay out); placed + skipped == count. Not kept in saves: 0 in a resumed range
+    // until the zone is built again.
     size_t placed = 0;
     size_t skipped = 0;
     double build_ms = 0.0;
@@ -94,17 +99,32 @@ constexpr size_t max_zone_id = 64;
 constexpr size_t max_hall_id_base = 54;
 
 // Sim side, after boot_new_game_data( "fp3d-range", true, headless ): seeds CDDA's RNG, makes the world quiet, fixes
-// the start date (spring, day 2, 10:00), creates a fixed avatar, marks the game as a range, starts it in the hub, builds
-// the hub and freezes the AI. Throws std::runtime_error on failure. Follow with do_turn().
+// the start date (spring, day 2, 10:00), creates a fixed avatar, marks the game as a range (the avatar values above),
+// starts it in the hub, builds the hub, freezes the AI and turns achievements off. Only in a range world (range_world).
+// Throws std::runtime_error on failure. Follow with do_turn().
 void boot_test_range( unsigned seed );
+// Sim side, right after a save has loaded (boot_saved_game) and before the main loop: makes a saved range game a range
+// game again, as it was saved. True only when there is a game, the avatar has `fp3d_range` and the active world is a
+// range world (range_world). Then: the zone registry is built again (the same zones from the same data), the boot seed
+// comes from `fp3d_range_seed` (an integer 0 .. UINT_MAX, else 1), each zone's built flag from the save (a built
+// zone is not built again: what it holds is in the save), the AI freeze from `fp3d_range_ai_frozen` (off only for 0,
+// else frozen), and achievements are off. Otherwise false and the game stays a normal one (reset_test_range: nothing
+// of an earlier range lingers). The caller allows cheats (the range operations) only when it returns true.
+bool resume_test_range();
 // Forgets the zone registry, ends the range session and unfreezes the AI; every boot does it first (boot.cpp).
 void reset_test_range();
-// True in a game boot_test_range started (game thread). The avatar value alone (a save, a mod) doesn't make one.
+// True in a range game (game thread): one boot_test_range started or resume_test_range resumed. The avatar value
+// alone (a save, a mod) doesn't make one.
 bool range_active();
+// Whether `world_name` is a world the range may run in: `fp3d-range` or `fp3d-range-<1 to 9 digits>`, and one of
+// FP3D's own (owned_world: boot's marker file in it). Any thread once boot set the paths.
+bool range_world( const std::string &world_name );
+// The seed zone builds use: boot_test_range's, or the one resume_test_range read from the save (game thread; range
+// games only).
+unsigned range_boot_seed();
 
 // The zones (game thread), hub first, the rest sorted by id, ids unique; built on first use from the loaded data
-// (the same data gives the same zones). Empty when not in a range game: a loaded save never is one, whatever its
-// avatar values say (range_active needs the session boot_test_range starts).
+// (the same data gives the same zones). Empty when not in a range game (range_active).
 const std::vector<range_zone> &range_zones();
 // The id base of each item category's halls zones, in order: "halls_" plus the category id in lower case ('_' for
 // anything but a-z, 0-9 and '_'), at most max_hall_id_base characters. Unique: a base already taken (two
@@ -210,8 +230,8 @@ std::string set_time_of_day( int minute );
 // interrupted like any wait). Returns once it is started. Refused when it would end past max_range_days after the
 // start.
 std::string advance( int minutes );
-// Monsters and NPCs skip their turns (no plans, no moves, no attacks); they still take damage and die. Not kept in
-// saves.
+// Monsters and NPCs skip their turns (no plans, no moves, no attacks); they still take damage and die. Kept in saves
+// (`fp3d_range_ai_frozen`; resume_test_range restores it).
 std::string set_ai_frozen( bool on );
 // Full hit points, no pain, no bad effects, fed, watered, rested, full stamina.
 std::string heal();

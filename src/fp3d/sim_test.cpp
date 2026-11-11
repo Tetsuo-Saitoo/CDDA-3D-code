@@ -218,6 +218,36 @@ std::atomic<bool> range_fill{ false };
 std::atomic<uint64_t> range_fill_last{ 0 };    // the last one's id
 std::atomic<bool> range_fill_ok{ false };      // ids 1 apart, 32 of them, the 33rd refused
 
+// Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
+// normal world's save carries them, and after the reload resumes the range as the bridge does after a load. What it
+// found right after: -1 until then.
+std::atomic<int> resume_said{ -1 };      // resume_test_range(): 1 yes, 0 no
+std::atomic<int> resume_active{ -1 };    // range_active()
+std::atomic<int> resume_zones{ -1 };     // range_zones().size()
+std::atomic<int> resume_frozen{ -1 };    // ai_frozen()
+std::atomic<int> resume_marked{ -1 };    // the loaded avatar still carries fp3d_range 1 (the save kept it)
+
+// The test range's values on a normal game's avatar (fp3d/test_range.h): a crafted save, AI frozen, the hub built.
+void mark_as_range()
+{
+    avatar &u = get_avatar();
+    u.set_value( "fp3d_range", 1.0 );
+    u.set_value( "fp3d_range_seed", 7.0 );
+    u.set_value( "fp3d_range_ai_frozen", 1.0 );
+    u.set_value( "fp3d_range_built_hub", 1.0 );
+}
+
+// Right after the reload, as bridge/src/sim_session.cpp does after loading a save.
+void note_resume()
+{
+    resume_said.store( fp3d::resume_test_range() ? 1 : 0 );
+    resume_active.store( fp3d::range_active() ? 1 : 0 );
+    resume_zones.store( static_cast<int>( fp3d::range_zones().size() ) );
+    resume_frozen.store( fp3d::ai_frozen() ? 1 : 0 );
+    const diag_value *v = get_avatar().maybe_get_value( "fp3d_range" );
+    resume_marked.store( v != nullptr && v->is_dbl() && v->dbl() == 1.0 ? 1 : 0 );
+}
+
 void fill_range_ops()
 {
     fp3d::range_op heal;
@@ -905,6 +935,7 @@ void sim_main()
             throw std::runtime_error( "start_game failed" );
         }
         build_scene();
+        mark_as_range();
         const std::string save_id = get_avatar().get_save_id();
         std::printf( "sim: game started, scene built\n" );
         fp3d::set_before_ask_hook( observe );
@@ -920,6 +951,7 @@ void sim_main()
             throw std::runtime_error( "load failed" );
         }
         loads++;
+        note_resume();
         fp3d::reset_snapshots();
         while( !do_turn() ) {
         }
@@ -4157,6 +4189,26 @@ static bool run_range_op_checks()
     return failed == 0 && r.has_value();
 }
 
+// A saved range game resumes only in a range world (fp3d/test_range.h resume_test_range, 2026-11-10): this normal
+// world's save carries the range's avatar values (mark_as_range), and resumed after the reload as the bridge does, it
+// stays a normal game: no range, no zones, AI not frozen.
+static bool run_range_resume_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    check( resume_marked.load() == 1 && resume_said.load() == 0 && resume_active.load() == 0 &&
+           resume_zones.load() == 0 && resume_frozen.load() == 0, "range resume: a normal world's marked save refused",
+           "marked " + std::to_string( resume_marked.load() ) + ", said " + std::to_string( resume_said.load() ) +
+           ", active " + std::to_string( resume_active.load() ) + ", zones " + std::to_string( resume_zones.load() ) +
+           ", frozen " + std::to_string( resume_frozen.load() ) );
+    check( !fp3d::range_world( "fp3d-sim" ) && !fp3d::range_world( "fp3d-range-sim" ),
+           "range resume: fp3d-sim is no range world", "" );
+    return failed == 0;
+}
+
 // Unload and reload by handle (fp3d/item_hands.h, 2026-11-10): a gun's magazine out into a hand, a magazine's rounds
 // into the pack, a magazine loaded from loose rounds and from rounds lying in reach, the gun loaded with it. Refusals
 // (incompatible ammo, itself, nothing loaded, out of reach, sealed, gone) say why, spend nothing and change nothing;
@@ -4807,6 +4859,7 @@ int main()
     const bool combat_ok = guns_ok && run_combat_checks();
     const bool range_ok = combat_ok && run_range_op_checks();
     const bool throw_pour_ok = range_ok && run_throw_pour_checks();
+    const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
 
@@ -4849,6 +4902,7 @@ int main()
     std::printf( "guns: %s\n", guns_ok ? "ok" : "BAD" );
     std::printf( "combat: %s\n", combat_ok ? "ok" : "BAD" );
     std::printf( "range ops: %s\n", range_ok ? "ok" : "BAD" );
+    std::printf( "range resume: %s\n", resume_ok ? "ok" : "BAD" );
     std::printf( "throw/pour: %s\n", throw_pour_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
@@ -4858,6 +4912,6 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           throw_pour_ok && worlds_ok && boot_ok && data_check_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }
