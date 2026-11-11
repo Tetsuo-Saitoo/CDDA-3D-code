@@ -4,17 +4,24 @@
 #include <climits>
 #include <deque>
 #include <mutex>
+#include <optional>
+#include <string>
 #include <utility>
 #include <vector>
 
 #include "achievement.h"
 #include "avatar.h"
 #include "calendar.h"
+#include "coordinates.h"
+#include "fp3d/arrival.h"
 #include "fp3d/bridge.h"
 #include "fp3d/test_range.h"
+#include "game.h"
 #include "item.h"
 #include "item_location.h"
 #include "itype.h"
+#include "map.h"
+#include "map_scale_constants.h"
 #include "messages.h"
 #include "translations.h"
 #include "type_id.h"
@@ -324,6 +331,58 @@ std::vector<range_op_result> latest_range_results()
 
 namespace
 {
+// The teleport cheat (range_op_kind::point_teleport). The client's square is checked, never trusted: bounded, then
+// in the loaded bubble. The player arrives as in the test range's zone teleport (fp3d/arrival.h).
+std::string teleport_to_square( const ui_point &square )
+{
+    if( !in_timed_hook() ) {
+        return "Only between turns.";
+    }
+    if( !cheats_allowed() ) {
+        return "Cheats are off.";
+    }
+    avatar &u = get_avatar();
+    if( g->uquit != QUIT_NO || u.is_dead_state() ) {
+        return "Not now.";
+    }
+    const char *const outside = "That square is outside the reality bubble.";
+    // Bounded before any arithmetic on it (the bubble is far smaller): no overflow in the map's conversions.
+    constexpr int max_coord = 1 << 28;
+    const auto ok = []( int v ) {
+        return v >= -max_coord && v <= max_coord;
+    };
+    if( !ok( square.x ) || !ok( square.y ) || square.z < -OVERMAP_DEPTH || square.z > OVERMAP_HEIGHT ) {
+        return outside;
+    }
+    map &here = get_map();
+    const tripoint_abs_ms target( square.x, square.y, square.z );
+    if( !here.inbounds( here.get_bub( target ) ) ) {
+        return outside;
+    }
+    if( u.is_mounted() ) {
+        return "Not while riding.";
+    }
+    if( u.in_vehicle ) {
+        return "Not while in a vehicle.";
+    }
+    const std::optional<tripoint_abs_ms> arrive = arrival_square( target );
+    if( !arrive ) {
+        return "No free square to arrive on there.";
+    }
+    if( *arrive == u.pos_abs() ) {
+        return "You are already there.";
+    }
+    no_achievements();
+    leave_square( u );
+    // Another floor: the map shifts to it first, as CDDA's own moves between floors do (game::place_player).
+    if( arrive->z() != u.posz() ) {
+        g->vertical_shift( arrive->z() );
+    }
+    u.setpos( *arrive, false );
+    settle_avatar();
+    return "";
+}
+
 std::string run_range_op( const range_op &op )
 {
     // Out-of-range numbers become -1, which every operation refuses.
@@ -345,6 +404,8 @@ std::string run_range_op( const range_op &op )
             return heal();
         case range_op_kind::rebuild_zone:
             return rebuild_zone( n < 0 ? SIZE_MAX : static_cast<size_t>( n ) );
+        case range_op_kind::point_teleport:
+            return teleport_to_square( op.square );
     }
     return "No such operation.";
 }

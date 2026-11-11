@@ -5,8 +5,10 @@
 //
 // usage: fp3d-sim-test   (run from the cdda/ folder)
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <chrono>
+#include <climits>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -38,6 +40,7 @@
 #include "field.h"
 #include "field_type.h"
 #include "flexbuffer_json.h"
+#include "fp3d/arrival.h"
 #include "fp3d/boot.h"
 #include "fp3d/data_check.h"
 #include "fp3d/bridge.h"
@@ -61,6 +64,7 @@
 #include "math_parser_diag_value.h"
 #include "json_loader.h"
 #include "map.h"
+#include "map_scale_constants.h"
 #include "mapdata.h"
 #include "messages.h"
 #include "monster.h"
@@ -81,6 +85,7 @@ const itype_id itype_apple( "apple" );
 const itype_id itype_backpack( "backpack" );
 const itype_id itype_rock( "rock" );
 const mtype_id mon_zombie( "mon_zombie" );
+const mtype_id mon_horse( "mon_horse" );
 const itype_id itype_2h_flail_steel( "2h_flail_steel" );
 const itype_id itype_gasoline( "gasoline" );
 const itype_id itype_hose( "hose" );
@@ -103,6 +108,7 @@ const ter_str_id ter_t_water_sh( "t_water_sh" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
 const vpart_id vpart_tank_small( "tank_small" );
+const vpart_id vpart_seat( "seat" );
 const ter_str_id ter_t_door_c( "t_door_c" );
 const ter_str_id ter_t_floor( "t_floor" );
 const ter_str_id ter_t_wall( "t_wall" );
@@ -218,6 +224,14 @@ std::atomic<bool> range_fill{ false };
 std::atomic<uint64_t> range_fill_last{ 0 };    // the last one's id
 std::atomic<bool> range_fill_ok{ false };      // ids 1 apart, 32 of them, the 33rd refused
 
+// Teleport cheat checks (run_point_teleport_checks): at the next main-loop request the hook sets up round pt_round:
+// it notes whether the player stands where the last round should have left it, then queues this round's teleports.
+std::atomic<int> pt_round{ 0 };
+std::array<std::atomic<uint64_t>, 5> pt_ids{};   // this round's teleports in order; 0 = not queued
+std::atomic<int> pt_ended_ok{ -1 };              // 1 = where the last round should have left the player
+std::optional<tripoint_abs_ms> pt_expected;      // sim thread only: where this round should leave the player
+std::optional<tripoint_abs_ms> pt_blood;         // sim thread only: the square round 2 bloodied
+
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
 // normal world's save carries them, and after the reload resumes the range as the bridge does after a load. What it
 // found right after: -1 until then.
@@ -295,12 +309,109 @@ void fill_range_ops()
     range_fill_ok.store( queued && ops.size() == fp3d::max_range_ops_waiting && fp3d::request_range_op( heal ) == 0 );
 }
 
+void queue_point_teleport( size_t i, const tripoint_abs_ms &p )
+{
+    fp3d::range_op op;
+    op.kind = fp3d::range_op_kind::point_teleport;
+    op.square = fp3d::ui_point{ p.x(), p.y(), p.z() };
+    pt_ids[i].store( fp3d::request_range_op( op ) );
+}
+
+// A square 3 to 6 squares from `from` on its floor, free to arrive on (fp3d/arrival.h).
+std::optional<tripoint_abs_ms> free_square_near( const tripoint_abs_ms &from )
+{
+    for( const tripoint_abs_ms &p : closest_points_first( from, 3, 6 ) ) {
+        if( p.z() == from.z() && fp3d::arrival_square( p ) == p ) {
+            return p;
+        }
+    }
+    return std::nullopt;
+}
+
+void set_up_point_teleports( int round )
+{
+    avatar &u = get_avatar();
+    map &here = get_map();
+    const tripoint_abs_ms at = u.pos_abs();
+    pt_ended_ok.store( pt_expected && at == *pt_expected ? 1 : 0 );
+    pt_expected.reset();
+    switch( round ) {
+        case 1:
+            // Refused: far out (no overflow), outside the bubble, above the top floor, the player's own square. Then
+            // a free square.
+            queue_point_teleport( 0, tripoint_abs_ms( INT_MAX, INT_MIN, 0 ) );
+            queue_point_teleport( 1, here.get_abs( tripoint_bub_ms( MAPSIZE_X + 5, 5, u.posz() ) ) );
+            queue_point_teleport( 2, tripoint_abs_ms( at.x(), at.y(), OVERMAP_HEIGHT + 1 ) );
+            queue_point_teleport( 3, at );
+            pt_expected = free_square_near( at );
+            if( pt_expected ) {
+                queue_point_teleport( 4, *pt_expected );
+            }
+            break;
+        case 2:
+            // Onto blood (a field): the nearest free square instead.
+            pt_blood = free_square_near( at );
+            if( pt_blood ) {
+                here.add_field( here.get_bub( *pt_blood ), fd_blood, 1 );
+                pt_expected = fp3d::arrival_square( *pt_blood );
+                queue_point_teleport( 0, *pt_blood );
+            }
+            break;
+        case 3:
+            // In a vehicle (a frame and a seat put under the player, boarded): refused, the player stays.
+            if( pt_blood ) {
+                here.remove_field( here.get_bub( *pt_blood ), fd_blood );
+            }
+            if( vehicle *veh = here.add_vehicle( vehicle_prototype_none, u.pos_bub(), 0_degrees, 0, 0 ) ) {
+                veh->install_part( here, point_rel_ms::zero, vpart_frame );
+                veh->install_part( here, point_rel_ms::zero, vpart_seat );
+                here.add_vehicle_to_cache( veh );
+                here.board_vehicle( u.pos_bub(), &u );
+            }
+            pt_expected = at;
+            if( const std::optional<tripoint_abs_ms> t = free_square_near( at ) ) {
+                queue_point_teleport( 0, *t );
+            }
+            break;
+        case 4:
+            // Riding (a horse next to the player, mounted): refused, the player stays.
+            here.unboard_vehicle( u.pos_bub() );
+            if( const optional_vpart_position vp = here.veh_at( u.pos_bub() ) ) {
+                here.destroy_vehicle( &vp->vehicle() );
+            }
+            for( const tripoint_bub_ms &p : closest_points_first( u.pos_bub(), 1, 1 ) ) {
+                if( here.passable( p ) && g->is_empty( p ) ) {
+                    if( monster *horse = g->place_critter_at( mon_horse, p ) ) {
+                        u.mount_creature( *horse );
+                    }
+                    break;
+                }
+            }
+            pt_expected = u.pos_abs();
+            if( const std::optional<tripoint_abs_ms> t = free_square_near( u.pos_abs() ) ) {
+                queue_point_teleport( 0, *t );
+            }
+            break;
+        default:
+            // Off the horse (unhurt), the horse gone.
+            if( u.is_mounted() ) {
+                u.forced_dismount();
+                u.healall( 100 );
+            }
+            g->clear_zombies();
+            break;
+    }
+}
+
 void observe()
 {
     // As the client's hook (bridge/src/sim_session.cpp).
     fp3d::run_range_requests();
     if( range_fill.exchange( false ) ) {
         fill_range_ops();
+    }
+    if( const int round = pt_round.exchange( 0 ); round != 0 ) {
+        set_up_point_teleports( round );
     }
     const avatar &u = get_avatar();
     map &here = get_map();
@@ -4189,6 +4300,80 @@ static bool run_range_op_checks()
     return failed == 0 && r.has_value();
 }
 
+// The teleport cheat (fp3d/cheats.h range_op_kind::point_teleport, 2026-11-10), in this normal game: refused until
+// cheats are allowed; the client's square bounded and in the bubble; arrival on a free square, the nearest one when
+// it isn't; refused in a vehicle and while riding.
+static bool run_point_teleport_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "teleport cheat: main loop waiting", "" );
+        return false;
+    }
+    fp3d::range_op tp;
+    tp.kind = fp3d::range_op_kind::point_teleport;
+    check( !fp3d::cheats_allowed() && fp3d::request_range_op( tp ) == 0, "teleport cheat refused until allowed", "" );
+    fp3d::set_cheats_allowed( true );
+    // Round n's results in order, once the hook set it up (a heal, refused outside the range, wakes the main loop).
+    const auto round = [&]( int n, size_t count ) {
+        for( std::atomic<uint64_t> &id : pt_ids ) {
+            id.store( 0 );
+        }
+        pt_ended_ok.store( -1 );
+        pt_round.store( n );
+        fp3d::range_op heal;
+        heal.kind = fp3d::range_op_kind::heal;
+        fp3d::request_range_op( heal );
+        std::vector<std::string> got;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 20000 ) {
+            got.clear();
+            const std::vector<fp3d::range_op_result> res = fp3d::latest_range_results();
+            for( size_t i = 0; i < count; i++ ) {
+                for( const fp3d::range_op_result &x : res ) {
+                    if( x.id != 0 && x.id == pt_ids[i].load() ) {
+                        got.push_back( x.error );
+                        break;
+                    }
+                }
+            }
+            if( got.size() == count && pt_ended_ok.load() != -1 ) {
+                break;
+            }
+            if( std::optional<fp3d::ui_request> next = fp3d::wait_request( 100, r->id ) ) {
+                r = next;
+            }
+        }
+        got.resize( count, "(no result)" );
+        return got;
+    };
+    const std::string outside = "That square is outside the reality bubble.";
+    std::vector<std::string> got = round( 1, 5 );
+    check( got[0] == outside && got[1] == outside && got[2] == outside,
+           "teleport cheat: squares outside the bubble refused", got[0] + " | " + got[1] + " | " + got[2] );
+    check( got[3] == "You are already there.", "teleport cheat: own square refused", got[3] );
+    check( got[4].empty(), "teleport cheat: to a free square", got[4] );
+    got = round( 2, 1 );
+    check( pt_ended_ok.load() == 1, "teleport cheat: arrived on that square", "" );
+    check( got[0].empty(), "teleport cheat: onto blood", got[0] );
+    got = round( 3, 1 );
+    check( pt_ended_ok.load() == 1, "teleport cheat: arrived next to the blood", "" );
+    check( got[0] == "Not while in a vehicle.", "teleport cheat: refused in a vehicle", got[0] );
+    got = round( 4, 1 );
+    check( pt_ended_ok.load() == 1, "teleport cheat: stayed in the vehicle", "" );
+    check( got[0] == "Not while riding.", "teleport cheat: refused while riding", got[0] );
+    round( 5, 0 );
+    check( pt_ended_ok.load() == 1, "teleport cheat: stayed on the horse", "" );
+    fp3d::set_cheats_allowed( false );
+    check( fp3d::request_range_op( tp ) == 0, "teleport cheat refused again once disallowed", "" );
+    return failed == 0;
+}
+
 // A saved range game resumes only in a range world (fp3d/test_range.h resume_test_range, 2026-11-10): this normal
 // world's save carries the range's avatar values (mark_as_range), and resumed after the reload as the bridge does, it
 // stays a normal game: no range, no zones, AI not frozen.
@@ -4857,7 +5042,7 @@ int main()
     const bool stairs_ok = cheats_ok && run_stairs_checks();
     const bool guns_ok = stairs_ok && run_gun_item_checks();
     const bool combat_ok = guns_ok && run_combat_checks();
-    const bool range_ok = combat_ok && run_range_op_checks();
+    const bool range_ok = combat_ok && run_range_op_checks() && run_point_teleport_checks();
     const bool throw_pour_ok = range_ok && run_throw_pour_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).

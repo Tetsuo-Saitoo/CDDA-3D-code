@@ -1,5 +1,6 @@
 # FP3D: bridge + boot helpers are compiled into the game library so CDDA's input/draw hooks can reach them.
 target_sources(cataclysm-tiles-common PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/arrival.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/bridge.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/boot.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/data_check.cpp

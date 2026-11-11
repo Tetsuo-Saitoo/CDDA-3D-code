@@ -34,6 +34,7 @@
 #include "field.h"
 #include "field_type.h"
 #include "flag.h"
+#include "fp3d/arrival.h"
 #include "fp3d/boot.h"
 #include "fp3d/chargen.h"
 #include "fp3d/game_access.h"
@@ -994,57 +995,6 @@ void build_zone( size_t index )
     }
     std::printf( "range: built zone %s in %.0f ms (%zu of %zu placed%s%s)\n", z.id.c_str(), z.build_ms, z.placed,
                  z.count, skipped.empty() ? "" : "; skipped:", skipped.c_str() );
-}
-
-// After the avatar moved within the loaded bubble: recentre it and refresh what the turn would.
-void settle_avatar()
-{
-    avatar &u = get_avatar();
-    map &here = get_map();
-    g->update_map( u );
-    here.invalidate_map_cache( u.posz() );
-    here.build_map_cache( u.posz() );
-    g->update_overmap_seen();
-}
-
-// Before the bubble is loaded elsewhere under the player, as CDDA's own moves that put you elsewhere (game.cpp drops
-// the grab there): let go of what is grabbed (it stays behind), stop hauling (the hauled items' references die with
-// the bubble), forget the auto-move route.
-void stop_moving( avatar &u )
-{
-    if( u.get_grab_type() != object_type::NONE ) {
-        u.grab( object_type::NONE );
-    }
-    u.stop_hauling();
-    u.clear_destination();
-}
-
-// Before the player is taken away from where it stands: stop_moving, and the client's queued actions, meant for the
-// old place, dropped too.
-void leave_square( avatar &u )
-{
-    stop_moving( u );
-    fp3d::clear_actions();
-}
-
-// Where the player arrives in a zone whose area is loaded: `centre` when it is free, else the nearest free square at
-// most arrival_search_squares from it (ring by ring). Free: in the bubble, passable, a floor to stand on (not open
-// air, not deep water), no field (fire, smoke, acid, ...), no trap, no vehicle part, no monster or NPC (the avatar
-// itself, the one moving, doesn't count). nullopt if there is none.
-std::optional<tripoint_abs_ms> arrival_square( const tripoint_abs_ms &centre )
-{
-    map &here = get_map();
-    creature_tracker &tracker = get_creature_tracker();
-    for( const tripoint_bub_ms &p : closest_points_first( here.get_bub( centre ), fp3d::arrival_search_squares ) ) {
-        if( !here.inbounds( p ) || !here.passable( p ) || !here.has_floor( p ) ||
-            here.has_flag( ter_furn_flag::TFLAG_DEEP_WATER, p ) || here.field_at( p ).field_count() > 0 ||
-            !here.tr_at( p ).is_null() || here.veh_at( p ) || tracker.creature_at<monster>( p, true ) != nullptr ||
-            tracker.creature_at<npc>( p ) != nullptr ) {
-            continue;
-        }
-        return here.get_abs( p );
-    }
-    return std::nullopt;
 }
 
 // Loads the bubble round `omt` (CDDA's overmap teleport: the creatures of the old bubble are saved, a vehicle the
