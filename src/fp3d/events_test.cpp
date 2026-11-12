@@ -3,10 +3,14 @@
 // leave out (a death the player can't see) and the overflow rule. Exit code 0 = all checks pass.
 //
 // usage: fp3d-events-test   (run from the cdda/ folder)
+#include <atomic>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <iterator>
+#include <optional>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "avatar.h"
@@ -20,17 +24,22 @@
 #include "dispersion.h"
 #include "explosion.h"
 #include "fp3d/boot.h"
+#include "fp3d/bridge.h"
 #include "fp3d/events.h"
 #include "fp3d/points.h"
 #include "fp3d/snapshot.h"
+#include "fp3d/swing.h"
 #include "game.h"
 #include "map.h"
+#include "martialarts.h"
 #include "messages.h"
 #include "monster.h"
 #include "projectile.h"
 #include "rng.h"
 #include "sounds.h"
+#include "translation.h"
 #include "type_id.h"
+#include "weakpoint.h"
 
 namespace
 {
@@ -144,6 +153,8 @@ int main()
         // damage from the player, only messages and sounds between. Swung until a hit does damage.
         {
             bool ordered = false;
+            bool one_each = true;       // every swing sent exactly one attack event
+            bool unnamed = true;        // a plain hit (no special attack) names no technique
             int swings = 0;
             std::string seen_order;
             for( ; swings < 20 && !ordered; swings++ ) {
@@ -151,6 +162,12 @@ int main()
                 u.melee_attack( *zed, false );
                 std::vector<event> all;
                 fp3d::drain_events( all );
+                int attacks = 0;
+                for( const event &e : all ) {
+                    attacks += e.kind == event_kind::attack ? 1 : 0;
+                    unnamed = unnamed && ( e.kind != event_kind::attack || ( e.text.empty() && e.amount == 0 ) );
+                }
+                one_each = one_each && attacks == 1;
                 size_t i = 0;
                 while( i < all.size() && !( all[i].kind == event_kind::attack && all[i].uid == 1 &&
                                              all[i].other == zed_uid ) ) {
@@ -168,8 +185,198 @@ int main()
                           all[j].other == 1;
             }
             zed->set_hp( zed->get_hp_max() );
-            check( ordered, "melee: a hit's attack event, then its damage from the player",
-                   std::to_string( swings ) + " swings, after the hit: " + seen_order );
+            check( ordered && one_each && unnamed, "melee: a hit's attack event, then its damage from the player",
+                   std::to_string( swings ) + " swings, after the hit: " + seen_order +
+                   ( one_each ? "" : ", not one attack event a swing" ) +
+                   ( unnamed ? "" : ", a plain strike named a technique" ) );
+        }
+        // A hit names its technique (fp3d/swing.h swing_note): its translated name and its family; a miss none.
+        {
+            const matec_id rapid( "RAPID" );
+            const std::string rapid_name = rapid.is_valid() ? rapid->name.translated() : std::string( "?" );
+            bool one_each = true;
+            bool misses_plain = true;
+            bool hit = false;
+            bool named = false;
+            int swings = 0;
+            std::string got = "no hit";
+            for( ; swings < 20 && !hit && rapid.is_valid(); swings++ ) {
+                zed->set_hp( zed->get_hp_max() );
+                u.melee_attack( *zed, false, rapid );
+                const std::vector<event> atks = drain( event_kind::attack );
+                one_each = one_each && atks.size() == 1 && atks[0].uid == 1 && atks[0].other == zed_uid;
+                if( atks.size() != 1 ) {
+                    continue;
+                }
+                if( atks[0].detail == 0 ) {
+                    misses_plain = misses_plain && atks[0].text.empty() && atks[0].amount == 0;
+                    continue;
+                }
+                hit = true;
+                got = "\"" + atks[0].text + "\" family " + std::to_string( atks[0].amount );
+                named = atks[0].detail == 1 && atks[0].text == rapid_name && atks[0].amount == fp3d::technique_strike;
+            }
+            zed->set_hp( zed->get_hp_max() );
+            check( named && one_each && misses_plain && rapid_name == "Rapid Strike",
+                   "melee: a forced technique names itself", std::to_string( swings ) + " swings, " + got +
+                   ( one_each ? "" : ", not one attack event a swing" ) +
+                   ( misses_plain ? "" : ", a miss named a technique" ) );
+        }
+        {
+            struct family_of {
+                const char *id;
+                int family;
+            };
+            const family_of families[] = {
+                { "SWEEP", fp3d::technique_down }, { "BRUTAL", fp3d::technique_stun },
+                { "PRECISE", fp3d::technique_stun }, { "WRAP", fp3d::technique_stun },
+                { "RAPID", fp3d::technique_strike }, { "PENETRATE", fp3d::technique_strike },
+                { "WHIP_DISARM", fp3d::technique_disarm }, { "DEF_DISARM", fp3d::technique_disarm },
+                { "tec_none", fp3d::technique_none }, { "WBLOCK_1", fp3d::technique_none },
+                { "tec_feint", fp3d::technique_none }
+            };
+            std::string wrong;
+            for( const family_of &f : families ) {
+                const matec_id id( f.id );
+                const int family = id.is_valid() ? fp3d::technique_family( *id ) : -1;
+                if( family != f.family ) {
+                    wrong += std::string( wrong.empty() ? "" : ", " ) + f.id + " " + std::to_string( family );
+                }
+            }
+            check( wrong.empty(), "technique families", wrong.empty() ? std::to_string( std::size( families ) ) +
+                   " techniques" : "wrong: " + wrong );
+        }
+        {
+            // colour tags, two control characters and more characters than fit: 7 bytes, then 100 of 2 bytes
+            std::string raw = "<color_red>Swe\x01" "e\np</color>";
+            std::string clean = "Sweep";
+            for( int i = 0; i < 100; i++ ) {
+                raw += "\xC3\xA9";
+                clean += i < 28 ? "\xC3\xA9" : "";
+            }
+            const std::string text = fp3d::technique_text( raw );
+            // bytes that are no UTF-8 character are left out: a stray byte, a cut-off character, an overlong form,
+            // a surrogate, one past U+10FFFF; a 4-byte character stays whole
+            const std::string odd = fp3d::technique_text( std::string( "\xFF\xC3" "ok\xE2\x82" ) );
+            const std::string forms = fp3d::technique_text( std::string( "\xC0\x80\xED\xA0\x80\xF4\x90\x80\x80"
+                                      "a\xF0\x9F\x98\x80" ) );
+            // a tag that one pass over the name leaves, or that a dropped byte puts together, goes too: an opener
+            // inside an opener, a control character inside a tag, a stray byte inside one
+            const std::string nested = fp3d::technique_text( "<col<color_red>or_red>X" );
+            const std::string joined = fp3d::technique_text( std::string( "<co\x01lor_red>X</co\nlor>" ) );
+            const std::string stray = fp3d::technique_text( std::string( "<col\xFFor_red>X" ) );
+            // a name is read only so far (CDDA's tag pass repeats the tail once per opener that lies before one
+            // '>'): this one's '>' and tail are never reached, and its openers are no text
+            std::string hostile;
+            for( int i = 0; i < 2000; i++ ) {
+                hostile += "<color_";
+            }
+            hostile += ">" + std::string( 20000, 'a' );
+            const std::string cut_short = fp3d::technique_text( hostile );
+            const bool tags_gone = nested == "X" && joined == "X" && stray == "X" && cut_short.empty();
+            const fp3d::technique_note unseen = fp3d::swing_note( u, matec_id( "SWEEP" ), false );
+            const fp3d::technique_note none = fp3d::swing_note( u, tec_none, true );
+            const fp3d::technique_note unknown = fp3d::swing_note( u, matec_id( "fp3d_no_such_technique" ), true );
+            const fp3d::technique_note sweep = fp3d::swing_note( u, matec_id( "SWEEP" ), true );
+            const auto empty = []( const fp3d::technique_note & n ) {
+                return n.name.empty() && n.family == 0;
+            };
+            // a monster's hit and the avatar's miss never name a technique; the family is clamped
+            drain( event_kind::attack );
+            fp3d::on_attack( *zed, u, "", true, "Sweep Attack", fp3d::technique_down );
+            fp3d::on_attack( u, *zed, "", false, "Sweep Attack", fp3d::technique_down );
+            fp3d::on_attack( u, *zed, "", true, "Sweep Attack", 99 );
+            fp3d::on_attack( u, *zed, "", true, "Sweep Attack", -3 );
+            const std::vector<event> sent = drain( event_kind::attack );
+            const bool sent_ok = sent.size() == 4 && sent[0].text.empty() && sent[0].amount == 0 &&
+                                 sent[1].text.empty() && sent[1].amount == 0 && sent[2].text == "Sweep Attack" &&
+                                 sent[2].amount == fp3d::max_technique_family && sent[3].amount == 0;
+            check( text == clean && text.size() == 61 && text.size() <= fp3d::max_technique_name && odd == "ok" &&
+                   forms == "a\xF0\x9F\x98\x80" && empty( unseen ) && empty( none ) && empty( unknown ) &&
+                   sweep.name == matec_id( "SWEEP" )->name.translated() && sweep.family == fp3d::technique_down &&
+                   sent_ok && tags_gone, "technique text is cleaned", std::to_string( text.size() ) + " bytes \"" +
+                   text + "\", odd \"" + odd + "\", sweep \"" + sweep.name + "\" " + std::to_string( sweep.family ) +
+                   ", " + std::to_string( sent.size() ) + " events" + ( sent_ok ? "" : " (wrong)" ) +
+                   ( tags_gone ? "" : ", tags left: \"" + nested + "\" \"" + joined + "\" \"" + stray + "\", " +
+                     std::to_string( cut_short.size() ) + " bytes of the long name" ) );
+        }
+        // A swing inside a swing (a technique's extra hit on another creature) rolls for itself: the roll the
+        // outer swing's part is weighted by stays the outer swing's (fp3d/swing.h swing_rolled). The outer swing
+        // asks as an aimed strike does; a second thread answers it as a client would, for the zombie's leg.
+        {
+            monster *other = g->place_critter_at( mon_zombie, at + tripoint_rel_ms( 0, 1, 0 ) );
+            const fp3d::swing_counts c0 = fp3d::get_swing_counts();
+            fp3d::swing_counts c1 = c0;
+            int inner_landed = 0;
+            int outer_tries = 0;
+            bool outer_landed = false;
+            if( other != nullptr ) {
+                const fp3d::aimed_strike aimed;
+                std::atomic<bool> stop{ false };
+                std::thread client( [&stop, zed_uid]() {
+                    while( !stop ) {
+                        const std::optional<fp3d::ui_request> r = fp3d::wait_request( 100 );
+                        if( !r ) {
+                            continue;
+                        }
+                        fp3d::shot_answer leg;
+                        leg.end = r->cursor;
+                        leg.hit_uid = zed_uid;
+                        leg.part = "leg";
+                        fp3d::ui_answer a;
+                        a.id = r->id;
+                        a.shot = leg;
+                        fp3d::answer( a );
+                        return;
+                    }
+                } );
+                std::optional<fp3d::swing_scope> outer;
+                fp3d::set_active( true );    // only a live bridge asks
+                try {
+                    outer.emplace( u, *zed );
+                } catch( ... ) {
+                    std::printf( "  the swing request threw\n" );
+                }
+                fp3d::set_active( false );
+                stop = true;
+                client.join();
+                c1 = fp3d::get_swing_counts();
+                weakpoint_attack hit;
+                hit.source = &u;
+                hit.target = zed;
+                hit.type = weakpoint_attack::attack_type::MELEE_BASH;
+                hit.compute_wp_skill();
+                // The outer swing has rolled no hit yet. The inner one's critical hit is not the outer swing's:
+                // the leg never lands. (Were it taken, each try would land with the leg's chance times 4.)
+                {
+                    const fp3d::swing_scope inner( u, *other );
+                    fp3d::swing_rolled( 0, true );
+                }
+                for( int i = 0; i < 200; i++ ) {
+                    inner_landed += fp3d::swing_weakpoint( *zed, hit ) != nullptr ? 1 : 0;
+                }
+                // The outer swing's critical hit stays through an inner swing's roll (a miss, to tell them apart):
+                // the leg lands, at its chance times 4 a try (about 1 in 5 here: all 2000 failing is 0.8^2000).
+                fp3d::swing_rolled( 0, true );
+                {
+                    const fp3d::swing_scope inner( u, *other );
+                    fp3d::swing_rolled( -1, false );
+                }
+                for( ; outer_tries < 2000 && !outer_landed; outer_tries++ ) {
+                    outer_landed = fp3d::swing_weakpoint( *zed, hit ) != nullptr;
+                }
+                outer.reset();
+                g->remove_zombie( *other );
+                refresh_caches();
+            }
+            const fp3d::swing_counts c2 = fp3d::get_swing_counts();
+            check( other != nullptr && c1.asked - c0.asked == 1 && c1.accepted - c0.accepted == 1 &&
+                   inner_landed == 0 && outer_landed && c2.parts - c0.parts == 1,
+                   "a swing inside a swing keeps the outer roll", "asked +" + std::to_string( c1.asked - c0.asked ) +
+                   " accepted +" + std::to_string( c1.accepted - c0.accepted ) + ", the inner roll landed " +
+                   std::to_string( inner_landed ) + " of 200, the outer roll " +
+                   ( outer_landed ? "landed at try " + std::to_string( outer_tries ) : std::string( "never landed" ) ) +
+                   ", parts +" + std::to_string( c2.parts - c0.parts ) );
         }
 
         bool zed_in_snapshot = false;

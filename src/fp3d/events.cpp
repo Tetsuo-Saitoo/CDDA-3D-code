@@ -125,7 +125,8 @@ void on_message( const std::string &text, int type )
     push( std::move( e ) );
 }
 
-void on_attack( const Creature &attacker, const Creature &target, const std::string &weapon, bool hit )
+void on_attack( const Creature &attacker, const Creature &target, const std::string &weapon, bool hit,
+                const std::string &technique, int family )
 {
     if( !player_sees( attacker ) && !player_sees( target ) ) {
         return;
@@ -137,6 +138,11 @@ void on_attack( const Creature &attacker, const Creature &target, const std::str
     e.pos = to_ui_point( target.pos_abs() );
     e.type = weapon.empty() ? 0 : item_index( weapon );
     e.detail = hit ? 1 : 0;
+    // Only the avatar's own hit names its technique (already cleaned by swing.h technique_text; bounded again).
+    if( hit && attacker.is_avatar() ) {
+        e.text = bounded_text( technique );
+        e.amount = std::clamp( family, 0, max_technique_family );
+    }
     push( std::move( e ) );
 }
 
