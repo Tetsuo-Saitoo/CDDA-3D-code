@@ -21,6 +21,7 @@
 #include "enums.h"
 #include "field_type.h"
 #include "flexbuffer_json.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "generic_factory.h"
 #include "map.h"
 #include "map_extras.h"
@@ -272,12 +273,27 @@ std::pair<tripoint_abs_omt, std::unordered_map<std::string, std::string>>
     // creating overmaps as necessary.
     const int radius = 3;
     const omt_types_parameters chosen_target = random_target();
+    // FP3D: each overmap is tried for the chosen terrain, then for this location's others, so a start stops at the
+    // first overmap that has this location at all (fp3d::nearest_random_start picks one the nearest overmap has).
+    std::vector<const omt_types_parameters *> tries{ &chosen_target };
+    if( fp3d::active() ) {
+        for( const omt_types_parameters &t : _locations ) {
+            if( t.omt != chosen_target.omt || t.omt_type != chosen_target.omt_type ) {
+                tries.push_back( &t );
+            }
+        }
+    }
+    int searched = 0; // FP3D: how many overmaps a start took (each new one is generated), for the boot times
     for( const point_abs_om &omp : closest_points_first( origin, radius ) ) {
         overmap &omap = overmap_buffer.get( omp );
-        const tripoint_om_omt omtstart = omap.find_random_omt( std::make_pair( chosen_target.omt,
-                                         chosen_target.omt_type ) );
-        if( omtstart.raw() != tripoint::min ) {
-            return std::make_pair( project_combine( omp, omtstart ), chosen_target.parameters );
+        searched++;
+        for( const omt_types_parameters *target : tries ) {
+            const tripoint_om_omt omtstart = omap.find_random_omt( std::make_pair( target->omt, target->omt_type ) );
+            if( omtstart.raw() != tripoint::min ) {
+                DebugLog( D_INFO, D_MAIN ) << "start location " << id.str() << " (" << target->omt
+                                           << ") found in overmap " << searched << " of the search";
+                return std::make_pair( project_combine( omp, omtstart ), target->parameters );
+            }
         }
     }
     // Should never happen, if it does we messed up.
