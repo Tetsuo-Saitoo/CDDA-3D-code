@@ -70,9 +70,13 @@
 #include "monster.h"
 #include "npc.h"
 #include "options.h"
+#include "overmap.h"
+#include "overmapbuffer.h"
 #include "path_info.h"
 #include "pocket_type.h"
 #include "rng.h"
+#include "scenario.h"
+#include "start_location.h"
 #include "type_id.h"
 #include "units.h"
 #include "vehicle.h"
@@ -170,6 +174,7 @@ std::atomic<int> loaded_safe_mode{ -1 };       // ... and at the first one after
 std::atomic<bool> cheat_probe{ false };
 std::atomic<int> data_check_failures{ -1 };     // data check skip checks at boot (-1: not run)
 std::atomic<int> world_name_failures{ -1 };     // world name checks at boot (-1: not run)
+std::atomic<int> random_start_failures{ -1 };   // random start location check after start_game (-1: not run)
 std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed in the gun safe         // cheat checks: hit the torso, wield an empty Glock
 // Hand checks: 1 = a zombie to the west and a rock in hand, 2 = a two-handed flail in hand, 3 = a hose in hand,
 // an empty jerrycan carried and a one-tile vehicle north with 4 L of gasoline in a small tank, 4 = a zombie west,
@@ -956,6 +961,38 @@ int check_world_names()
     return failed;
 }
 
+// A random start (the sim's character is a quick start's) lands in the nearest overmap, in CDDA's search order, that
+// has any of the scenario's start locations (fp3d::nearest_random_start): none searched before it has one.
+int check_random_start()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const std::string &what ) {
+        std::printf( "  random start: %-50s %s\n", what.c_str(), ok ? "PASS" : "FAIL" );
+        failed += ok ? 0 : 1;
+    };
+    const scenario &scen = *get_scenario();
+    const point_abs_om start_om = project_to<coords::om>( get_avatar().pos_abs_omt().xy() );
+    check( get_avatar().random_start_location, "the sim's character starts at random" );
+    int searched = 0;
+    bool reached = false;
+    for( const point_abs_om &omp : closest_points_first( point_abs_om(), 3 ) ) {
+        searched++;
+        if( omp == start_om ) {
+            reached = true;
+            break;
+        }
+        // Made by the search already: get() makes nothing new here.
+        const overmap &om = overmap_buffer.get( omp );
+        for( const start_location &loc : start_locations::get_all() ) {
+            if( scen.allowed_start( loc.id ) && fp3d::start_terrains_in( om, loc ) > 0 ) {
+                check( false, "overmap " + std::to_string( searched ) + " has " + loc.id.str() + ", passed over" );
+            }
+        }
+    }
+    check( reached, "started in overmap " + std::to_string( searched ) + " of the search" );
+    return failed;
+}
+
 // FP3D's data check skip (fp3d/data_check.h): the same data gives the same fingerprint, another mod or a world's own
 // mods change that, a garbled marker means check, and a check that passed is skipped the next time.
 int check_data_check()
@@ -1045,6 +1082,7 @@ void sim_main()
         if( !fp3d_game_access::start_game( *g ) ) {
             throw std::runtime_error( "start_game failed" );
         }
+        random_start_failures = check_random_start();
         build_scene();
         mark_as_range();
         const std::string save_id = get_avatar().get_save_id();
@@ -5095,9 +5133,11 @@ int main()
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
     const bool data_check_ok = data_check_failures == 0;
     std::printf( "data check: %s\n", data_check_ok ? "ok" : "BAD" );
+    const bool random_start_ok = random_start_failures == 0;
+    std::printf( "random start: %s\n", random_start_ok ? "ok" : "BAD" );
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

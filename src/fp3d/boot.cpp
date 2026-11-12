@@ -28,8 +28,12 @@
 #include "messages.h"
 #include "options.h"
 #include "output.h"
+#include "overmap.h"
 #include "overmapbuffer.h"
 #include "path_info.h"
+#include "rng.h"
+#include "scenario.h"
+#include "start_location.h"
 #include "type_id.h"
 #include "weather.h"
 #include "worldfactory.h"
@@ -300,6 +304,49 @@ void run_save()
     const bool ok = fp3d_game_access::save_game( *g );
     add_msg( ok ? m_good : m_bad, ok ? "Game saved." : "The game could not be saved." );
     note_saved( ok );
+}
+
+size_t start_terrains_in( const overmap &om, const start_location &loc )
+{
+    size_t n = 0;
+    for( const omt_types_parameters &t : loc.targets() ) {
+        if( om.find_random_omt( std::make_pair( t.omt, t.omt_type ) ).raw() != tripoint::min ) {
+            n++;
+        }
+    }
+    return n;
+}
+
+start_location_id nearest_random_start( const scenario &scen, const std::optional<point_abs_om> &origin )
+{
+    if( get_option<bool>( "SELECT_STARTING_CITY" ) ) {
+        return scen.random_start_location();
+    }
+    std::vector<const start_location *> allowed;
+    for( const start_location &loc : start_locations::get_all() ) {
+        if( scen.allowed_start( loc.id ) && !loc.targets().empty() ) {
+            allowed.push_back( &loc );
+        }
+    }
+    // The overmaps start_location::find_player_initial_location( point_abs_om ) goes through, in its order.
+    constexpr int search_radius = 3;
+    int searched = 0;
+    for( const point_abs_om &omp : closest_points_first( origin.value_or( point_abs_om() ), search_radius ) ) {
+        const overmap &om = overmap_buffer.get( omp );
+        searched++;
+        std::vector<start_location_id> here;
+        for( const start_location *loc : allowed ) {
+            if( start_terrains_in( om, *loc ) > 0 ) {
+                here.push_back( loc->id );
+            }
+        }
+        if( !here.empty() ) {
+            const start_location_id picked = random_entry( here );
+            DebugLog( D_INFO, D_MAIN ) << "[fp3d] random start: " << picked.str() << " from overmap " << searched;
+            return picked;
+        }
+    }
+    return scen.random_start_location();
 }
 
 void shutdown_world()
