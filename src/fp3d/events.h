@@ -61,7 +61,8 @@ void on_sound( const tripoint_bub_ms &p, int volume, int heard, int category, co
                const std::string &id, const std::string &variant );
 void on_message( const std::string &text, int type );
 void on_attack( const Creature &attacker, const Creature &target, const std::string &weapon, bool hit );
-void on_damage( const Creature &target, const std::string &body_part, int amount,
+// `source` (may be null) becomes `other` only when it is the player or a creature the player sees, else 0.
+void on_damage( const Creature &target, const Creature *source, const std::string &body_part, int amount,
                 const dealt_damage_instance &dealt );
 // `path` from the shooter's square; the projectile got as far as `end`.
 void on_projectile( const map &here, const Creature *shooter, const std::vector<tripoint_bub_ms> &path,

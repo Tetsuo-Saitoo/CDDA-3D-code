@@ -140,6 +140,37 @@ int main()
         std::vector<event> atk = drain( event_kind::attack );
         check( atk.size() == 1 && atk[0].uid == 1 && atk[0].other == zed_uid, "melee: attacker and target uids",
                atk.empty() ? "none" : std::string( atk[0].detail ? "hit" : "miss" ) );
+        // A hit's order, as the client confirms it (HitFeedback): the player's attack event, then the target's
+        // damage from the player, only messages and sounds between. Swung until a hit does damage.
+        {
+            bool ordered = false;
+            int swings = 0;
+            std::string seen_order;
+            for( ; swings < 20 && !ordered; swings++ ) {
+                zed->set_hp( zed->get_hp_max() );
+                u.melee_attack( *zed, false );
+                std::vector<event> all;
+                fp3d::drain_events( all );
+                size_t i = 0;
+                while( i < all.size() && !( all[i].kind == event_kind::attack && all[i].uid == 1 &&
+                                             all[i].other == zed_uid ) ) {
+                    i++;
+                }
+                if( i == all.size() || all[i].detail != 1 ) {
+                    continue;   // a miss
+                }
+                size_t j = i + 1;
+                while( j < all.size() && ( all[j].kind == event_kind::message || all[j].kind == event_kind::sound ) ) {
+                    j++;
+                }
+                seen_order = j < all.size() ? std::to_string( static_cast<int>( all[j].kind ) ) : "end";
+                ordered = j < all.size() && all[j].kind == event_kind::damage && all[j].uid == zed_uid &&
+                          all[j].other == 1;
+            }
+            zed->set_hp( zed->get_hp_max() );
+            check( ordered, "melee: a hit's attack event, then its damage from the player",
+                   std::to_string( swings ) + " swings, after the hit: " + seen_order );
+        }
 
         bool zed_in_snapshot = false;
         const std::shared_ptr<const fp3d::snapshot> snap = fp3d::capture_snapshot();
@@ -154,6 +185,31 @@ int main()
                name_of( fp3d::id_kind::damage_type, dmg[0].type ) == "bash" &&
                name_of( fp3d::id_kind::body_part, dmg[0].detail ) == "torso", "damage: amount, type, body part",
                dmg.empty() ? "none" : std::to_string( dmg[0].amount ) );
+        // The source: the player's uid, 0 without one, and 0 for a monster the player doesn't see (under the floor)
+        check( dmg.size() == 1 && dmg[0].other == 1, "damage: the player as its source",
+               dmg.empty() ? "none" : "other " + std::to_string( dmg[0].other ) );
+        zed->deal_damage( nullptr, bodypart_id( "torso" ), damage_instance( damage_bash, 5 ) );
+        std::vector<event> unsourced = drain( event_kind::damage );
+        check( unsourced.size() == 1 && unsourced[0].other == 0, "damage: no source, other 0",
+               unsourced.empty() ? "none" : "other " + std::to_string( unsourced[0].other ) );
+        {
+            const tripoint_bub_ms under = at + tripoint_rel_ms( 0, 0, -1 );
+            here.ter_set( under, ter_t_floor );
+            monster *lurker = g->place_critter_at( mon_zombie, under );
+            refresh_caches();
+            const bool lurker_unseen = lurker != nullptr && !u.sees( here, *lurker ) && u.sees( here, *zed );
+            if( lurker != nullptr ) {
+                zed->deal_damage( lurker, bodypart_id( "torso" ), damage_instance( damage_bash, 5 ) );
+            }
+            std::vector<event> hidden_source = drain( event_kind::damage );
+            check( lurker_unseen && hidden_source.size() == 1 && hidden_source[0].uid == zed_uid &&
+                   hidden_source[0].other == 0, "damage: an unseen source is 0",
+                   hidden_source.empty() ? "none" : "other " + std::to_string( hidden_source[0].other ) );
+            if( lurker != nullptr ) {
+                g->remove_zombie( *lurker );
+            }
+            refresh_caches();
+        }
 
         projectile proj;
         proj.speed = 1000;

@@ -140,7 +140,7 @@ void on_attack( const Creature &attacker, const Creature &target, const std::str
     push( std::move( e ) );
 }
 
-void on_damage( const Creature &target, const std::string &body_part, int amount,
+void on_damage( const Creature &target, const Creature *source, const std::string &body_part, int amount,
                 const dealt_damage_instance &dealt )
 {
     if( !player_sees( target ) ) {
@@ -158,6 +158,8 @@ void on_damage( const Creature &target, const std::string &body_part, int amount
     event e;
     e.kind = event_kind::damage;
     e.uid = creature_uid( target );
+    // who did it, looked up now: never an unseen attacker's uid
+    e.other = source != nullptr && player_sees( *source ) ? creature_uid( *source ) : 0;
     e.pos = to_ui_point( target.pos_abs() );
     e.amount = amount;
     e.type = intern_id( id_kind::damage_type, worst );
