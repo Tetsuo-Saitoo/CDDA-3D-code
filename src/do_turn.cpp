@@ -495,7 +495,8 @@ bool do_turn()
                                        ( get_option<std::string>( "ETERNAL_WEATHER" ) );
             weather.set_nextweather( calendar::turn );
         } else {
-            weather.weather_override = WEATHER_NULL;
+            // FP3D: a range game keeps its clear sky (fp3d/test_range.h, boot_test_range and resume_test_range)
+            weather.weather_override = fp3d::range_active() ? WEATHER_CLEAR : WEATHER_NULL;
             weather.set_nextweather( calendar::turn );
         }
     } else {

@@ -296,8 +296,9 @@ void store_frozen( bool on )
 
 // The range is for trying things, not for surviving the weather: a fixed temperature (as CDDA's tutorial) and a clear
 // sky, so a cold or wet day never stops a wait with "You are freezing! Stop waiting?" and snow or fog never hides a
-// target. Saves keep the temperature but not the sky, so resume_test_range sets both again. Each boot makes a new
-// game (and weather), so a later normal game never inherits it. Game thread, once the avatar is on the map.
+// target. Saves keep the temperature but not the sky, so resume_test_range sets both again; CDDA's first turn of a
+// game clears the sky's override, and do_turn keeps it for a range game (range_active). Each boot makes a new game
+// (and weather), so a later normal game never inherits it. Game thread, once the avatar is on the map.
 void keep_range_weather()
 {
     weather_manager &w = get_weather();
