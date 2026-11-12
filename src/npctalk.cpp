@@ -59,6 +59,7 @@
 #include "faction_camp.h"
 #include "field.h"
 #include "flag.h"
+#include "fp3d/events.h" // FP3D:
 #include "flat_set.h"
 #include "flexbuffer_json.h"
 #include "game.h"
@@ -5783,6 +5784,10 @@ talk_effect_fun_t::func f_lightning()
     return []( dialogue const &/* d */ ) {
         if( get_player_character().posz() >= 0 ) {
             get_weather().lightning_active = true;
+            // FP3D: the flash, for the client (the flag is cleared again before the turn's snapshot)
+            if( fp3d::events_enabled() ) {
+                fp3d::on_lightning();
+            }
         }
     };
 }

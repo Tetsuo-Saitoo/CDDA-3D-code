@@ -5,6 +5,8 @@
 // usage: fp3d-snapshot-test   (run from the cdda/ folder)
 #include <algorithm>
 #include <chrono>
+#include <climits>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -34,11 +36,14 @@
 #include "rng.h"
 #include "submap.h"
 #include "type_id.h"
+#include "weather.h"
+#include "weather_type.h"
 
 namespace
 {
 const mtype_id mon_dog( "mon_dog" );
 const mtype_id mon_zombie( "mon_zombie" );
+const ter_str_id ter_t_floor( "t_floor" );
 const ter_str_id ter_t_wall( "t_wall" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
 
@@ -230,6 +235,77 @@ int main()
                    "effects in the JSON" );
             u.remove_effect( stunned );
         }
+        {
+            // Mood: the morale screen's entries, strongest first, with the level, its band and CDDA's face.
+            u.clear_morale();
+            u.add_morale( morale_type( "morale_craving_caffeine" ), -30, -30 );
+            u.add_morale( morale_type( "morale_music" ), 10, 10 );
+            double mood_ms = 0;
+            const std::shared_ptr<const fp3d::snapshot> moody = timed_capture( mood_ms );
+            const fp3d::mood_view &mood = moody->player.mood;
+            const int level = u.get_morale_level();
+            check( level == -20 && mood.level == level && mood.band == -1 && !mood.face.empty() && mood.total == 2 &&
+                   mood.entries.size() == 2 && mood.entries[0].name == "Craving caffeine" &&
+                   mood.entries[0].value == -30 && mood.entries[0].percent == 100 &&
+                   mood.entries[1].name == "Music" && mood.entries[1].value == 10 && mood.entries[1].percent == 100,
+                   "mood: level, band, face and entries, strongest first", "level " + std::to_string( mood.level ) +
+                   ", band " + std::to_string( mood.band ) + ", face " + mood.face + ", " +
+                   std::to_string( mood.entries.size() ) + " of " + std::to_string( mood.total ) );
+            std::ostringstream mood_json;
+            fp3d::write_snapshot_json( mood_json, *moody, u.posz(), u.posz() );
+            check( mood_json.str().find( "\"mood\":{\"level\":-20,\"band\":-1,\"face\":\"" ) != std::string::npos &&
+                   mood_json.str().find( "\"total\":2,\"entries\":[{\"name\":\"Craving caffeine\",\"value\":-30,"
+                                         "\"percent\":100},{\"name\":\"Music\",\"value\":10,\"percent\":100}]}" ) !=
+                   std::string::npos, "mood in the JSON" );
+            check( fp3d::mood_band( 100 ) == 3 && fp3d::mood_band( 99 ) == 2 && fp3d::mood_band( 50 ) == 2 &&
+                   fp3d::mood_band( 49 ) == 1 && fp3d::mood_band( 10 ) == 1 && fp3d::mood_band( 9 ) == 0 &&
+                   fp3d::mood_band( -10 ) == 0 && fp3d::mood_band( -11 ) == -1 && fp3d::mood_band( -50 ) == -1 &&
+                   fp3d::mood_band( -51 ) == -2 && fp3d::mood_band( -100 ) == -2 && fp3d::mood_band( -101 ) == -3 &&
+                   fp3d::mood_band( INT_MIN ) == -3 && fp3d::mood_band( INT_MAX ) == 3, "mood bands" );
+            // The share is cut to a whole number, as the morale screen prints it: 100 and 225 of 325.
+            u.add_morale( morale_type( "morale_honey" ), 15, 15 );
+            const std::shared_ptr<const fp3d::snapshot> sweet = timed_capture( mood_ms );
+            const fp3d::mood_view &shares = sweet->player.mood;
+            check( shares.entries.size() == 3 && shares.entries[1].name == "Enjoyed honey" &&
+                   shares.entries[1].percent == 69 && shares.entries[2].name == "Music" &&
+                   shares.entries[2].percent == 30 && shares.entries[0].percent == 100,
+                   "mood: shares cut like the morale screen's", shares.entries.size() == 3 ?
+                   std::to_string( shares.entries[1].percent ) + " and " + std::to_string( shares.entries[2].percent ) :
+                   std::to_string( shares.entries.size() ) + " entries" );
+            // Text for the client: no color tags or control characters, never cut inside a character.
+            check( fp3d::client_text( "<color_red>caf\xC3\xA9</color>\x01!", 40, 160 ) == "caf\xC3\xA9!" &&
+                   fp3d::client_text( "ab\xE2\x94\xBB", 10, 4 ) == "ab" &&
+                   fp3d::client_text( "ab\xE2\x94\xBB", 10, 5 ) == "ab\xE2\x94\xBB" &&
+                   fp3d::client_text( "a\xF0\x9F\x98\x80", 10, 4 ) == "a" &&
+                   fp3d::client_text( "a\xC3\xA9\xC3\xA9", 10, 4 ) == "a\xC3\xA9" &&
+                   fp3d::client_text( "abcdef", 3, 160 ) == "abc" && fp3d::client_text( "", 3, 3 ).empty(),
+                   "client text: plain, bounded, whole characters" );
+            // More entries than fit: the strongest max_mood_entries, all counted.
+            u.clear_morale();
+            const char *const many[] = { "morale_food_hot", "morale_chat", "morale_ate_with_table", "morale_music",
+                                         "morale_honey", "morale_game", "morale_marloss", "morale_mutagen",
+                                         "morale_feeling_good", "morale_support", "morale_photos",
+                                         "morale_craving_nicotine", "morale_craving_caffeine", "morale_craving_alcohol"
+                                       };
+            int n = 0;
+            for( const char *id : many ) {
+                n++;
+                u.add_morale( morale_type( id ), n % 2 == 0 ? n : -n, n % 2 == 0 ? n : -n );
+            }
+            const std::shared_ptr<const fp3d::snapshot> crowded = timed_capture( mood_ms );
+            const fp3d::mood_view &lots = crowded->player.mood;
+            bool ordered = lots.entries.size() == fp3d::max_mood_entries;
+            for( size_t i = 0; ordered && i < lots.entries.size(); i++ ) {
+                ordered = std::abs( lots.entries[i].value ) == n - static_cast<int>( i ) && lots.entries[i].value != 0 &&
+                          !lots.entries[i].name.empty() && lots.entries[i].percent <= 100;
+            }
+            check( ordered && lots.total == n, "mood: the strongest 12 of 14 entries, all counted",
+                   std::to_string( lots.entries.size() ) + " of " + std::to_string( lots.total ) );
+            u.clear_morale();
+            const std::shared_ptr<const fp3d::snapshot> calm = timed_capture( mood_ms );
+            check( calm->player.mood.entries.empty() && calm->player.mood.total == 0 && calm->player.mood.level == 0 &&
+                   calm->player.mood.band == 0, "mood: nothing on a blank mind" );
+        }
 
         // One wall 3 squares east of the player: exactly one submap's shape revision moves.
         const tripoint_bub_ms wall_at = u.pos_bub() + tripoint_rel_ms( 3, 0, 0 );
@@ -314,6 +390,72 @@ int main()
                "submaps in both bubbles keep ter/furn and revision",
                std::to_string( same_ground ) + "/" + std::to_string( overlap ) + " same ground, " +
                std::to_string( kept ) + " same revision" );
+        {
+            // Weather: what the current weather type does, and the wind and shelter at the player. Last: it puts a
+            // floor under the player for a while, which bumps submap revisions the checks above count.
+            weather_manager &w = get_weather();
+            const tripoint_bub_ms at = u.pos_bub();
+            const ter_id ground = here.ter( at );
+            const auto rebuild = [&]() {
+                here.invalidate_map_cache( at.z() );
+                here.build_map_cache( at.z() );
+            };
+            double w_ms = 0;
+            const auto with_weather = [&]( const char *id ) {
+                w.weather_override = weather_type_id( id );
+                w.set_nextweather( calendar::turn );
+                w.update_weather();
+                w.windspeed = 20;        // mph
+                w.winddirection = 90;
+                return timed_capture( w_ms );
+            };
+            const auto close_to = []( float a, float b ) {
+                return std::fabs( a - b ) < 0.01f;
+            };
+            const std::shared_ptr<const fp3d::snapshot> rain = with_weather( "rain" );
+            const fp3d::environment_view &r = rain->env;
+            check( r.weather_id == "rain" && r.weather_name == "Rain" && r.precip == 3 && r.precip_kind == 1 &&
+                   r.weather_sound == 2 && close_to( r.sight_penalty, 1.1f ) && r.light_modifier == -30 &&
+                   close_to( r.sun_multiplier, 0.03f ) && r.sound_attn == 4 && !r.dangerous,
+                   "weather: rain", r.weather_id + " / " + r.weather_name + ", precip " + std::to_string( r.precip ) +
+                   " kind " + std::to_string( r.precip_kind ) + ", sound " + std::to_string( r.weather_sound ) );
+            check( close_to( r.wind_speed, 20 * 0.44704f ) && close_to( r.wind_dir_deg, 90.0f ) && r.humidity <= 100 &&
+                   r.sheltered == g->is_sheltered( at ) && r.wind_at_player >= 0.0f &&
+                   r.wind_at_player <= r.wind_speed + 0.01f && ( !r.sheltered || r.wind_at_player == 0.0f ),
+                   "weather: wind and humidity at the player", std::to_string( r.wind_at_player ) + " of " +
+                   std::to_string( r.wind_speed ) + " m/s, humidity " + std::to_string( r.humidity ) +
+                   ( r.sheltered ? ", sheltered" : ", in the open" ) );
+            const std::shared_ptr<const fp3d::snapshot> snow = with_weather( "flurries" );
+            check( snow->env.weather_id == "flurries" && snow->env.precip == 2 && snow->env.precip_kind == 2 &&
+                   snow->env.weather_sound == 5, "weather: flurries are snow",
+                   std::to_string( snow->env.precip ) + " kind " + std::to_string( snow->env.precip_kind ) );
+            const std::shared_ptr<const fp3d::snapshot> fog = with_weather( "fog" );
+            check( fog->env.weather_id == "fog" && fog->env.precip == 0 && fog->env.precip_kind == 0 &&
+                   fog->env.weather_sound == 0 && close_to( fog->env.sight_penalty, 1.7f ) && fog->env.light_modifier == -40,
+                   "weather: fog falls on nothing and hides more", std::to_string( fog->env.sight_penalty ) );
+            const std::shared_ptr<const fp3d::snapshot> storm = with_weather( "portal_storm" );
+            check( storm->env.dangerous && storm->env.weather_sound == 8, "weather: a portal storm is dangerous" );
+            // Under a roof: sheltered, no wind. Then back in the open.
+            here.ter_set( at, ter_t_floor );
+            rebuild();
+            const std::shared_ptr<const fp3d::snapshot> indoors = with_weather( "rain" );
+            check( indoors->env.sheltered && indoors->env.wind_at_player == 0.0f && indoors->env.precip == 3,
+                   "weather: sheltered under a roof, no wind there",
+                   std::to_string( indoors->env.wind_at_player ) + " m/s" );
+            std::ostringstream w_json;
+            fp3d::write_snapshot_json( w_json, *indoors, u.posz(), u.posz() );
+            const std::string wj = w_json.str();
+            check( wj.find( "\"weather_id\":\"rain\",\"weather_name\":\"Rain\",\"precip\":3,\"precip_kind\":1,"
+                            "\"weather_sound\":2,\"sight_penalty\":" ) != std::string::npos &&
+                   wj.find( "\"light_modifier\":-30,\"sun_multiplier\":" ) != std::string::npos &&
+                   wj.find( "\"sound_attn\":4,\"dangerous\":false,\"wind_at_player\":" ) != std::string::npos &&
+                   wj.find( "\"sheltered\":true}" ) != std::string::npos, "weather in the JSON" );
+            here.ter_set( at, ground );
+            rebuild();
+            w.weather_override = WEATHER_NULL;
+            w.set_nextweather( calendar::turn );
+            w.update_weather();
+        }
     } catch( const std::exception &e ) {
         std::printf( "error: %s\n", e.what() );
         return EXIT_FAILURE;

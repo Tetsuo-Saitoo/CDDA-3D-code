@@ -41,6 +41,8 @@
 #include "field_type.h"
 #include "flag.h"
 #include "flexbuffer_json.h"
+#include "dialogue.h"
+#include "effect_on_condition.h"
 #include "fp3d/arrival.h"
 #include "fp3d/boot.h"
 #include "fp3d/data_check.h"
@@ -78,10 +80,13 @@
 #include "rng.h"
 #include "scenario.h"
 #include "start_location.h"
+#include "talker.h"
 #include "type_id.h"
 #include "units.h"
 #include "vehicle.h"
 #include "vpart_position.h"
+#include "weather.h"
+#include "weather_type.h"
 #include "worldfactory.h"
 
 namespace
@@ -237,6 +242,10 @@ std::array<std::atomic<uint64_t>, 5> pt_ids{};   // this round's teleports in or
 std::atomic<int> pt_ended_ok{ -1 };              // 1 = where the last round should have left the player
 std::optional<tripoint_abs_ms> pt_expected;      // sim thread only: where this round should leave the player
 std::optional<tripoint_abs_ms> pt_blood;         // sim thread only: the square round 2 bloodied
+
+// Weather and mood checks (run_weather_mood_checks): at the next main-loop request the hook 1 = forces a lightning
+// storm, adds two morale entries and sets off CDDA's lightning effect, 2 = takes them back.
+std::atomic<int> weather_mood_setup{ 0 };
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
 // normal world's save carries them, and after the reload resumes the range as the bridge does after a load. What it
@@ -409,6 +418,26 @@ void set_up_point_teleports( int round )
     }
 }
 
+void set_up_weather_mood( bool on )
+{
+    avatar &u = get_avatar();
+    weather_manager &w = get_weather();
+    const morale_type craving( "morale_craving_caffeine" );
+    const morale_type music( "morale_music" );
+    w.weather_override = on ? weather_type_id( "lightning" ) : WEATHER_NULL;
+    w.set_nextweather( calendar::turn );
+    w.update_weather();
+    if( on ) {
+        u.add_morale( craving, -40, -40 );
+        u.add_morale( music, 15, 15 );
+        dialogue d( get_talker_for( u ), nullptr );
+        effect_on_condition_id( "lightning" )->apply_true_effects( d );
+    } else {
+        u.rem_morale( craving );
+        u.rem_morale( music );
+    }
+}
+
 void observe()
 {
     // As the client's hook (bridge/src/sim_session.cpp).
@@ -418,6 +447,9 @@ void observe()
     }
     if( const int round = pt_round.exchange( 0 ); round != 0 ) {
         set_up_point_teleports( round );
+    }
+    if( const int setup = weather_mood_setup.exchange( 0 ); setup != 0 ) {
+        set_up_weather_mood( setup == 1 );
     }
     const avatar &u = get_avatar();
     map &here = get_map();
@@ -4413,6 +4445,85 @@ static bool run_point_teleport_checks()
     return failed == 0;
 }
 
+// Weather and mood in the live snapshot (contracts/snapshot.md `env` and `player.mood`, 2026-11-12): a forced
+// lightning storm and two morale entries show in the snapshot published with the request they were set up at; the
+// flash itself comes as an event (counted with the others at the end).
+static bool run_weather_mood_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "weather and mood: main loop waiting", "" );
+        return false;
+    }
+    // A turn passes; the hook does `setup` at the main-loop request after it.
+    const auto after_turn = [&]( int setup ) {
+        weather_mood_setup.store( setup );
+        fp3d::queue_action( "pause" );
+        const uint64_t before = r->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 30000 && ( weather_mood_setup.load() != 0 || r->id == before || !r->timed ) ) {
+            if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id ) ) {
+                r = next;
+            }
+        }
+        return weather_mood_setup.load() == 0 && r->id != before && r->timed;
+    };
+    if( !after_turn( 1 ) ) {
+        check( false, "weather and mood: set up at a main-loop request", "" );
+        return false;
+    }
+    const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+    if( !s ) {
+        check( false, "weather and mood: a snapshot", "" );
+        return false;
+    }
+    const fp3d::environment_view &e = s->env;
+    check( e.weather_id == "lightning" && e.weather_name == "Lightning Storm" && e.precip == 3 && e.precip_kind == 1 &&
+           e.weather_sound == 4 && e.sight_penalty > 1.0f && e.light_modifier < 0 && e.sun_multiplier < 0.5f &&
+           e.sound_attn > 0 && !e.dangerous, "weather: a lightning storm in the snapshot",
+           e.weather_id + " / " + e.weather_name + ", precip " + std::to_string( e.precip ) + " kind " +
+           std::to_string( e.precip_kind ) + ", sound " + std::to_string( e.weather_sound ) );
+    check( e.humidity <= 100 && e.wind_at_player >= 0.0f && e.wind_speed >= 0.0f &&
+           ( !e.sheltered || e.wind_at_player == 0.0f ), "weather: wind, humidity and shelter at the player",
+           std::to_string( e.wind_at_player ) + " of " + std::to_string( e.wind_speed ) + " m/s, humidity " +
+           std::to_string( e.humidity ) + ( e.sheltered ? ", sheltered" : ", in the open" ) );
+    const fp3d::mood_view &m = s->player.mood;
+    bool craving = false;
+    bool music = false;
+    bool ordered = m.entries.size() <= fp3d::max_mood_entries && m.total >= m.entries.size();
+    for( size_t i = 0; i < m.entries.size(); i++ ) {
+        craving = craving || ( m.entries[i].name == "Craving caffeine" && m.entries[i].value == -40 );
+        music = music || ( m.entries[i].name == "Music" && m.entries[i].value == 15 );
+        ordered = ordered && m.entries[i].value != 0 && !m.entries[i].name.empty() && m.entries[i].percent <= 100 &&
+                  ( i == 0 || std::abs( m.entries[i - 1].value ) >= std::abs( m.entries[i].value ) );
+    }
+    check( craving && music && ordered && m.level == s->player.morale && m.band == fp3d::mood_band( m.level ) &&
+           !m.face.empty(), "mood: level, face and the entries in the snapshot",
+           "level " + std::to_string( m.level ) + ", band " + std::to_string( m.band ) + ", face " + m.face + ", " +
+           std::to_string( m.entries.size() ) + " of " + std::to_string( m.total ) + " entries" );
+    std::ostringstream json;
+    fp3d::write_snapshot_json( json, *s, s->player.pos.z, s->player.pos.z );
+    const std::string j = json.str();
+    check( j.find( "\"weather_id\":\"lightning\",\"weather_name\":\"Lightning Storm\",\"precip\":3,"
+                   "\"precip_kind\":1,\"weather_sound\":4," ) != std::string::npos &&
+           j.find( "\"sheltered\":" ) != std::string::npos && j.find( "\"mood\":{\"level\":" ) != std::string::npos &&
+           j.find( "{\"name\":\"Craving caffeine\",\"value\":-40,\"percent\":" ) != std::string::npos,
+           "weather and mood in the snapshot JSON", "" );
+    // The flash needs the open sky above ground (CDDA's rule): the event is counted at the end.
+    check( s->player.pos.z >= 0, "weather: the player is above ground for the flash",
+           "z " + std::to_string( s->player.pos.z ) );
+    check( after_turn( 2 ), "weather and mood: taken back", "" );
+    const std::shared_ptr<const fp3d::snapshot> s2 = fp3d::latest_snapshot();
+    check( s2 && s2->env.weather_id != "lightning" && !s2->env.weather_id.empty(), "weather: back to the world's own",
+           s2 ? s2->env.weather_id : "" );
+    return failed == 0;
+}
+
 // A saved range game resumes only in a range world (fp3d/test_range.h resume_test_range, 2026-11-10): this normal
 // world's save carries the range's avatar values (mark_as_range), and resumed after the reload as the bridge does, it
 // stays a normal game: no range, no zones, AI not frozen.
@@ -4995,7 +5106,7 @@ int main()
     fp3d::set_events_enabled( true );
     std::thread sim( sim_main );
     // Drained at every request like a client would; counted per kind and checked at the end.
-    size_t event_counts[static_cast<size_t>( fp3d::event_kind::turn_end ) + 1] = {};
+    size_t event_counts[fp3d::event_kind_count] = {};
     size_t events_dropped = 0;
     uint64_t last_event_seq = 0;
     bool seq_ordered = true;
@@ -5083,6 +5194,7 @@ int main()
     const bool combat_ok = guns_ok && run_combat_checks();
     const bool range_ok = combat_ok && run_range_op_checks() && run_point_teleport_checks();
     const bool throw_pour_ok = range_ok && run_throw_pour_checks();
+    const bool weather_checks_ok = throw_pour_ok && run_weather_mood_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -5114,6 +5226,10 @@ int main()
                  "dropped %zu)\n", events_ok ? "ok" : "BAD", count( event_kind::turn_end ),
                  count( event_kind::message ), count( event_kind::sound ), count( event_kind::projectile ),
                  count( event_kind::anim ), count( event_kind::attack ), events_dropped );
+    // The flash run_weather_mood_checks set off.
+    const bool weather_ok = weather_checks_ok && count( event_kind::lightning ) > 0;
+    std::printf( "weather and mood: %s (lightning events %zu)\n", weather_ok ? "ok" : "BAD",
+                 count( event_kind::lightning ) );
     std::printf( "queue: %s\n", queue_ok ? "ok" : "BAD" );
     std::printf( "safe mode: %s\n", safemode_ok ? "ok" : "BAD" );
     std::printf( "hands: %s\n", hands_ok ? "ok" : "BAD" );
@@ -5138,6 +5254,6 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -18,6 +18,7 @@
 #include "character_id.h"
 #include "coordinates.h"
 #include "creature.h"
+#include "display.h"
 #include "effect.h"
 #include "enums.h"
 #include "type_id.h"
@@ -41,7 +42,10 @@
 #include "mapdata.h"
 #include "memory_fast.h"
 #include "monster.h"
+#include "mood_face.h"
+#include "morale.h"
 #include "output.h"
+#include "overmapbuffer.h"
 #include "mtype.h"
 #include "npc.h"
 #include "trap.h"
@@ -50,7 +54,9 @@
 #include "vehicle.h"
 #include "vpart_position.h"
 #include "vpart_range.h"
+#include "translation.h"
 #include "weather.h"
+#include "weather_type.h"
 
 static_assert( SEEX == fp3d::sm_size && SEEY == fp3d::sm_size, "snapshot submaps are 12x12" );
 
@@ -94,6 +100,34 @@ uint8_t clamp_u8( double v )
     return static_cast<uint8_t>( std::clamp( std::lround( v ), 0L, 255L ) );
 }
 
+} // namespace
+
+std::string client_text( const std::string &raw, size_t max_columns, size_t max_bytes )
+{
+    std::string s = sanitize_text( utf8_truncate( remove_color_tags( raw ), max_columns ), max_bytes );
+    // The byte cap may have cut a character: drop a last sequence that is not whole.
+    size_t lead = s.size();
+    while( lead > 0 && s.size() - lead < 3 && ( static_cast<unsigned char>( s[lead - 1] ) & 0xC0 ) == 0x80 ) {
+        lead--;
+    }
+    if( lead > 0 ) {
+        const unsigned char c = static_cast<unsigned char>( s[lead - 1] );
+        const size_t want = c >= 0xF0 ? 4 : c >= 0xE0 ? 3 : c >= 0xC0 ? 2 : 1;
+        if( c >= 0x80 && s.size() - ( lead - 1 ) < want ) {
+            s.resize( lead - 1 );
+        }
+    }
+    return s;
+}
+
+int8_t mood_band( int level )
+{
+    return level >= 100 ? 3 : level >= 50 ? 2 : level >= 10 ? 1 : level >= -10 ? 0 : level >= -50 ? -1 :
+           level >= -100 ? -2 : -3;
+}
+
+namespace
+{
 int16_t clamp_i16( int v )
 {
     return static_cast<int16_t>( std::clamp( v, -32768, 32767 ) );
@@ -378,6 +412,51 @@ void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags
     }
 }
 
+// CDDA's morale screen: the level and the strongest entries. Names come from game data (mods, item names) and are
+// cut to max_mood_name_columns; an entry whose name is empty after that is still counted in `total`.
+void capture_mood( const avatar &u, mood_view &mood )
+{
+    const int level = u.get_morale_level();
+    mood.level = clamp_i16( level );
+    mood.band = mood_band( level );
+    // CDDA's face lookup raises a debug message for a face with no steps (a mod's): no face then.
+    const mood_face_id &face = u.character_mood_face();
+    if( face.is_valid() && !face->values().empty() ) {
+        mood.face = client_text( display::morale_face_color( u ).first, max_mood_face_bytes, max_mood_face_bytes );
+    }
+    std::vector<std::pair<std::string, int>> all = u.morale->fp3d_entries();
+    mood.total = static_cast<uint16_t>( std::min<size_t>( all.size(), UINT16_MAX ) );
+    // The morale screen's share: an entry's square over the sum of squares on its side (good or bad).
+    double good = 0;
+    double bad = 0;
+    for( const std::pair<std::string, int> &e : all ) {
+        const double sq = static_cast<double>( e.second ) * e.second;
+        ( e.second > 0 ? good : bad ) += sq;
+    }
+    std::sort( all.begin(), all.end(), []( const std::pair<std::string, int> &a,
+    const std::pair<std::string, int> &b ) {
+        const int64_t ma = std::abs( static_cast<int64_t>( a.second ) );
+        const int64_t mb = std::abs( static_cast<int64_t>( b.second ) );
+        return ma != mb ? ma > mb : a.first < b.first;
+    } );
+    for( const std::pair<std::string, int> &e : all ) {
+        if( mood.entries.size() >= max_mood_entries ) {
+            break;
+        }
+        mood_entry m;
+        m.name = client_text( e.first, max_mood_name_columns, 4 * max_mood_name_columns );
+        if( m.name.empty() ) {
+            continue;
+        }
+        m.value = clamp_i16( e.second );
+        const double side = e.second > 0 ? good : bad;
+        const double sq = static_cast<double>( e.second ) * e.second;
+        // Cut, not rounded: what the morale screen prints.
+        m.percent = side > 0 ? static_cast<uint8_t>( std::clamp( sq / side * 100.0, 0.0, 100.0 ) ) : 0;
+        mood.entries.push_back( std::move( m ) );
+    }
+}
+
 void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &seen )
 {
     pv.uid = 1;
@@ -399,6 +478,7 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
     pv.sleepiness = clamp_i16( u.get_sleepiness() );
     pv.pain = clamp_i16( u.get_perceived_pain() );
     pv.morale = clamp_i16( u.get_morale_level() );
+    capture_mood( u, pv.mood );
     pv.wielded = wielded_index( u );
     if( const item_location w = u.get_wielded_item(); w && w->is_gun() ) {
         gun_view g;
@@ -426,8 +506,7 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
             break;
         }
         const std::string &id = e.get_id().str();
-        const std::string name = sanitize_text( utf8_truncate( remove_color_tags( e.disp_name() ),
-                                                max_effect_name_columns ), 4 * max_effect_name_columns );
+        const std::string name = client_text( e.disp_name(), max_effect_name_columns, 4 * max_effect_name_columns );
         if( name.empty() || id.empty() || id.size() > max_effect_id_bytes ) {
             continue;
         }
@@ -513,6 +592,44 @@ void capture_environment( const avatar &u, environment_view &env )
     env.wind_speed = static_cast<float>( weather.windspeed * 0.44704 );   // mph -> m/s
     env.wind_dir_deg = static_cast<float>( weather.winddirection );
     env.ambient_light = clamp_u8( g->natural_light_level( u.posz() ) );
+
+    // The weather type's numbers come from game data (mods too): bounded, and never NaN or infinite in the JSON.
+    const auto bounded = []( float v, float lo, float hi, float fallback ) {
+        return std::isfinite( v ) ? std::clamp( v, lo, hi ) : fallback;
+    };
+    const weather_type_id &wid = weather.weather_id;
+    if( wid.is_valid() ) {
+        const weather_type &w = *wid;
+        env.weather_id = wid.str().size() <= max_weather_id_bytes ? sanitize_text( wid.str(),
+                         max_weather_id_bytes ) : std::string();
+        env.weather_name = client_text( w.name.translated(), max_weather_name_columns,
+                                        4 * max_weather_name_columns );
+        env.precip = static_cast<uint8_t>( std::clamp( static_cast<int>( w.precip ), 0,
+                                           static_cast<int>( precip_class::heavy ) ) );
+        // Snow is what CDDA draws and sounds as snow; `rains` only says whether it wets (a mod's snow can).
+        const bool snow = w.tiles_animation == "weather_snowflake" ||
+                          w.sound_category == weather_sound_category::flurries ||
+                          w.sound_category == weather_sound_category::snow ||
+                          w.sound_category == weather_sound_category::snowstorm;
+        env.precip_kind = env.precip == 0 ? 0 : snow ? 2 : 1;
+        env.weather_sound = static_cast<uint8_t>( std::clamp( static_cast<int>( w.sound_category ), 0,
+                            static_cast<int>( weather_sound_category::last ) - 1 ) );
+        env.sight_penalty = bounded( w.sight_penalty, 0.0f, 100.0f, 1.0f );
+        env.light_modifier = static_cast<int16_t>( std::clamp( w.light_modifier, -1000, 1000 ) );
+        env.sun_multiplier = bounded( w.sun_multiplier, 0.0f, 10.0f, 1.0f );
+        env.sound_attn = static_cast<int16_t>( std::clamp( w.sound_attn, 0, 1000 ) );
+        env.dangerous = w.dangerous;
+    }
+    env.sheltered = g->is_sheltered( u.pos_bub() );
+    // As CDDA works out the wind on the player (character_body.cpp), without a vehicle's own speed.
+    // Wind and humidity can be set by game data (effects on conditions): bounded before CDDA's integer maths.
+    const int local_wind = get_local_windpower( std::clamp( weather.windspeed, 0, 1000 ),
+                           overmap_buffer.ter( u.pos_abs_omt() ), u.pos_abs(), weather.winddirection, env.sheltered );
+    env.wind_at_player = bounded( static_cast<float>( local_wind * 0.44704 ), 0.0f, 1000.0f, 0.0f );
+    const double humidity = weather.weather_precise->humidity;
+    env.humidity = static_cast<uint8_t>( std::clamp( get_local_humidity( std::isfinite( humidity ) ?
+                                         std::clamp( humidity, 0.0, 100.0 ) : 0.0, wid.is_valid() ? wid : WEATHER_CLEAR,
+                                         env.sheltered ), 0, 100 ) );
 }
 
 // vehicle_tiles: bit0 a part is here, bit1 the part is inside the vehicle (roofed).
@@ -875,6 +992,23 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         jo.end_array();
         jo.end_object();
     }
+    jo.member( "mood" );
+    jo.start_object();
+    jo.member( "level", static_cast<int>( pv.mood.level ) );
+    jo.member( "band", static_cast<int>( pv.mood.band ) );
+    jo.member( "face", pv.mood.face );
+    jo.member( "total", static_cast<int>( pv.mood.total ) );
+    jo.member( "entries" );
+    jo.start_array();
+    for( const mood_entry &m : pv.mood.entries ) {
+        jo.start_object();
+        jo.member( "name", m.name );
+        jo.member( "value", static_cast<int>( m.value ) );
+        jo.member( "percent", static_cast<int>( m.percent ) );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.end_object();
     jo.member( "effects" );
     jo.start_array();
     for( const effect_view &e : pv.effects ) {
@@ -932,6 +1066,19 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     jo.member( "wind_speed", env.wind_speed );
     jo.member( "wind_dir_deg", env.wind_dir_deg );
     jo.member( "ambient_light", static_cast<int>( env.ambient_light ) );
+    jo.member( "weather_id", env.weather_id );
+    jo.member( "weather_name", env.weather_name );
+    jo.member( "precip", static_cast<int>( env.precip ) );
+    jo.member( "precip_kind", static_cast<int>( env.precip_kind ) );
+    jo.member( "weather_sound", static_cast<int>( env.weather_sound ) );
+    jo.member( "sight_penalty", env.sight_penalty );
+    jo.member( "light_modifier", static_cast<int>( env.light_modifier ) );
+    jo.member( "sun_multiplier", env.sun_multiplier );
+    jo.member( "sound_attn", static_cast<int>( env.sound_attn ) );
+    jo.member( "dangerous", env.dangerous );
+    jo.member( "wind_at_player", env.wind_at_player );
+    jo.member( "humidity", static_cast<int>( env.humidity ) );
+    jo.member( "sheltered", env.sheltered );
     jo.end_object();
 
     jo.member( "submaps" );

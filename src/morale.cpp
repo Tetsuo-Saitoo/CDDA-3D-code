@@ -450,6 +450,26 @@ int player_morale::get_total_negative_value() const
     return std::sqrt( sum );
 }
 
+// FP3D: get_name() would raise a debug message for an unknown type, at every snapshot
+std::string player_morale::morale_point::fp3d_name() const
+{
+    return type.is_valid() ? get_name() : std::string();
+}
+
+// FP3D:
+std::vector<std::pair<std::string, int>> player_morale::fp3d_entries() const
+{
+    const morale_mult mult = get_temper_mult();
+    std::vector<std::pair<std::string, int>> out;
+    for( const morale_point &m : points ) {
+        const int bonus = m.get_net_bonus( mult );
+        if( bonus != 0 ) {
+            out.emplace_back( m.fp3d_name(), bonus );
+        }
+    }
+    return out;
+}
+
 int player_morale::get_perceived_pain() const
 {
     return perceived_pain;
