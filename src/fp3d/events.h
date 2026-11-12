@@ -24,7 +24,11 @@ struct dealt_damage_instance;
 namespace fp3d
 {
 
-enum class event_kind : uint8_t { sound, message, attack, damage, projectile, explosion, death, anim, turn_end };
+enum class event_kind : uint8_t {
+    sound, message, attack, damage, projectile, explosion, death, anim, turn_end, lightning
+};
+// How many kinds there are (tables indexed by kind).
+constexpr size_t event_kind_count = static_cast<size_t>( event_kind::lightning ) + 1;
 
 struct event {
     event_kind kind = event_kind::turn_end;
@@ -91,6 +95,9 @@ std::string current_explosion_item();
 void on_death( const Creature &c );
 void on_activity( const Character &ch, const std::string &activity );
 void on_turn_end();
+// CDDA's lightning flash (the `lightning` effect of its weather effects; npctalk.cpp). CDDA's own flag for it is
+// cleared again before the turn ends, so a snapshot never shows it. `pos` is the player's square.
+void on_lightning();
 
 } // namespace fp3d
 

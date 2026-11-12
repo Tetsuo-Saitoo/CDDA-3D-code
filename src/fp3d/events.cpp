@@ -284,4 +284,12 @@ void on_turn_end()
     push( std::move( e ) );
 }
 
+void on_lightning()
+{
+    event e;
+    e.kind = event_kind::lightning;
+    e.pos = to_ui_point( get_avatar().pos_abs() );
+    push( std::move( e ) );
+}
+
 } // namespace fp3d

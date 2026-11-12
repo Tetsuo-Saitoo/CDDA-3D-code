@@ -21,7 +21,9 @@
 #include "coordinates.h"
 #include "damage.h"
 #include "debug.h"
+#include "dialogue.h"
 #include "dispersion.h"
+#include "effect_on_condition.h"
 #include "explosion.h"
 #include "fp3d/boot.h"
 #include "fp3d/bridge.h"
@@ -37,6 +39,7 @@
 #include "projectile.h"
 #include "rng.h"
 #include "sounds.h"
+#include "talker.h"
 #include "translation.h"
 #include "type_id.h"
 #include "weakpoint.h"
@@ -456,6 +459,25 @@ int main()
         check( anim.size() == 1 && anim[0].uid == 1 && name_of( fp3d::id_kind::activity, anim[0].type ) == "ACT_WAIT",
                "activity: anim event" );
         u.cancel_activity();
+
+        {
+            // CDDA's lightning flash (the weather's `lightning` effect): one event at the player's square, and
+            // none while events are off.
+            const effect_on_condition_id lightning( "lightning" );
+            drain( event_kind::lightning );
+            dialogue d( get_talker_for( u ), nullptr );
+            lightning->apply_true_effects( d );
+            std::vector<event> flash = drain( event_kind::lightning );
+            const tripoint_abs_ms where = u.pos_abs();
+            check( flash.size() == 1 && flash[0].pos.x == where.x() && flash[0].pos.y == where.y() &&
+                   flash[0].pos.z == where.z() && flash[0].uid == 0, "lightning: one event at the player",
+                   std::to_string( flash.size() ) + " events" );
+            fp3d::set_events_enabled( false );
+            dialogue d2( get_talker_for( u ), nullptr );
+            lightning->apply_true_effects( d2 );
+            fp3d::set_events_enabled( true );
+            check( drain( event_kind::lightning ).empty(), "lightning: nothing while events are off" );
+        }
 
         const tripoint_bub_ms blast_at = at + tripoint_rel_ms( -3, 2, 0 );
         {

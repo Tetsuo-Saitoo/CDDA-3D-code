@@ -204,6 +204,31 @@ struct effect_view {
     int32_t seconds_left = -1;           // -1 permanent
 };
 
+// Text from game data (names from mods, item names) as the client gets it: color tags removed, at most
+// `max_columns` wide, no control characters, at most `max_bytes` long and never cut inside a UTF-8 character.
+std::string client_text( const std::string &raw, size_t max_columns, size_t max_bytes );
+
+// CDDA's morale screen, for the HUD's mood line.
+constexpr size_t max_mood_entries = 12;
+constexpr size_t max_mood_name_columns = 60;
+constexpr size_t max_mood_face_bytes = 16;
+struct mood_entry {
+    std::string name;                    // the morale screen's line, color tags removed; up to max_mood_name_columns
+    int16_t value = 0;                   // its morale points now (decay and temper applied), never 0
+    uint8_t percent = 0;                 // its share of its side (good or bad), cut to a whole number as the
+    // morale screen shows it; 0..100
+};
+struct mood_view {
+    int16_t level = 0;                   // CDDA's morale level
+    int8_t band = 0;                     // -3 .. 3 (mood_band)
+    std::string face;                    // CDDA's mood face for this character and level; up to max_mood_face_bytes
+    uint16_t total = 0;                  // how many entries CDDA has (entries may hold fewer)
+    std::vector<mood_entry> entries;     // largest |value| first, then by name; cap max_mood_entries
+};
+// The band of a morale level, by the thresholds of CDDA's default mood face: >= 100: 3, >= 50: 2, >= 10: 1,
+// >= -10: 0, >= -50: -1, >= -100: -2, lower: -3.
+int8_t mood_band( int level );
+
 struct player_view {
     uint64_t uid = 0;
     ui_point pos;
@@ -231,6 +256,7 @@ struct player_view {
     std::vector<carried_view> items;              // wielded, then worn items and what's inside; cap 256
     std::optional<gun_view> wielded_gun;          // when the wielded item is a gun
     std::vector<effect_view> effects;             // cap max_player_effects
+    mood_view mood;
 };
 
 struct environment_view {
@@ -240,11 +266,28 @@ struct environment_view {
     float sun_az_deg = 0;
     uint8_t moon_phase = 0;                       // moon_phase enum
     uint32_t weather = 0;                         // weather index
-    float temperature_c = 0;
-    float wind_speed = 0;                         // m/s
-    float wind_dir_deg = 0;
+    float temperature_c = 0;                      // air temperature on the player's square
+    float wind_speed = 0;                         // m/s, the region's wind
+    float wind_dir_deg = 0;                       // compass degrees the wind comes from (0 north, 90 east)
     uint8_t ambient_light = 0;                    // natural light level at the player's z
+    // What the current weather type does.
+    std::string weather_id;                       // weather_type id; up to max_weather_id_bytes ("" if longer)
+    std::string weather_name;                     // CDDA's name for it; up to max_weather_name_columns
+    uint8_t precip = 0;                           // 0 none, 1 very light, 2 light, 3 heavy (precip_class)
+    uint8_t precip_kind = 0;                      // 0 none, 1 rain, 2 snow (CDDA's snowflake animation or a snow sound)
+    uint8_t weather_sound = 0;                    // weather_sound_category, 0 (silent) .. 11 (cloudy)
+    float sight_penalty = 1;                      // CDDA's sight cost factor per square: 1 none, fog 1.7; 0..100
+    int16_t light_modifier = 0;                   // added to natural light (clouds: negative); -1000..1000
+    float sun_multiplier = 1;                     // how much sun gets through: 1 clear sky; 0..10
+    int16_t sound_attn = 0;                       // how much the weather drowns sounds; 0..1000
+    bool dangerous = false;
+    // At the player.
+    float wind_at_player = 0;                     // m/s on the player's square, terrain and cover counted
+    uint8_t humidity = 0;                         // percent
+    bool sheltered = false;                       // game::is_sheltered: roof, underground or roofed vehicle
 };
+constexpr size_t max_weather_id_bytes = 64;
+constexpr size_t max_weather_name_columns = 40;
 
 struct snapshot {
     uint32_t contract_version = fp3d::contract_version;

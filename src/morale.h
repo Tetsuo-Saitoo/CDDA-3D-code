@@ -57,6 +57,9 @@ class player_morale
 
         int get_total_positive_value() const;
         int get_total_negative_value() const;
+        // FP3D: every point that changes morale now, as the morale screen names it, with its value after decay and
+        // the temper multiplier (fp3d/snapshot.cpp)
+        std::vector<std::pair<std::string, int>> fp3d_entries() const;
 
         /** Returns perceived pain. Only used in morale_test.cpp*/
         int get_perceived_pain() const;
@@ -99,6 +102,8 @@ class player_morale
                 void serialize( JsonOut &json ) const;
 
                 std::string get_name() const;
+                // FP3D: the name, "" for a morale type the game data doesn't have (a save from other mods)
+                std::string fp3d_name() const;
                 int get_net_bonus() const;
                 int get_net_bonus( const morale_mult &mult ) const;
                 bool is_expired() const;
