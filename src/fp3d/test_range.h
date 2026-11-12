@@ -31,6 +31,7 @@
 
 #include "coordinates.h"
 #include "fp3d/bridge.h"
+#include "units.h"
 
 namespace fp3d
 {
@@ -91,6 +92,8 @@ constexpr size_t max_monster_id = 64;
 // The range clock stops this many days after the start of the game (about 10 years): set_time_of_day and advance
 // refuse to go past it, far from the end of CDDA's 32-bit turn counter.
 constexpr int max_range_days = 3650;
+// The air temperature a range game is held at (keep_range_weather: also a clear sky), as CDDA's tutorial holds 20 C.
+const units::temperature range_temperature = units::from_celsius( 20 );
 // Teleport: when the zone centre is taken or unsafe (see teleport_to_zone), the player arrives on the nearest free
 // square at most this far from it.
 constexpr int arrival_search_squares = 10;
@@ -100,7 +103,8 @@ constexpr size_t max_hall_id_base = 54;
 
 // Sim side, after boot_new_game_data( "fp3d-range", true, headless ): seeds CDDA's RNG, makes the world quiet, fixes
 // the start date (spring, day 2, 10:00), creates a fixed avatar, marks the game as a range (the avatar values above),
-// starts it in the hub, builds the hub, freezes the AI and turns achievements off. Only in a range world (range_world).
+// starts it in the hub, builds the hub, fixes the weather (range_temperature, a clear sky), freezes the AI and turns
+// achievements off. Only in a range world (range_world).
 // Throws std::runtime_error on failure. Follow with do_turn().
 void boot_test_range( unsigned seed );
 // Sim side, right after a save has loaded (boot_saved_game) and before the main loop: makes a saved range game a range
@@ -108,7 +112,7 @@ void boot_test_range( unsigned seed );
 // range world (range_world). Then: the zone registry is built again (the same zones from the same data), the boot seed
 // comes from `fp3d_range_seed` (an integer 0 .. UINT_MAX, else 1), each zone's built flag from the save (a built
 // zone is not built again: what it holds is in the save), the AI freeze from `fp3d_range_ai_frozen` (off only for 0,
-// else frozen), and achievements are off. Otherwise false and the game stays a normal one (reset_test_range: nothing
+// else frozen), the weather is fixed again (range_temperature, a clear sky) and achievements are off. Otherwise false and the game stays a normal one (reset_test_range: nothing
 // of an earlier range lingers). The caller allows cheats (the range operations) only when it returns true.
 bool resume_test_range();
 // Forgets the zone registry, ends the range session and unfreezes the AI; every boot does it first (boot.cpp).

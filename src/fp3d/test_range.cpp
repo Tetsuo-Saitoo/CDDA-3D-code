@@ -294,6 +294,19 @@ void store_frozen( bool on )
     get_avatar().set_value( frozen_var, on ? 1.0 : 0.0 );
 }
 
+// The range is for trying things, not for surviving the weather: a fixed temperature (as CDDA's tutorial) and a clear
+// sky, so a cold or wet day never stops a wait with "You are freezing! Stop waiting?" and snow or fog never hides a
+// target. Saves keep the temperature but not the sky, so resume_test_range sets both again; CDDA's first turn of a
+// game clears the sky's override, and do_turn keeps it for a range game (range_active). Each boot makes a new game
+// (and weather), so a later normal game never inherits it. Game thread, once the avatar is on the map.
+void keep_range_weather()
+{
+    weather_manager &w = get_weather();
+    w.forced_temperature = fp3d::range_temperature;
+    w.weather_override = WEATHER_CLEAR;
+    w.set_nextweather( calendar::turn );
+}
+
 // What a save says (hostile: bounded). The boot seed: an integer 0 .. UINT_MAX, else (missing, not a number, out of
 // range, a fraction) 1.
 unsigned saved_seed()
@@ -1604,6 +1617,7 @@ void boot_test_range( unsigned seed )
     build_zone( 0 );
     u.setpos( hub, false );
     settle_avatar();
+    keep_range_weather();
     store_frozen( true );
     // As CDDA's debug menu: a game with cheats earns no achievements.
     get_achievements().set_enabled( false );
@@ -1629,6 +1643,7 @@ bool resume_test_range()
     // (what they hold is in the save).
     build_registry();
     store_frozen( saved_frozen() );
+    keep_range_weather();
     get_achievements().set_enabled( false );
     size_t built = 0;
     for( const range_zone &z : reg().zones ) {
