@@ -2,7 +2,6 @@
 #ifndef CATA_SRC_FP3D_BOOT_H
 #define CATA_SRC_FP3D_BOOT_H
 
-#include <cstddef>
 #include <optional>
 #include <string>
 
@@ -64,8 +63,8 @@ void boot_saved_game( const std::string &world_name, const std::string &save_nam
 // location's terrains, so it stops at the same overmap. CDDA's own pick when starting cities are chosen or no
 // overmap within CDDA's search has any. Call it inside start_game: overmaps made earlier miss its new seed.
 start_location_id nearest_random_start( const scenario &scen, const std::optional<point_abs_om> &origin );
-// How many of `loc`'s terrains `om` has somewhere.
-size_t start_terrains_in( const overmap &om, const start_location &loc );
+// Whether `om` has any of `loc`'s terrains somewhere.
+bool has_start_terrain( const overmap &om, const start_location &loc );
 
 // CDDA's own exit path (exit_handler in main.cpp) plus SDL_Quit, on the thread that ran boot_world. Call it before
 // the process or DLL exits after a headless boot: CDDA's atexit( SDL_Quit ) otherwise runs before its static tile

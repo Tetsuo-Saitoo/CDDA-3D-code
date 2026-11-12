@@ -17,11 +17,11 @@
 #include "creature.h"
 #include "current_map.h"
 #include "debug.h"
-#include "fp3d/bridge.h" // FP3D:
 #include "enum_conversions.h"
 #include "enums.h"
 #include "field_type.h"
 #include "flexbuffer_json.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "generic_factory.h"
 #include "map.h"
 #include "map_extras.h"

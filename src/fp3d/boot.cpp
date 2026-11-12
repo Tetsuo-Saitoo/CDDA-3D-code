@@ -306,15 +306,14 @@ void run_save()
     note_saved( ok );
 }
 
-size_t start_terrains_in( const overmap &om, const start_location &loc )
+bool has_start_terrain( const overmap &om, const start_location &loc )
 {
-    size_t n = 0;
     for( const omt_types_parameters &t : loc.targets() ) {
         if( om.find_random_omt( std::make_pair( t.omt, t.omt_type ) ).raw() != tripoint::min ) {
-            n++;
+            return true;
         }
     }
-    return n;
+    return false;
 }
 
 start_location_id nearest_random_start( const scenario &scen, const std::optional<point_abs_om> &origin )
@@ -336,7 +335,7 @@ start_location_id nearest_random_start( const scenario &scen, const std::optiona
         searched++;
         std::vector<start_location_id> here;
         for( const start_location *loc : allowed ) {
-            if( start_terrains_in( om, *loc ) > 0 ) {
+            if( has_start_terrain( om, *loc ) ) {
                 here.push_back( loc->id );
             }
         }

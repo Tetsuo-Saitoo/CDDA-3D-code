@@ -975,7 +975,9 @@ int check_random_start()
     check( get_avatar().random_start_location, "the sim's character starts at random" );
     int searched = 0;
     bool reached = false;
-    for( const point_abs_om &omp : closest_points_first( point_abs_om(), 3 ) ) {
+    // From where start_game's search starts.
+    const point_abs_om origin = get_avatar().world_origin.value_or( point_abs_om() );
+    for( const point_abs_om &omp : closest_points_first( origin, 3 ) ) {
         searched++;
         if( omp == start_om ) {
             reached = true;
@@ -984,7 +986,7 @@ int check_random_start()
         // Made by the search already: get() makes nothing new here.
         const overmap &om = overmap_buffer.get( omp );
         for( const start_location &loc : start_locations::get_all() ) {
-            if( scen.allowed_start( loc.id ) && fp3d::start_terrains_in( om, loc ) > 0 ) {
+            if( scen.allowed_start( loc.id ) && fp3d::has_start_terrain( om, loc ) ) {
                 check( false, "overmap " + std::to_string( searched ) + " has " + loc.id.str() + ", passed over" );
             }
         }
