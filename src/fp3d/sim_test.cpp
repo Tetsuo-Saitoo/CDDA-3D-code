@@ -39,6 +39,7 @@
 #include "do_turn.h"
 #include "field.h"
 #include "field_type.h"
+#include "flag.h"
 #include "flexbuffer_json.h"
 #include "fp3d/arrival.h"
 #include "fp3d/boot.h"
@@ -505,6 +506,7 @@ void observe()
             g->place_critter_at( mon_zombie, p + tripoint_rel_ms( -3, 0, 0 ) );
             item gun( itype_glock_19 );
             gun.ammo_set( itype_9mm, 15 );
+            gun.set_flag( flag_NEVER_JAMS );   // each shot fires (no random malfunction: CDDA's roll)
             get_avatar().set_wielded_item( gun );
             break;
         }
@@ -2585,6 +2587,9 @@ static bool run_combat_checks()
                 if( !sc->fault.empty() ) {
                     gun.set_fault( fault_id( sc->fault ), true, false );
                 }
+                // No random malfunction (CDDA's roll, about 1 in 300 shots even for a new gun and a skilled
+                // shooter: the shot silently doesn't happen): the checks are about the hooks. Jams are set above.
+                gun.set_flag( flag_NEVER_JAMS );
                 u.set_wielded_item( gun );
             } else {
                 u.remove_weapon();
@@ -2639,6 +2644,7 @@ static bool run_combat_checks()
                 item base( itype_id( sc->gun ) );
                 base.ammo_set( itype_9mm );
                 base.set_fault( fault_id( "fault_stovepipe" ), true, false );
+                base.set_flag( flag_NEVER_JAMS );   // its 3 rounds all fire (no random malfunction)
                 here.build_map_cache( p.z() );
                 st->turret_fired = u.fire_gun( here, p + tripoint_rel_ms( sc->zx, sc->zy, 0 ), 3, base );
             }
@@ -3194,17 +3200,9 @@ static bool run_combat_checks()
         int shots = 0;
         int crits = 0;
         int hits = 0;
-        int malfunctions = 0;
         for( int i = 0; i < 20; i++ ) {
             const result r = run( far_zombie, "fire", answer_with::fire, dead_centre, false, std::nullopt );
             if( !fired( r, 1 ) ) {
-                // an unskilled shooter's gun malfunctions now and then (CDDA's roll): that shot doesn't count
-                for( const std::string &m : r.after.messages ) {
-                    if( m.find( "malfunctions" ) != std::string::npos ) {
-                        malfunctions++;
-                        break;
-                    }
-                }
                 continue;
             }
             shots++;
@@ -3215,9 +3213,9 @@ static bool run_combat_checks()
             }
             crits += crit ? 1 : 0;
         }
-        check( shots + malfunctions == 20 && shots >= 15 && crits < shots, "20 claimed head shots: CDDA's roll decides",
-               std::to_string( shots ) + " fired, " + std::to_string( malfunctions ) + " malfunctioned, " +
-               std::to_string( hits ) + " hit, " + std::to_string( crits ) + " critical / head" );
+        check( shots == 20 && crits < shots, "20 claimed head shots: CDDA's roll decides",
+               std::to_string( shots ) + " fired, " + std::to_string( hits ) + " hit, " + std::to_string( crits ) +
+               " critical / head" );
     }
     const auto outcomes = [&]( const result & r ) {
         return delta( r.c0.accepted, r.c1.accepted ) + delta( r.c0.planned, r.c1.planned );
