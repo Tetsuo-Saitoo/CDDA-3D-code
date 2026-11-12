@@ -16,6 +16,7 @@
 #include <atomic>
 #include <chrono>
 #include <climits>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -73,6 +74,7 @@
 #include "vehicle.h"
 #include "vpart_position.h"
 #include "vpart_range.h"
+#include "weather.h"
 #include "worldfactory.h"
 
 namespace
@@ -331,6 +333,21 @@ std::string ok_or( const std::string &why )
     return why.empty() ? "ok" : "[" + why + "]";
 }
 
+// The range's fixed weather (keep_range_weather in test_range.cpp): "" when it holds, else what is wrong (sim thread).
+std::string weather_wrong()
+{
+    const weather_manager &w = get_weather_const();
+    std::string why;
+    if( !w.forced_temperature ||
+        std::fabs( units::to_kelvin( *w.forced_temperature ) - units::to_kelvin( fp3d::range_temperature ) ) > 0.01f ) {
+        why += "temperature not fixed at 20 C; ";
+    }
+    if( w.weather_override != WEATHER_CLEAR || w.weather_id != WEATHER_CLEAR ) {
+        why += "weather " + w.weather_id.str() + ", override " + w.weather_override.str();
+    }
+    return why;
+}
+
 // ---- the checks ----
 
 size_t check_registry()
@@ -537,6 +554,11 @@ void check_hub()
            std::to_string( results.size() ) );
     check( at_centre && npcs == 0 && mons.size() == 1, "hub: player on the start square, no NPCs, one monster",
            std::to_string( npcs ) + " NPCs, " + std::to_string( mons.size() ) + " monsters" );
+    std::string weather = "not run";
+    on_sim( [&] {
+        weather = weather_wrong();
+    } );
+    check( weather.empty(), "hub: the range holds 20 C and a clear sky (no cold to stop a wait)", weather );
 }
 
 // Monsters stay put over 10 turns while frozen.
@@ -2012,6 +2034,9 @@ size_t check_reload()
         built_value = avatar_number( "fp3d_range_built_" + fp3d::range_zones()[pick].id );
         // As if booted with a seed other than the default (1): resume must read it from the save.
         u.set_value( "fp3d_range_seed", 4242.0 );
+        // As a range saved before the fixed weather (and the sky is never saved): resume must set both.
+        get_weather().forced_temperature.reset();
+        get_weather().weather_override = WEATHER_NULL;
         rows_before = zone_rows();
         saved = fp3d_game_access::save_game( *g );
         if( saved ) {
@@ -2040,6 +2065,7 @@ size_t check_reload()
     bool frozen = true;
     unsigned seed = 0;
     bool achievements = true;
+    std::string weather_after = "not run";
     int zone_after = -1;
     std::vector<zone_row> rows_after;
     fp3d::range_zone z;
@@ -2060,6 +2086,7 @@ size_t check_reload()
         frozen = fp3d::ai_frozen();
         seed = fp3d::range_boot_seed();
         achievements = get_achievements().is_enabled();
+        weather_after = weather_wrong();
         rows_after = zone_rows();
         zone_after = fp3d::current_zone();
         if( pick < fp3d::range_zones().size() ) {
@@ -2092,6 +2119,8 @@ size_t check_reload()
            std::to_string( things_before ) + " -> " + std::to_string( things_after ) + " things" );
     check( !frozen && seed == 4242 && !achievements, "reload: AI running and seed as saved, achievements off",
            "seed " + std::to_string( seed ) );
+    check( weather_after.empty(), "reload: 20 C and a clear sky again, also for a save without them",
+           weather_after );
     check( healed.empty() && to_hub.empty() && zone_hub == 0, "reload: heal and teleport to the hub work",
            ok_or( healed ) + ok_or( to_hub ) );
     check( again.empty() && zone_again == static_cast<int>( pick ) && z_again.placed == 0 &&
