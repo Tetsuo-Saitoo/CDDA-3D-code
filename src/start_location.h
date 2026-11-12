@@ -47,6 +47,10 @@ class start_location
         std::string name() const;
         int targets_count() const;
         omt_types_parameters random_target() const;
+        // FP3D: every overmap terrain this location can start on (fp3d::nearest_random_start)
+        const std::vector<omt_types_parameters> &targets() const {
+            return _locations;
+        }
         const std::set<std::string> &flags() const;
 
         /**

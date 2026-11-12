@@ -37,6 +37,7 @@
 #endif
 
 #include "achievement.h"
+#include "fp3d/boot.h" // FP3D:
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/points.h" // FP3D:
 #include "action.h"
@@ -925,8 +926,14 @@ bool game::start_game()
     // Move items from the raw inventory to item_location s. See header TODO.
     u.migrate_items_to_storage( true );
 
-    const start_location &start_loc = u.random_start_location ? scen->random_start_location().obj() :
-                                      u.start_location.obj();
+    if( fp3d::active() ) {
+        fp3d::note_boot_step( "Starting the game: finding a start location" ); // FP3D: boot phase times
+    }
+    // FP3D: a random start takes a start location the nearest overmap has, not one picked first and then searched
+    // for, generating overmaps on the way (fp3d/boot.h).
+    const start_location &start_loc = !u.random_start_location ? u.start_location.obj() :
+                                      fp3d::active() ? fp3d::nearest_random_start( *scen, u.world_origin ).obj() :
+                                      scen->random_start_location().obj();
     tripoint_abs_omt omtstart = tripoint_abs_omt::invalid;
     std::unordered_map<std::string, std::string> associated_parameters;
     const bool select_starting_city = get_option<bool>( "SELECT_STARTING_CITY" );
@@ -959,6 +966,9 @@ bool game::start_game()
     // Set parameter(s) if specified in chosen start_loc
     start_loc.set_parameters( omtstart, associated_parameters );
 
+    if( fp3d::active() ) {
+        fp3d::note_boot_step( "Starting the game: the map around the start" ); // FP3D: boot phase times
+    }
     start_loc.prepare_map( omtstart );
 
     if( scen->has_map_extra() ) {
@@ -1008,6 +1018,9 @@ bool game::start_game()
     get_auto_notes_settings().clear();
     get_auto_notes_settings().default_initialize();
 
+    if( fp3d::active() ) {
+        fp3d::note_boot_step( "Starting the game: NPCs and monsters" ); // FP3D: boot phase times
+    }
     // spawn the starting NPC, assuming it's not disallowed by the scenario
     if( !get_scenario()->has_flag( "LONE_START" ) ) {
         create_starting_npcs();

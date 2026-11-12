@@ -6,6 +6,11 @@
 #include <string>
 
 #include "coordinates.h"
+#include "type_id.h"
+
+class overmap;
+class scenario;
+class start_location;
 
 namespace fp3d
 {
@@ -50,6 +55,16 @@ std::string replacing_world_name( const std::string &world_name );
 // game::load). Deletes nothing. Follow with do_turn() to play. Run it on the thread that will own the game.
 // Throws std::runtime_error if the world or the save doesn't exist or the load fails. `headless` as above.
 void boot_saved_game( const std::string &world_name, const std::string &save_name, bool headless );
+
+// For game::start_game's random start location: one of the scenario's start locations that the nearest overmap
+// holding any of them has (in the order CDDA's own search goes, from `origin` or the world's origin), at random.
+// CDDA picks a location first and then generates overmap after overmap (up to 49) until it finds that one, which
+// made a quick start's "Starting the game" take 1-18 s. With FP3D active, that search takes any of the picked
+// location's terrains, so it stops at the same overmap. CDDA's own pick when starting cities are chosen or no
+// overmap within CDDA's search has any. Call it inside start_game: overmaps made earlier miss its new seed.
+start_location_id nearest_random_start( const scenario &scen, const std::optional<point_abs_om> &origin );
+// Whether `om` has any of `loc`'s terrains somewhere.
+bool has_start_terrain( const overmap &om, const start_location &loc );
 
 // CDDA's own exit path (exit_handler in main.cpp) plus SDL_Quit, on the thread that ran boot_world. Call it before
 // the process or DLL exits after a headless boot: CDDA's atexit( SDL_Quit ) otherwise runs before its static tile
