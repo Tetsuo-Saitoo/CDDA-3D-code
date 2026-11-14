@@ -1462,7 +1462,7 @@ dealt_damage_instance Creature::deal_damage( Creature *source, bodypart_id bp,
     apply_damage( source, bp, total_damage );
     // FP3D: hit reaction for the client
     if( fp3d::events_enabled() && total_damage > 0 ) {
-        fp3d::on_damage( *this, source, bp.id().str(), total_damage, dealt_dams );
+        fp3d::on_damage( *this, source, bp.id().str(), total_damage, dealt_dams, wkpt );
     }
 
     if( wkpt != nullptr ) {

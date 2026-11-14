@@ -36,6 +36,7 @@
 #include "martialarts.h"
 #include "messages.h"
 #include "monster.h"
+#include "mtype.h"
 #include "projectile.h"
 #include "rng.h"
 #include "sounds.h"
@@ -402,6 +403,36 @@ int main()
         std::vector<event> unsourced = drain( event_kind::damage );
         check( unsourced.size() == 1 && unsourced[0].other == 0, "damage: no source, other 0",
                unsourced.empty() ? "none" : "other " + std::to_string( unsourced[0].other ) );
+        {
+            // the weak point the hit landed on: a monster's names it in `text`; none, or an id that is no plain id,
+            // sends ""
+            const weakpoint *head = nullptr;
+            for( const weakpoint &w : zed->type->weakpoints.weakpoint_list ) {
+                head = w.id == "head" ? &w : head;
+            }
+            weakpoint_attack aimed;
+            aimed.accuracy = 1.0;   // not -1: absorb_hit takes the weak point given, as for an aimed hit
+            if( head != nullptr ) {
+                zed->deal_damage( &u, bodypart_id( "torso" ), damage_instance( damage_bash, 10 ), aimed, *head );
+            }
+            const std::vector<event> on_head = drain( event_kind::damage );
+            zed->deal_damage( &u, bodypart_id( "torso" ), damage_instance( damage_bash, 5 ), aimed, weakpoint() );
+            const std::vector<event> on_body = drain( event_kind::damage );
+            const bool ids_ok = fp3d::weakpoint_text( "leg_joint" ) == "leg_joint" &&
+                                fp3d::weakpoint_text( "Eye2" ) == "Eye2" && fp3d::weakpoint_text( "" ).empty() &&
+                                fp3d::weakpoint_text( "the head" ).empty() && fp3d::weakpoint_text( "9th" ).empty() &&
+                                fp3d::weakpoint_text( "<color_red>head" ).empty() &&
+                                fp3d::weakpoint_text( "h\xC3\xA9" "ad" ).empty() &&
+                                fp3d::weakpoint_text( std::string( fp3d::max_weakpoint_id, 'a' ) ).size() ==
+                                fp3d::max_weakpoint_id &&
+                                fp3d::weakpoint_text( std::string( fp3d::max_weakpoint_id + 1, 'a' ) ).empty();
+            check( head != nullptr && on_head.size() == 1 && on_head[0].text == "head" && on_body.size() == 1 &&
+                   on_body[0].text.empty() && ids_ok, "damage: a monster's weak point is named",
+                   std::string( head == nullptr ? "no head weak point" : "" ) + ( on_head.empty() ? " none" :
+                           " \"" + on_head[0].text + "\"" ) + ( on_body.empty() ? " none" : " \"" + on_body[0].text + "\"" ) +
+                   ( ids_ok ? "" : " ids wrong" ) );
+            zed->set_hp( zed->get_hp_max() );   // the checks after this one want it alive
+        }
         {
             const tripoint_bub_ms under = at + tripoint_rel_ms( 0, 0, -1 );
             here.ter_set( under, ter_t_floor );
