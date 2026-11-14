@@ -26,6 +26,7 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <limits>
 #include <map>
 #include <mutex>
@@ -333,7 +334,8 @@ std::string ok_or( const std::string &why )
     return why.empty() ? "ok" : "[" + why + "]";
 }
 
-// The range's fixed weather (keep_range_weather in test_range.cpp): "" when it holds, else what is wrong (sim thread).
+// The range's fixed weather (keep_range_weather in test_range.cpp: 20 C, a clear sky, no wind): "" when it holds, else
+// what is wrong (sim thread).
 std::string weather_wrong()
 {
     const weather_manager &w = get_weather_const();
@@ -343,7 +345,10 @@ std::string weather_wrong()
         why += "temperature not fixed at 20 C; ";
     }
     if( w.weather_override != WEATHER_CLEAR || w.weather_id != WEATHER_CLEAR ) {
-        why += "weather " + w.weather_id.str() + ", override " + w.weather_override.str();
+        why += "weather " + w.weather_id.str() + ", override " + w.weather_override.str() + "; ";
+    }
+    if( !w.windspeed_override || *w.windspeed_override != 0 || w.windspeed != 0 ) {
+        why += "wind " + std::to_string( w.windspeed ) + ( w.windspeed_override ? "" : ", no override" );
     }
     return why;
 }
@@ -558,7 +563,7 @@ void check_hub()
     on_sim( [&] {
         weather = weather_wrong();
     } );
-    check( weather.empty(), "hub: the range holds 20 C and a clear sky (no cold to stop a wait)", weather );
+    check( weather.empty(), "hub: the range holds 20 C, a clear sky and no wind (no cold to stop a wait)", weather );
 }
 
 // Monsters stay put over 10 turns while frozen.
@@ -2010,6 +2015,9 @@ size_t check_reload()
     double frozen_value = -1.0;
     double built_value = -1.0;
     bool saved = false;
+    std::string weather_at_save = "not run";
+    bool master_weather = false;
+    bool master_forced = true;
     on_sim( [&] {
         const std::vector<fp3d::range_zone> &zones = fp3d::range_zones();
         for( size_t i = 1; i < zones.size(); i++ ) {
@@ -2034,11 +2042,20 @@ size_t check_reload()
         built_value = avatar_number( "fp3d_range_built_" + fp3d::range_zones()[pick].id );
         // As if booted with a seed other than the default (1): resume must read it from the save.
         u.set_value( "fp3d_range_seed", 4242.0 );
-        // As a range saved before the fixed weather (and the sky is never saved): resume must set both.
+        rows_before = zone_rows();
+        // Saved with the fixed weather on: the world's file must not carry the temperature (it is read for every
+        // character of the world).
+        weather_at_save = weather_wrong();
+        saved = fp3d_game_access::save_game( *g );
+        std::ifstream master( ( PATH_INFO::world_base_save_path() / SAVE_MASTER ).get_unrelative_path(),
+                              std::ios::binary );
+        const std::string text( ( std::istreambuf_iterator<char>( master ) ), std::istreambuf_iterator<char>() );
+        master_weather = text.find( "\"weather\"" ) != std::string::npos;
+        master_forced = text.find( "forced_temperature" ) != std::string::npos;
+        // Nothing of it lingers in this process either: only resume can set it after the load.
         get_weather().forced_temperature.reset();
         get_weather().weather_override = WEATHER_NULL;
-        rows_before = zone_rows();
-        saved = fp3d_game_access::save_game( *g );
+        get_weather().windspeed_override.reset();
         if( saved ) {
             // As CDDA's save-and-quit: the game ends on its next turn, and sim_main loads it again.
             reload_save = u.get_save_id();
@@ -2053,6 +2070,10 @@ size_t check_reload()
            ( was_built ? " (built before)" : " (built on arrival)" ) );
     check( frozen_value == 0.0 && built_value == 1.0, "reload: the AI freeze and the built zone in avatar values",
            "frozen " + std::to_string( frozen_value ) + ", built " + std::to_string( built_value ) );
+    check( weather_at_save.empty() && master_weather && !master_forced,
+           "reload: the fixed temperature is not in the world's save (master.gsav)",
+           ok_or( weather_at_save ) + ( master_weather ? "" : " no weather in the file" ) +
+           ( master_forced ? " forced_temperature in the file" : "" ) );
 
     // That turn ends the game; the next main-loop request comes after the load.
     const auto t = std::chrono::steady_clock::now();
@@ -2119,7 +2140,7 @@ size_t check_reload()
            std::to_string( things_before ) + " -> " + std::to_string( things_after ) + " things" );
     check( !frozen && seed == 4242 && !achievements, "reload: AI running and seed as saved, achievements off",
            "seed " + std::to_string( seed ) );
-    check( weather_after.empty(), "reload: 20 C and a clear sky again, also for a save without them",
+    check( weather_after.empty(), "reload: 20 C, a clear sky and no wind again (resume sets them, the save has none)",
            weather_after );
     check( healed.empty() && to_hub.empty() && zone_hub == 0, "reload: heal and teleport to the hub work",
            ok_or( healed ) + ok_or( to_hub ) );
