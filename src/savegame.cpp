@@ -21,6 +21,7 @@
 #include "creature_tracker.h"
 #include "debug.h"
 #include "faction.h"
+#include "fp3d/test_range.h" // FP3D:
 #include "hash_utils.h"
 #include "input.h"
 #include "json.h"
@@ -1600,7 +1601,9 @@ void weather_manager::serialize_all( JsonOut &json )
     json.member( "temperature", units::to_fahrenheit( weather.temperature ) );
     json.member( "winddirection", weather.winddirection );
     json.member( "windspeed", weather.windspeed );
-    if( weather.forced_temperature ) {
+    // FP3D: a range game's fixed temperature (fp3d/test_range.h) is the range's, not the world's: this file is read
+    // for every character of the world, and resume_test_range sets it again
+    if( weather.forced_temperature && !fp3d::range_active() ) {
         json.member( "forced_temperature", units::to_fahrenheit( *weather.forced_temperature ) );
     }
     json.end_object();

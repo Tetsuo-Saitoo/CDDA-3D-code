@@ -294,16 +294,19 @@ void store_frozen( bool on )
     get_avatar().set_value( frozen_var, on ? 1.0 : 0.0 );
 }
 
-// The range is for trying things, not for surviving the weather: a fixed temperature (as CDDA's tutorial) and a clear
-// sky, so a cold or wet day never stops a wait with "You are freezing! Stop waiting?" and snow or fog never hides a
-// target. Saves keep the temperature but not the sky, so resume_test_range sets both again; CDDA's first turn of a
-// game clears the sky's override, and do_turn keeps it for a range game (range_active). Each boot makes a new game
-// (and weather), so a later normal game never inherits it. Game thread, once the avatar is on the map.
+// The range is for trying things, not for surviving the weather: a fixed temperature (as CDDA's tutorial), a clear
+// sky and no wind, so a cold, wet or windy day never stops a wait with "You are freezing! Stop waiting?" and snow or
+// fog never hides a target. None of it is in a save (the temperature is the range's, not the world's: savegame.cpp
+// leaves it out for a range game; CDDA saves neither override), so resume_test_range sets all three again. CDDA's
+// first turn of a game clears the sky's override, and do_turn keeps it for a range game (range_active). Each boot
+// makes a new game (and weather), so a later normal game never inherits it. Game thread, once the avatar is on the
+// map.
 void keep_range_weather()
 {
     weather_manager &w = get_weather();
     w.forced_temperature = fp3d::range_temperature;
     w.weather_override = WEATHER_CLEAR;
+    w.windspeed_override = 0;
     w.set_nextweather( calendar::turn );
 }
 
