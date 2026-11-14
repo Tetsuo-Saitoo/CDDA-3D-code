@@ -1,5 +1,6 @@
 #include "fp3d/cheats.h"
 
+#include <algorithm>
 #include <array>
 #include <climits>
 #include <deque>
@@ -23,8 +24,11 @@
 #include "map.h"
 #include "map_scale_constants.h"
 #include "messages.h"
+#include "options.h"
 #include "translations.h"
 #include "type_id.h"
+#include "weather.h"
+#include "weather_type.h"
 
 static const itype_id itype_backpack_giant( "backpack_giant" );
 static const itype_id itype_bandages( "bandages" );
@@ -306,7 +310,7 @@ bool request_test_kit()
 
 uint64_t request_range_op( const range_op &op )
 {
-    if( is_shut_down() || op.monster.size() > max_monster_id ) {
+    if( is_shut_down() || op.monster.size() > max_monster_id || op.weather.size() > max_weather_id ) {
         return 0;
     }
     uint64_t id = 0;
@@ -383,6 +387,68 @@ std::string teleport_to_square( const ui_point &square )
     return "";
 }
 
+// The loaded weather type with exactly this id (never "null"), found among the loaded ones: a client's text never
+// becomes an id of its own.
+std::optional<weather_type_id> loaded_weather( const std::string &id )
+{
+    if( id.empty() || id.size() > max_weather_id || id == WEATHER_NULL.str() ) {
+        return std::nullopt;
+    }
+    for( const weather_type &w : weather_types::get_all() ) {
+        if( w.id.str() == id ) {
+            return w.id;
+        }
+    }
+    return std::nullopt;
+}
+
+// The weather cheat (range_op_kind::weather), as CDDA's debug menu: the override, then the weather now.
+std::string set_weather( const std::string &id, int wind )
+{
+    if( !in_timed_hook() ) {
+        return "Only between turns.";
+    }
+    if( !cheats_allowed() ) {
+        return "Cheats are off.";
+    }
+    const avatar &u = get_avatar();
+    if( g->uquit != QUIT_NO || u.is_dead_state() ) {
+        return "Not now.";
+    }
+    if( wind < -1 || wind > max_cheat_wind ) {
+        return "No such wind.";
+    }
+    std::optional<weather_type_id> chosen;
+    if( !id.empty() ) {
+        chosen = loaded_weather( id );
+        if( !chosen ) {
+            return "No such weather.";
+        }
+    }
+    // The option wins over any override (weather_manager::update_weather).
+    if( get_option<std::string>( "ETERNAL_WEATHER" ) != "normal" ) {
+        return "This world's weather never changes.";
+    }
+    no_achievements();
+    weather_manager &w = get_weather();
+    const bool range = chosen ? range_active() : keep_range_weather();
+    if( chosen ) {
+        w.weather_override = *chosen;
+    } else if( !range ) {
+        w.weather_override = WEATHER_NULL;
+    }
+    if( wind >= 0 ) {
+        w.windspeed_override = wind;
+    } else if( range ) {
+        w.windspeed_override = 0;
+    } else {
+        w.windspeed_override = std::nullopt;
+    }
+    w.set_nextweather( calendar::turn );
+    w.update_weather();
+    return "";
+}
+
 std::string run_range_op( const range_op &op )
 {
     // Out-of-range numbers become -1, which every operation refuses.
@@ -406,6 +472,8 @@ std::string run_range_op( const range_op &op )
             return rebuild_zone( n < 0 ? SIZE_MAX : static_cast<size_t>( n ) );
         case range_op_kind::point_teleport:
             return teleport_to_square( op.square );
+        case range_op_kind::weather:
+            return set_weather( op.weather, op.wind );
     }
     return "No such operation.";
 }
@@ -508,10 +576,15 @@ void publish_cheats( const avatar &u )
             on |= uint32_t{ 1 } << i;
         }
     }
+    const weather_manager &w = get_weather();
+    std::string held = w.weather_override == WEATHER_NULL ? std::string() : w.weather_override.str();
+    const int wind = w.windspeed_override ? std::clamp( *w.windspeed_override, 0, max_cheat_wind ) : -1;
     requests &r = reqs();
     std::lock_guard<std::mutex> lk( r.m );
     r.latest.seq++;
     r.latest.on = on;
     r.latest.kits_given = r.kits_given;
+    r.latest.weather = std::move( held );
+    r.latest.wind = wind;
 }
 } // namespace fp3d

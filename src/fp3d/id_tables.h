@@ -112,6 +112,13 @@ struct vpart_def {
     std::vector<std::string> flags;
 };
 
+// A weather type for the weather cheat's picker (cheats.h): its id and display name (snapshot.h's bounds).
+constexpr size_t max_weather_types = 128;
+struct weather_def {
+    std::string id;
+    std::string name;
+};
+
 struct id_tables {
     uint32_t generation = 0;       // +1 per build; a client drops everything it cached on a change
     std::vector<terrain_def> ter;  // index = CDDA int id (snapshot ter), 0 = t_null
@@ -121,6 +128,7 @@ struct id_tables {
     std::vector<item_def> items;   // index = session itype index (0 = none, empty def)
     std::vector<monster_def> monsters;  // index = session mtype index
     std::vector<vpart_def> vparts;      // index = session vpart index
+    std::vector<weather_def> weathers;  // the loaded weather types but "null", by id; at most max_weather_types
 };
 
 // Sim side, after a world's data is loaded (boot does it): pre-fills the session tables and builds the

@@ -301,7 +301,7 @@ void store_frozen( bool on )
 // first turn of a game clears the sky's override, and do_turn keeps it for a range game (range_active). Each boot
 // makes a new game (and weather), so a later normal game never inherits it. Game thread, once the avatar is on the
 // map.
-void keep_range_weather()
+void hold_range_weather()
 {
     weather_manager &w = get_weather();
     w.forced_temperature = fp3d::range_temperature;
@@ -1206,6 +1206,15 @@ bool range_active()
     return session.load() && g != nullptr && avatar_flag( range_var );
 }
 
+bool keep_range_weather()
+{
+    if( !range_active() ) {
+        return false;
+    }
+    hold_range_weather();
+    return true;
+}
+
 bool range_world( const std::string &world_name )
 {
     // The names boot_new_game_data( "fp3d-range", ..., replace ) gives (replacing_world_name: "-2" .. "-99"), digits
@@ -1620,7 +1629,7 @@ void boot_test_range( unsigned seed )
     build_zone( 0 );
     u.setpos( hub, false );
     settle_avatar();
-    keep_range_weather();
+    hold_range_weather();
     store_frozen( true );
     // As CDDA's debug menu: a game with cheats earns no achievements.
     get_achievements().set_enabled( false );
@@ -1646,7 +1655,7 @@ bool resume_test_range()
     // (what they hold is in the save).
     build_registry();
     store_frozen( saved_frozen() );
-    keep_range_weather();
+    hold_range_weather();
     get_achievements().set_enabled( false );
     size_t built = 0;
     for( const range_zone &z : reg().zones ) {

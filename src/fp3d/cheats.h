@@ -51,9 +51,16 @@ bool request_test_kit();
 // point_teleport is the teleport cheat, in any game while cheats are allowed: the player goes to `square` (absolute
 // map square) in the loaded bubble, or to the nearest free square near it (fp3d/arrival.h); refused while riding or
 // in a vehicle. The first one turns the game's achievements off.
+// weather is the weather cheat, in any game while cheats are allowed: `weather` names a loaded weather type (as the
+// id tables list it, id_tables.h) and the sky holds it; "" gives the weather back to the game (in a range game: its
+// clear sky, test_range.h keep_range_weather). `wind` holds the wind speed (mph, 0..max_cheat_wind); -1 lets the
+// game decide (a range game holds it still). The temperature is never touched. Refused in a world whose weather
+// never changes (CDDA's ETERNAL_WEATHER option). CDDA saves neither: a loaded game decides again.
 enum class range_op_kind : uint8_t {
-    spawn_item, spawn_monster, teleport, time_of_day, advance, ai_frozen, heal, rebuild_zone, point_teleport
+    spawn_item, spawn_monster, teleport, time_of_day, advance, ai_frozen, heal, rebuild_zone, point_teleport, weather
 };
+constexpr size_t max_weather_id = 64;
+constexpr int max_cheat_wind = 100;    // mph, about 45 m/s
 struct range_op {
     range_op_kind kind = range_op_kind::heal;
     uint32_t itype = 0;      // spawn_item: session itype index (id tables)
@@ -61,11 +68,14 @@ struct range_op {
     int64_t number = 0;
     ui_point square;         // spawn_item, spawn_monster, point_teleport
     std::string monster;     // spawn_monster: mtype id
+    std::string weather;     // weather: a weather type id, "" = the game's own
+    int wind = -1;           // weather: mph 0..max_cheat_wind, -1 = the game decides
 };
 constexpr size_t max_range_ops_waiting = 32;
 constexpr size_t max_range_results = 16;
 // Client side: the operation's id (1, 2, ...); 0 when cheats aren't allowed, max_range_ops_waiting already wait,
-// the monster id is longer than test_range.h's max_monster_id, or after shutdown. Disallowing cheats drops what waits.
+// the monster id is longer than test_range.h's max_monster_id or the weather id than max_weather_id, or after
+// shutdown. Disallowing cheats drops what waits.
 uint64_t request_range_op( const range_op &op );
 struct range_op_result {
     uint64_t id = 0;
@@ -80,6 +90,8 @@ struct cheats_view {
     uint64_t seq = 0;              // bumps on every publish; 0 = nothing published yet
     uint32_t on = 0;               // bit i: cheat i is on
     uint64_t kits_given = 0;       // test kits handed out since start
+    std::string weather;           // the weather the sky is held at ("" = the game decides; a range game: "clear")
+    int wind = -1;                 // the wind speed held, mph (-1 = the game decides)
 };
 // Client side.
 cheats_view latest_cheats();
