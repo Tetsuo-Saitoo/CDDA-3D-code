@@ -122,6 +122,9 @@ void reset_test_range();
 // True in a range game (game thread): one boot_test_range started or resume_test_range resumed. The avatar value
 // alone (a save, a mod) doesn't make one.
 bool range_active();
+// In a range game (range_active): its fixed weather again (range_temperature, a clear sky, no wind), as boot and
+// resume set it; true. Anywhere else it does nothing and returns false. Game thread (the weather cheat, cheats.h).
+bool keep_range_weather();
 // Whether `world_name` is a world the range may run in: `fp3d-range` or `fp3d-range-<1 to 9 digits>`, and one of
 // FP3D's own (owned_world: boot's marker file in it). Any thread once boot set the paths.
 bool range_world( const std::string &world_name );

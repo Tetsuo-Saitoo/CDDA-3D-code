@@ -174,6 +174,19 @@ void build_id_tables()
     }
     prefill( id_kind::weather, std::move( ids ) );
     ids.clear();
+    std::vector<weather_def> weathers;
+    for( const weather_type &w : weather_types::get_all() ) {
+        if( w.id != WEATHER_NULL ) {
+            weathers.push_back( { w.id.str(), client_text( w.name.translated(), max_weather_name_columns,
+                                  max_weather_name_columns * 4 ) } );
+        }
+    }
+    std::sort( weathers.begin(), weathers.end(), []( const weather_def & a, const weather_def & b ) {
+        return a.id < b.id;
+    } );
+    if( weathers.size() > max_weather_types ) {
+        weathers.resize( max_weather_types );
+    }
     for( const body_part_type &bp : body_part_type::get_all() ) {
         ids.push_back( bp.id.str() );
     }
@@ -318,6 +331,7 @@ void build_id_tables()
     }
 
     std::lock_guard<std::mutex> lk( tables_mutex );
+    t->weathers = std::move( weathers );
     t->generation = ++generation;
     latest = std::move( t );
 }
@@ -425,6 +439,15 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         jo.member( "looks_like", d.looks_like );
         jo.member( "location", d.location );
         write_strings( jo, "flags", d.flags );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.member( "weather_types" );
+    jo.start_array();
+    for( const weather_def &d : t.weathers ) {
+        jo.start_object();
+        jo.member( "id", d.id );
+        jo.member( "name", d.name );
         jo.end_object();
     }
     jo.end_array();

@@ -77,6 +77,7 @@
 #include "overmap.h"
 #include "overmapbuffer.h"
 #include "path_info.h"
+#include "player_activity.h"
 #include "pocket_type.h"
 #include "rng.h"
 #include "scenario.h"
@@ -254,6 +255,7 @@ std::atomic<int> physics_setup{ 0 };           // 1: the item physics scene; 2: 
 // Weather and mood checks (run_weather_mood_checks): at the next main-loop request the hook 1 = forces a lightning
 // storm, adds two morale entries and sets off CDDA's lightning effect, 2 = takes them back.
 std::atomic<int> weather_mood_setup{ 0 };
+std::atomic<int> weather_wait{ 0 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
 // normal world's save carries them, and after the reload resumes the range as the bridge does after a load. What it
@@ -504,6 +506,21 @@ void set_up_weather_mood( bool on )
     }
 }
 
+// The weather cheat's wait: 20 minutes of CDDA's wait activity at 20 C (so the storm brings no "You are freezing!"
+// question), nothing hostile about; then the world's own temperature again.
+void wait_in_weather( bool start )
+{
+    weather_manager &w = get_weather();
+    if( !start ) {
+        w.forced_temperature.reset();
+        return;
+    }
+    g->clear_zombies();
+    w.forced_temperature = units::from_celsius( 20 );
+    get_avatar().assign_activity( player_activity( activity_id( "ACT_WAIT" ),
+                                  100 * to_turns<int>( 20_minutes ), 0 ) );
+}
+
 void observe()
 {
     // As the client's hook (bridge/src/sim_session.cpp).
@@ -516,6 +533,9 @@ void observe()
     }
     if( const int setup = weather_mood_setup.exchange( 0 ); setup != 0 ) {
         set_up_weather_mood( setup == 1 );
+    }
+    if( const int ww = weather_wait.exchange( 0 ); ww != 0 ) {
+        wait_in_weather( ww == 1 );
     }
     if( const int stage = physics_setup.exchange( 0 ); stage == 1 ) {
         set_up_item_physics();
@@ -4964,6 +4984,128 @@ static bool run_weather_mood_checks()
     return failed == 0;
 }
 
+// The weather cheat (fp3d/cheats.h range_op_kind::weather, 2026-11-13): a lightning storm and a wind chosen by id show
+// in the snapshot and the cheats view, and the flash comes as an event within a bounded wait (CDDA's 1 in 600 a
+// turn while it storms: at most 9 waits of 20 minutes, about 1 in 60 million to see none). Unknown ids, "null", a
+// wind out of range and an over-long id are refused; "" gives the weather back to the world (no range here).
+static bool run_weather_cheat_checks( const std::function<size_t()> &lightning_seen )
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  weather cheat: %-35s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    const auto weather = []( const std::string & id, int wind ) {
+        fp3d::range_op op;
+        op.kind = fp3d::range_op_kind::weather;
+        op.weather = id;
+        op.wind = wind;
+        return op;
+    };
+    check( fp3d::request_range_op( weather( "lightning", -1 ) ) == 0, "refused until cheats are allowed", "" );
+    fp3d::set_cheats_allowed( true );
+    check( fp3d::request_range_op( weather( std::string( fp3d::max_weather_id + 1, 'a' ), -1 ) ) == 0,
+           "an over-long id never queued", "" );
+    // The ops' results in order, once the hook ran them (asking wakes the main loop).
+    const auto run = [&]( const std::vector<fp3d::range_op> &ops ) {
+        std::vector<uint64_t> ids;
+        for( const fp3d::range_op &op : ops ) {
+            ids.push_back( fp3d::request_range_op( op ) );
+        }
+        std::vector<std::string> got;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 20000 ) {
+            got.clear();
+            const std::vector<fp3d::range_op_result> res = fp3d::latest_range_results();
+            for( const uint64_t id : ids ) {
+                for( const fp3d::range_op_result &x : res ) {
+                    if( id != 0 && x.id == id ) {
+                        got.push_back( x.error );
+                        break;
+                    }
+                }
+            }
+            if( got.size() == ids.size() ) {
+                break;
+            }
+            if( std::optional<fp3d::ui_request> next = fp3d::wait_request( 100, r->id ) ) {
+                r = next;
+            }
+        }
+        got.resize( ids.size(), "(no result)" );
+        return got;
+    };
+    // Turns pass until the main loop asks again; a question instead is cancelled and fails.
+    const auto pass = [&]( double ms ) {
+        const uint64_t before = r->id;
+        fp3d::queue_action( "pause" );
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < ms ) {
+            if( std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id ) ) {
+                r = next;
+                if( !r->timed ) {
+                    std::printf( "    question: %s %s\n", r->title.c_str(), r->text.c_str() );
+                    fp3d::ui_answer a;
+                    a.id = r->id;
+                    a.cancel = true;
+                    fp3d::answer( a );
+                    return false;
+                }
+                if( r->id != before ) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    std::vector<std::string> got = run( { weather( "fp3d_no_such_weather", -1 ), weather( "null", -1 ),
+                                          weather( "lightning", fp3d::max_cheat_wind + 1 ), weather( "lightning", -2 ),
+                                          weather( "lightning", 10 )
+                                        } );
+    check( got[0] == "No such weather." && got[1] == "No such weather.", "unknown ids and \"null\" refused",
+           got[0] + " | " + got[1] );
+    check( got[2] == "No such wind." && got[3] == "No such wind.", "a wind out of range refused",
+           got[2] + " | " + got[3] );
+    check( got[4].empty(), "a lightning storm, wind 10 mph", got[4] );
+    check( pass( 20000 ), "a turn passes", "" );
+    std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+    fp3d::cheats_view v = fp3d::latest_cheats();
+    check( s && s->env.weather_id == "lightning" && std::fabs( s->env.wind_speed - 10 * 0.44704f ) < 0.01f &&
+           v.weather == "lightning" && v.wind == 10, "in the snapshot and the cheats view",
+           ( s ? s->env.weather_id + ", " + std::to_string( s->env.wind_speed ) + " m/s" : std::string() ) +
+           "; cheats " + v.weather + ", " + std::to_string( v.wind ) );
+    // The flash: waits of 20 minutes (CDDA's wait activity, so turns pass quickly) until one comes.
+    const size_t before = lightning_seen();
+    size_t flashes = 0;
+    int waits = 0;
+    bool waited = true;
+    while( flashes == 0 && waits < 9 && waited ) {
+        waits++;
+        weather_wait.store( 1 );
+        waited = pass( 20000 ) && weather_wait.load() == 0 && pass( 180000 );
+        flashes = lightning_seen() - before;
+    }
+    check( waited && flashes > 0, "a flash comes as an event", std::to_string( flashes ) + " flashes in " +
+           std::to_string( waits ) + " waits of 20 minutes" );
+    weather_wait.store( 2 );
+    check( pass( 20000 ) && weather_wait.load() == 0, "the world's temperature again", "" );
+    got = run( { weather( "", -1 ) } );
+    check( got[0].empty(), "back to the world's weather", got[0] );
+    check( pass( 20000 ), "a turn passes", "" );
+    s = fp3d::latest_snapshot();
+    v = fp3d::latest_cheats();
+    check( s && s->env.weather_id != "lightning" && !s->env.weather_id.empty() && v.weather.empty() && v.wind == -1,
+           "the world decides again", ( s ? s->env.weather_id : std::string() ) + "; cheats [" + v.weather + "], " +
+           std::to_string( v.wind ) );
+    fp3d::set_cheats_allowed( false );
+    return failed == 0;
+}
+
 // A saved range game resumes only in a range world (fp3d/test_range.h resume_test_range, 2026-11-10): this normal
 // world's save carries the range's avatar values (mark_as_range), and resumed after the reload as the bridge does, it
 // stays a normal game: no range, no zones, AI not frozen.
@@ -5636,6 +5778,10 @@ int main()
     const bool throw_pour_ok = range_ok && run_throw_pour_checks();
     const bool physics_ok = throw_pour_ok && run_item_physics_checks();
     const bool weather_checks_ok = physics_ok && run_weather_mood_checks();
+    const bool weather_cheat_ok = weather_checks_ok && run_weather_cheat_checks( [&]() {
+        drain();
+        return event_counts[static_cast<size_t>( fp3d::event_kind::lightning )];
+    } );
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -5686,6 +5832,7 @@ int main()
     std::printf( "range resume: %s\n", resume_ok ? "ok" : "BAD" );
     std::printf( "throw/pour: %s\n", throw_pour_ok ? "ok" : "BAD" );
     std::printf( "item physics: %s\n", physics_ok ? "ok" : "BAD" );
+    std::printf( "weather cheat: %s\n", weather_cheat_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -5696,6 +5843,6 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }
