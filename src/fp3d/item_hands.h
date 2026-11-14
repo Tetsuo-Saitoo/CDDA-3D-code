@@ -20,7 +20,13 @@
 // carries the same uid; the snapshot gives the second one listed a new uid. A uid alone is never trusted: actions
 // also check the square (or that the avatar carries it) and the itype.
 // Spot: `fp3d_spot` = "x,y" in permille of the square, set when the client places an item; erased when the item
-// is picked up. Vars come from saves, which are hostile input like the client: both are parsed strictly.
+// is picked up. Pose: `fp3d_pose` = "yaw,side" (whole degrees 0..359, 0 or 1), only next to a spot: how the client's
+// physics left the item lying. Vars come from saves, which are hostile input like the client: all are parsed strictly.
+//
+// Three actions are for a client that simulates lying items (VR item physics): `place` moves a lying item one
+// square, `spot` stores how it rests, both without time; `hold` takes a carried item into a hand. Free actions are
+// bounded per turn (max_free_item_ops, one move per item) and reach no further than physics_reach from the avatar.
+// An action with a tag is answered by an `item_result` event (events.h).
 
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +51,12 @@ uint64_t item_handle( item &it, std::unordered_set<uint64_t> *seen = nullptr );
 uint64_t read_item_handle( const item &it );
 // The spot the client placed the item on (permille), false if none or malformed.
 bool item_spot( const item &it, uint16_t &x, uint16_t &y );
+// How the item lies on its spot (yaw in whole degrees), false if none, malformed or without a spot.
+bool item_pose( const item &it, uint16_t &yaw, bool &side );
+// place, spot: how far from the avatar's square the item may lie (squares, same level).
+constexpr int physics_reach = 2;
+// place, spot: how many run in one turn (they cost no time); more are refused until the next turn.
+constexpr int max_free_item_ops = 16;
 
 void register_item_actions( input_context &ctxt );
 bool is_item_action( const std::string &action );

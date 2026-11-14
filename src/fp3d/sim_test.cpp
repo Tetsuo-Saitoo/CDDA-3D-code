@@ -63,6 +63,7 @@
 #include "fp3d/swing.h"
 #include "game.h"
 #include "game_constants.h"
+#include "inventory.h"
 #include "item.h"
 #include "line.h"
 #include "math_parser_diag_value.h"
@@ -116,7 +117,11 @@ const itype_id itype_remington_870( "remington_870" );
 const itype_id itype_scar_l( "scar_l" );
 const itype_id itype_backpack_giant( "backpack_giant" );
 const itype_id itype_pebble( "pebble" );
+const itype_id itype_rock_large( "rock_large" );
+const itype_id itype_v8_combustion( "v8_combustion" );
+const ter_str_id ter_t_dirt( "t_dirt" );
 const itype_id itype_bottle_twoliter( "bottle_twoliter" );
+const ter_str_id ter_t_open_air( "t_open_air" );
 const ter_str_id ter_t_water_sh( "t_water_sh" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
@@ -245,6 +250,9 @@ std::array<std::atomic<uint64_t>, 5> pt_ids{};   // this round's teleports in or
 std::atomic<int> pt_ended_ok{ -1 };              // 1 = where the last round should have left the player
 std::optional<tripoint_abs_ms> pt_expected;      // sim thread only: where this round should leave the player
 std::optional<tripoint_abs_ms> pt_blood;         // sim thread only: the square round 2 bloodied
+
+// Item physics checks (run_item_physics_checks): at the next main-loop request the hook builds their scene.
+std::atomic<int> physics_setup{ 0 };           // 1: the item physics scene; 2: a pot of water in the main hand
 
 // Weather and mood checks (run_weather_mood_checks): at the next main-loop request the hook 1 = forces a lightning
 // storm, adds two morale entries and sets off CDDA's lightning effect, 2 = takes them back.
@@ -421,6 +429,64 @@ void set_up_point_teleports( int round )
     }
 }
 
+// Flat open ground nine squares wide with nothing lying on it; two rocks one square east, an engine (too heavy to
+// lift) one square south, a wall north-east, open air two east and one north; the avatar empty-handed, wearing only
+// a giant backpack with a plastic bottle, a pot, a two-liter bottle of water (rocks would merge into one stack: they
+// count by charges) and a large rock
+// (two-handed) in it (what earlier checks left it with is gone: the snapshot lists 256 carried items at most), and
+// seeing in the dark.
+void set_up_item_physics()
+{
+    avatar &u = get_avatar();
+    map &here = get_map();
+    const tripoint_bub_ms p = u.pos_bub();
+    g->clear_zombies();
+    for( int dx = -4; dx <= 4; dx++ ) {
+        for( int dy = -4; dy <= 4; dy++ ) {
+            const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+            here.i_clear( q );
+            here.furn_set( q, furn_str_id::NULL_ID() );
+            here.ter_set( q, ter_t_dirt );
+        }
+    }
+    here.ter_set( p + tripoint_rel_ms( 1, -1, 0 ), ter_t_wall );
+    here.ter_set( p + tripoint_rel_ms( 2, -1, 0 ), ter_t_open_air );
+    here.add_item( p + tripoint_rel_ms( 1, 0, 0 ), item( itype_rock ) );
+    here.add_item( p + tripoint_rel_ms( 1, 0, 0 ), item( itype_rock ) );
+    here.add_item( p + tripoint_rel_ms( 0, 1, 0 ), item( itype_v8_combustion ) );
+    here.invalidate_map_cache( p.z() );
+    here.build_map_cache( p.z() );
+    u.remove_weapon();
+    u.clear_worn();
+    u.inv->clear();
+    if( !u.has_trait( trait_DEBUG_NIGHTVISION ) ) {
+        u.set_mutation( trait_DEBUG_NIGHTVISION );
+    }
+    u.wear_item( item( itype_backpack_giant ), false );
+    u.i_add( item( itype_bottle_plastic ) );
+    u.i_add( item( itype_pot ) );
+    item water_bottle( itype_bottle_twoliter );
+    water_bottle.put_in( item( itype_water, calendar::turn, 2 ), pocket_type::CONTAINER );
+    u.i_add( water_bottle );
+    u.i_add( item( itype_rock_large ) );
+    u.set_moves( u.get_speed() );
+}
+
+// The last item physics checks: what the main hand holds put away, a pot of water in it instead.
+void wield_water_pot()
+{
+    avatar &u = get_avatar();
+    if( item_location held = u.get_wielded_item() ) {
+        item copy = *held;
+        u.remove_weapon();
+        u.i_add( copy );
+    }
+    item water_pot( itype_pot );
+    water_pot.put_in( item( itype_water, calendar::turn, 4 ), pocket_type::CONTAINER );
+    u.wield( water_pot );
+    u.set_moves( u.get_speed() );
+}
+
 void set_up_weather_mood( bool on )
 {
     avatar &u = get_avatar();
@@ -453,6 +519,11 @@ void observe()
     }
     if( const int setup = weather_mood_setup.exchange( 0 ); setup != 0 ) {
         set_up_weather_mood( setup == 1 );
+    }
+    if( const int stage = physics_setup.exchange( 0 ); stage == 1 ) {
+        set_up_item_physics();
+    } else if( stage == 2 ) {
+        wield_water_pot();
     }
     const avatar &u = get_avatar();
     map &here = get_map();
@@ -4620,6 +4691,375 @@ static bool run_point_teleport_checks()
     return failed == 0;
 }
 
+// The item actions for a client that simulates lying items (fp3d/item_hands.h, 2026-11-12): `place` moves a lying
+// item one square without time, `spot` stores how it rests, `hold` takes a carried item into a hand; a tag on any
+// item action brings an `item_result` event. Everything the client names is checked: reach, the next square only,
+// what the square takes, weight, once a turn per item, a cap per turn, a full hand never emptied.
+static bool run_item_physics_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  item physics: %-44s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct result {
+        bool queued = false;
+        bool back = false;        // in the main loop again
+        int spent = 0;            // moves
+        int answers = 0;          // item_result events for the action's tag
+        bool done = false;
+        uint64_t uid = 0;         // the result's item
+        std::string why;          // the result's text
+        std::string msg;          // the last message
+    };
+    uint32_t next_tag = 100;
+    const auto run = [&]( fp3d::item_action ia ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            return res;
+        }
+        const observed o0 = snapshot();
+        fp3d::drain_events( evs );
+        evs.clear();
+        ia.tag = ++next_tag;
+        res.queued = fp3d::queue_item_action( ia );
+        if( !res.queued ) {
+            return res;
+        }
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 40000, r0->id );
+        fp3d::drain_events( evs );
+        const observed o1 = snapshot();
+        res.back = r1 && r1->timed;
+        res.spent = static_cast<int>( o1.turn - o0.turn ) * o0.speed + o0.moves - o1.moves;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msg = e.text;
+            } else if( e.kind == fp3d::event_kind::item_result && e.detail == ia.tag ) {
+                res.answers++;
+                res.done = e.amount == 1;
+                res.uid = e.uid;
+                res.why = e.text;
+            }
+        }
+        return res;
+    };
+    // One answer for the item; done or refused with exactly this reason; no time either way when `free`.
+    const auto went = []( const result & r, uint64_t uid ) {
+        return r.queued && r.back && r.answers == 1 && r.uid == uid && r.done && r.why.empty();
+    };
+    const auto refused = []( const result & r, uint64_t uid, const char *why ) {
+        return r.queued && r.back && r.answers == 1 && r.uid == uid && !r.done &&
+               r.why.find( why ) != std::string::npos;
+    };
+    const auto show = []( const result & r ) {
+        return std::string( r.queued ? "" : "not queued " ) + ( r.done ? "done" : "refused" ) + " [" + r.why +
+               "] msg [" + r.msg + "] " + std::to_string( r.spent ) + " moves, " + std::to_string( r.answers ) +
+               " answers";
+    };
+    const auto type_of = []( const char *id ) {
+        return fp3d::intern_id( fp3d::id_kind::itype, id );
+    };
+    const auto on = []( const fp3d::ui_point & p, uint64_t uid ) {
+        for( const fp3d::item_handle_view &h : handles_at( p ) ) {
+            if( h.uid == uid ) {
+                return h;
+            }
+        }
+        return fp3d::item_handle_view();
+    };
+    const auto carried = []( uint64_t uid ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.uid == uid ) {
+                return c;
+            }
+        }
+        return fp3d::carried_view();
+    };
+    // What the snapshot lists as carried: "type:flags" each, for a failed check's detail.
+    const auto carried_list = []() {
+        const std::vector<fp3d::carried_view> all = carried_now();
+        std::string out = std::to_string( all.size() ) + " carried:";
+        for( size_t i = 0; i < all.size() && i < 16; i++ ) {
+            out += " " + fp3d::id_name( fp3d::id_kind::itype, all[i].type ) + ":" + std::to_string( all[i].flags );
+        }
+        return out;
+    };
+    const auto pass_turn = []() {
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            return false;
+        }
+        fp3d::queue_action( "pause" );
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 20000, r0->id );
+        return r1 && r1->timed;
+    };
+
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    physics_setup.store( 1 );
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 || physics_setup.load() != 0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    const fp3d::ui_point east{ here.x + 1, here.y, here.z };
+    const fp3d::ui_point east2{ here.x + 2, here.y, here.z };
+    const fp3d::ui_point east3{ here.x + 3, here.y, here.z };
+    const fp3d::ui_point south{ here.x, here.y + 1, here.z };
+    const fp3d::ui_point wall{ here.x + 1, here.y - 1, here.z };
+    const uint32_t t_rock = type_of( "rock" );
+    const uint32_t t_engine = type_of( "v8_combustion" );
+    const std::vector<fp3d::item_handle_view> lying = handles_at( east );
+    const std::vector<fp3d::item_handle_view> heavy = handles_at( south );
+    if( lying.size() != 2 || lying[0].type != t_rock || lying[1].type != t_rock || heavy.size() != 1 ||
+        heavy[0].type != t_engine ) {
+        check( false, "scene: two rocks east, an engine south", std::to_string( lying.size() ) + " east, " +
+               std::to_string( heavy.size() ) + " south" );
+        return false;
+    }
+    const uint64_t rock_a = lying[0].uid;
+    const uint64_t rock_b = lying[1].uid;
+    const auto action = [&]( fp3d::item_op op, uint64_t uid, uint32_t type, const fp3d::ui_point & pos ) {
+        fp3d::item_action a;
+        a.op = op;
+        a.item = { uid, type };
+        a.pos = pos;
+        return a;
+    };
+    const auto with_spot = []( fp3d::item_action a, uint16_t x, uint16_t y ) {
+        a.has_spot = true;
+        a.spot_x = x;
+        a.spot_y = y;
+        return a;
+    };
+    const auto with_pose = []( fp3d::item_action a, uint16_t yaw, bool side ) {
+        a.has_pose = true;
+        a.yaw = yaw;
+        a.side = side;
+        return a;
+    };
+    const auto place = [&]( uint64_t uid, uint32_t type, const fp3d::ui_point & from, const fp3d::ui_point & to ) {
+        fp3d::item_action a = action( fp3d::item_op::place, uid, type, from );
+        a.to = to;
+        return a;
+    };
+
+    // What the bridge refuses before anything is queued.
+    {
+        const fp3d::item_action ok = with_spot( action( fp3d::item_op::spot, rock_b, t_rock, east ), 1, 2 );
+        fp3d::item_action no_spot = ok;
+        no_spot.has_spot = false;
+        fp3d::item_action pose_alone = action( fp3d::item_op::place, rock_a, t_rock, east );
+        pose_alone.to = east2;
+        pose_alone.has_pose = true;
+        fp3d::item_action yaw_big = with_pose( ok, 360, false );
+        fp3d::item_action tag_big = ok;
+        tag_big.tag = fp3d::max_item_tag + 1u;
+        fp3d::item_action to_far = place( rock_a, t_rock, east, east2 );
+        to_far.to.x = 1 << 29;
+        fp3d::item_action pack = action( fp3d::item_op::hold, rock_a, t_rock, here );
+        fp3d::item_action no_op = ok;
+        no_op.op = static_cast<fp3d::item_op>( 11 );
+        check( !fp3d::queue_item_action( no_spot ) && !fp3d::queue_item_action( pose_alone ) &&
+               !fp3d::queue_item_action( yaw_big ) && !fp3d::queue_item_action( tag_big ) &&
+               !fp3d::queue_item_action( to_far ) && !fp3d::queue_item_action( pack ) &&
+               !fp3d::queue_item_action( no_op ), "malformed place, spot and hold never queued", "" );
+    }
+
+    // place: one square, no time, the spot and pose stored; once a turn for an item.
+    result res = run( with_pose( with_spot( place( rock_a, t_rock, east, east2 ), 250, 750 ), 90, true ) );
+    fp3d::item_handle_view h = on( east2, rock_a );
+    check( went( res, rock_a ) && res.spent == 0 && res.msg.empty() && h.uid == rock_a && h.spot_x == 250 &&
+           h.spot_y == 750 && h.yaw == 90 && h.side && on( east, rock_a ).uid == 0,
+           "place: to the next square, no time, no message", show( res ) + ", yaw " + std::to_string( h.yaw ) );
+    {
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        std::ostringstream json;
+        fp3d::write_snapshot_json( json, *s, here.z, here.z );
+        check( json.str().find( "\"poses\":[[" + std::to_string( rock_a ) + ",90,1]]" ) != std::string::npos,
+               "place: the pose in the snapshot JSON", "" );
+    }
+    res = run( place( rock_a, t_rock, east2, east ) );
+    check( refused( res, rock_a, "moved a moment ago" ) && res.spent == 0 && res.msg.empty() &&
+           on( east2, rock_a ).uid == rock_a, "place: an item moves once a turn", show( res ) );
+    // The next turn: on to a square three away (it rolled off), with no spot: the old one is forgotten. From
+    // there the client's physics can't have touched it any more.
+    check( pass_turn(), "a turn passes", "" );
+    res = run( place( rock_a, t_rock, east2, east3 ) );
+    h = on( east3, rock_a );
+    check( went( res, rock_a ) && h.uid == rock_a && h.spot_x == -1 && h.yaw == -1 && !h.side,
+           "place: on without a spot, the old one forgotten", show( res ) );
+    check( pass_turn(), "a turn passes", "" );
+    res = run( place( rock_a, t_rock, east3, east2 ) );
+    const result far_spot = run( with_spot( action( fp3d::item_op::spot, rock_a, t_rock, east3 ), 5, 5 ) );
+    check( refused( res, rock_a, "out of reach" ) && refused( far_spot, rock_a, "out of reach" ) &&
+           on( east3, rock_a ).uid == rock_a && on( east3, rock_a ).spot_x == -1,
+           "place and spot: nothing three squares away", show( res ) + " / " + show( far_spot ) );
+
+    // place refusals: not the next square, another level, a wall, an engine, a handle of the wrong type.
+    const result skip = run( place( rock_b, t_rock, east, east3 ) );
+    const result same = run( place( rock_b, t_rock, east, east ) );
+    fp3d::ui_point up = east2;
+    up.z += 1;
+    const result level = run( place( rock_b, t_rock, east, up ) );
+    check( refused( skip, rock_b, "next square" ) && refused( same, rock_b, "next square" ) &&
+           refused( level, rock_b, "next square" ) && on( east, rock_b ).uid == rock_b,
+           "place: only to the next square on its level", show( skip ) + " / " + show( same ) + " / " + show( level ) );
+    res = run( place( rock_b, t_rock, east, wall ) );
+    const fp3d::ui_point air{ here.x + 2, here.y - 1, here.z };
+    const result edge = run( place( rock_b, t_rock, east, air ) );
+    check( refused( res, rock_b, "can't go there" ) && refused( edge, rock_b, "can't go there" ) &&
+           on( east, rock_b ).uid == rock_b && handles_at( wall ).empty() && handles_at( air ).empty(),
+           "place: not into a wall, not over an edge", show( res ) + " / " + show( edge ) );
+    res = run( place( heavy[0].uid, t_engine, south, fp3d::ui_point{ here.x + 1, here.y + 1, here.z } ) );
+    check( refused( res, heavy[0].uid, "can't be moved" ) && on( south, heavy[0].uid ).uid == heavy[0].uid,
+           "place: not what the avatar couldn't lift", show( res ) );
+    res = run( place( rock_b, t_engine, east, east2 ) );
+    const result gone = run( place( rock_b, t_rock, east2, east ) );
+    check( refused( res, rock_b, "isn't there" ) && refused( gone, rock_b, "isn't there" ) &&
+           on( east, rock_b ).uid == rock_b, "place: the item by uid, type and square", show( res ) + " / " +
+           show( gone ) );
+
+    // spot: how it rests, in place; without a pose the old pose goes.
+    res = run( with_pose( with_spot( action( fp3d::item_op::spot, rock_b, t_rock, east ), 10, 20 ), 359, false ) );
+    h = on( east, rock_b );
+    check( went( res, rock_b ) && res.spent == 0 && res.msg.empty() && h.spot_x == 10 && h.spot_y == 20 &&
+           h.yaw == 359 && !h.side, "spot: stored in place, no time", show( res ) );
+    res = run( with_spot( action( fp3d::item_op::spot, rock_b, t_rock, east ), 30, 40 ) );
+    h = on( east, rock_b );
+    check( went( res, rock_b ) && h.spot_x == 30 && h.spot_y == 40 && h.yaw == -1,
+           "spot: a new spot without a pose forgets the pose", show( res ) );
+
+    // The cap: max_free_item_ops free actions in one turn, the next one refused; a new turn starts over.
+    check( pass_turn(), "a turn passes", "" );
+    int in_turn = 0;
+    for( int i = 0; i < fp3d::max_free_item_ops; i++ ) {
+        res = run( with_spot( action( fp3d::item_op::spot, rock_b, t_rock, east ), static_cast<uint16_t>( i ), 0 ) );
+        in_turn += went( res, rock_b ) && res.spent == 0 ? 1 : 0;
+    }
+    res = run( with_spot( action( fp3d::item_op::spot, rock_b, t_rock, east ), 500, 500 ) );
+    h = on( east, rock_b );
+    check( in_turn == fp3d::max_free_item_ops && refused( res, rock_b, "Too many" ) &&
+           h.spot_x == fp3d::max_free_item_ops - 1, "free actions: 16 a turn, the 17th refused",
+           std::to_string( in_turn ) + " done, then " + show( res ) );
+    check( pass_turn(), "a turn passes", "" );
+    res = run( with_spot( action( fp3d::item_op::spot, rock_b, t_rock, east ), 500, 500 ) );
+    check( went( res, rock_b ) && on( east, rock_b ).spot_x == 500, "free actions: the next turn starts over",
+           show( res ) );
+
+    // A tag on an ordinary action: done when it took its time, refused with the message's words.
+    res = run( action( fp3d::item_op::take, rock_b, t_rock, east ) );
+    check( went( res, rock_b ) && res.spent > 0 && carried( rock_b ).uid == rock_b, "tag: a take that went through",
+           show( res ) + ", " + carried_list() );
+    res = run( action( fp3d::item_op::take, rock_b, t_rock, east ) );
+    check( refused( res, rock_b, "isn't there any more" ) && res.why == res.msg && res.spent == 0,
+           "tag: a refused take says why, as its message", show( res ) );
+
+    // hold: carried things into the hands; a full hand refuses, nothing is put away.
+    const uint32_t t_big = type_of( "rock_large" );
+    const uint32_t t_pack = type_of( "backpack_giant" );
+    const uint32_t kinds[3] = { type_of( "bottle_plastic" ), type_of( "pot" ), type_of( "bottle_twoliter" ) };
+    uint64_t things[3] = { 0, 0, 0 };
+    uint64_t big = 0;
+    uint64_t pack = 0;
+    for( const fp3d::carried_view &c : carried_now() ) {
+        for( size_t i = 0; i < 3; i++ ) {
+            if( c.type == kinds[i] && ( c.flags & 7 ) == 0 ) {
+                things[i] = c.uid;
+            }
+        }
+        if( c.type == t_big ) {
+            big = c.uid;
+        } else if( c.type == t_pack && ( c.flags & fp3d::carried_worn ) != 0 ) {
+            pack = c.uid;
+        }
+    }
+    if( things[0] == 0 || things[1] == 0 || things[2] == 0 || big == 0 || pack == 0 ) {
+        check( false, "hold: a bottle, a pot, a big bottle, a large rock and the backpack carried", carried_list() );
+        return false;
+    }
+    const auto hold = [&]( uint64_t uid, uint32_t type, fp3d::item_hand hand ) {
+        fp3d::item_action a = action( fp3d::item_op::hold, uid, type, fp3d::ui_point{} );
+        a.hand = hand;
+        return run( a );
+    };
+    const auto flags = [&]( uint64_t uid ) {
+        return static_cast<int>( carried( uid ).flags );
+    };
+    using fp3d::item_hand;
+    res = hold( things[0], kinds[0], item_hand::main );
+    check( went( res, things[0] ) && res.spent > 0 && flags( things[0] ) == fp3d::carried_wielded,
+           "hold: a carried bottle into the main hand", show( res ) );
+    const result again = hold( things[0], kinds[0], item_hand::main );
+    const result full = hold( things[1], kinds[1], item_hand::main );
+    check( refused( again, things[0], "already holding" ) && refused( full, things[1], "hand is full" ) &&
+           again.spent == 0 && full.spent == 0 && flags( things[0] ) == fp3d::carried_wielded &&
+           flags( things[1] ) == 0, "hold: a full main hand refuses", show( again ) + " / " + show( full ) );
+    res = hold( things[1], kinds[1], item_hand::off );
+    check( went( res, things[1] ) && res.spent > 0 && flags( things[1] ) == fp3d::carried_offhand,
+           "hold: the pot into the off hand", show( res ) );
+    const result off_full = hold( things[2], kinds[2], item_hand::off );
+    const result swap = hold( things[0], kinds[0], item_hand::off );
+    const result swap2 = hold( things[1], kinds[1], item_hand::main );
+    check( refused( off_full, things[2], "other hand is full" ) && refused( swap, things[0], "other hand is full" ) &&
+           refused( swap2, things[1], "hand is full" ) && flags( things[0] ) == fp3d::carried_wielded &&
+           flags( things[1] ) == fp3d::carried_offhand && flags( things[2] ) == 0,
+           "hold: full hands refuse, nothing put away", show( off_full ) + " / " + show( swap ) + " / " + show( swap2 ) );
+    const result worn = hold( pack, t_pack, item_hand::main );
+    const result two = hold( big, t_big, item_hand::off );
+    check( refused( worn, pack, "Take off" ) && worn.why.find( "<color" ) == std::string::npos &&
+           refused( two, big, "too heavy to hold in one hand" ) &&
+           ( flags( pack ) & fp3d::carried_worn ) != 0, "hold: not a worn item, not a two-handed one in one hand",
+           show( worn ) + " / " + show( two ) );
+    // Hand over: the off hand's pot is put down, the main hand's bottle goes to the off hand and back.
+    res = run( action( fp3d::item_op::drop, things[1], kinds[1], east ) );
+    check( went( res, things[1] ) && on( east, things[1] ).uid == things[1], "hold: the off hand's pot put down",
+           show( res ) );
+    res = hold( things[0], kinds[0], item_hand::off );
+    check( went( res, things[0] ) && res.spent > 0 && flags( things[0] ) == fp3d::carried_offhand,
+           "hold: from the main hand to the off hand", show( res ) + ", flags " + std::to_string( flags( things[0] ) ) );
+    // Both hands for a two-handed item: what the off hand holds isn't put away for it.
+    res = hold( big, t_big, item_hand::main );
+    check( refused( res, big, "both hands" ) && flags( big ) == 0 && flags( things[0] ) == fp3d::carried_offhand,
+           "hold: a two-handed item needs the off hand free", show( res ) );
+    res = hold( things[0], kinds[0], item_hand::main );
+    check( went( res, things[0] ) && res.spent > 0 && flags( things[0] ) == fp3d::carried_wielded,
+           "hold: from the off hand to the main hand", show( res ) + ", flags " + std::to_string( flags( things[0] ) ) );
+    res = hold( 4242, t_rock, item_hand::main );
+    check( refused( res, 4242, "don't have that" ), "hold: only what is carried", show( res ) );
+    // Not the water out of its bottle, in either hand.
+    const uint32_t t_water = type_of( "water" );
+    uint64_t water = 0;
+    for( const fp3d::carried_view &c : carried_now() ) {
+        water = c.type == t_water ? c.uid : water;
+    }
+    const result sip = hold( water, t_water, item_hand::main );
+    const result sip2 = hold( water, t_water, item_hand::off );
+    check( water != 0 && refused( sip, water, "can't hold" ) && refused( sip2, water, "can't hold" ) &&
+           carried( water ).uid == water && sip.spent == 0, "hold: not a liquid out of its container",
+           show( sip ) + " / " + show( sip2 ) + ", " + carried_list() );
+    // A pot of water in the main hand stays there: it would spill on its way to a pocket.
+    physics_setup.store( 2 );
+    check( pass_turn() && physics_setup.load() == 0, "a pot of water in the main hand", "" );
+    const uint32_t t_pot = type_of( "pot" );
+    uint64_t pot = 0;
+    for( const fp3d::carried_view &c : carried_now() ) {
+        pot = c.type == t_pot && c.flags == fp3d::carried_wielded ? c.uid : pot;
+    }
+    res = hold( pot, t_pot, item_hand::off );
+    check( pot != 0 && refused( res, pot, "would spill" ) && res.spent == 0 && flags( pot ) == fp3d::carried_wielded,
+           "hold: an open pot of water stays in the main hand", show( res ) + ", " + carried_list() );
+    return failed == 0;
+}
+
 // Weather and mood in the live snapshot (contracts/snapshot.md `env` and `player.mood`, 2026-11-12): a forced
 // lightning storm and two morale entries show in the snapshot published with the request they were set up at; the
 // flash itself comes as an event (counted with the others at the end).
@@ -4850,7 +5290,7 @@ static bool run_gun_item_checks()
     fp3d::item_action unload_big = ul;
     unload_big.item.uid = fp3d::max_item_uid + 1;
     fp3d::item_action bad_op = ul;
-    bad_op.op = static_cast<fp3d::item_op>( 8 );
+    bad_op.op = static_cast<fp3d::item_op>( 11 );
     fp3d::item_action bad_hand = ul;
     bad_hand.hand = static_cast<fp3d::item_hand>( 3 );
     check( !fp3d::queue_item_action( no_ammo ) && !fp3d::queue_item_action( ammo_big ) &&
@@ -5115,7 +5555,7 @@ static bool run_throw_pour_checks()
     fp3d::item_action pour_untyped = po;
     pour_untyped.item.type = 0;
     fp3d::item_action bad_op = th;
-    bad_op.op = static_cast<fp3d::item_op>( 8 );
+    bad_op.op = static_cast<fp3d::item_op>( 11 );
     check( !fp3d::queue_item_action( throw_untyped ) && !fp3d::queue_item_action( throw_far ) &&
            !fp3d::queue_item_action( pour_both ) && !fp3d::queue_item_action( pour_half_ref ) &&
            !fp3d::queue_item_action( pour_pocket_no_container ) && !fp3d::queue_item_action( pour_pocket_big ) &&
@@ -5369,7 +5809,8 @@ int main()
     const bool combat_ok = guns_ok && run_combat_checks();
     const bool range_ok = combat_ok && run_range_op_checks() && run_point_teleport_checks();
     const bool throw_pour_ok = range_ok && run_throw_pour_checks();
-    const bool weather_checks_ok = throw_pour_ok && run_weather_mood_checks();
+    const bool physics_ok = throw_pour_ok && run_item_physics_checks();
+    const bool weather_checks_ok = physics_ok && run_weather_mood_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -5419,6 +5860,7 @@ int main()
     std::printf( "range ops: %s\n", range_ok ? "ok" : "BAD" );
     std::printf( "range resume: %s\n", resume_ok ? "ok" : "BAD" );
     std::printf( "throw/pour: %s\n", throw_pour_ok ? "ok" : "BAD" );
+    std::printf( "item physics: %s\n", physics_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -5429,6 +5871,6 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

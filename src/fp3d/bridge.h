@@ -207,7 +207,14 @@ size_t queued_actions();
 // or into the container `container` (carried or on the avatar's square or one next to it, found by handle there;
 // `pocket` as for put; as much as fits, the rest stays). With `container` set, `pos` stays at (0, 0, 0) (not sent);
 // without it, `pocket` stays -1. hand isn't used.
-enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour };
+// place: the client's physics moved the lying item `item` from the square `pos` onto the square `to` next to it
+// (it rolled or was knocked there): no time spent, CDDA's rules for what a square takes; the item must lie near the
+// avatar (item_hands.h physics_reach) on a square it sees, and be one the avatar could lift. An item moves once a
+// turn. `spot` and the pose are stored when given, forgotten otherwise.
+// spot: only how the lying item `item` rests on its square `pos` changes (`spot` required, the pose with it).
+// hold: the carried item `item` goes into the main hand (CDDA's wield and its cost) or the off hand (held.h), `hand`
+// main or off; refused for a worn item or a hand that holds something else: nothing is ever put away to make room.
+enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold };
 // take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
 // fit), wielded, the off hand.
 enum class item_hand : uint8_t { pack, main, off };
@@ -230,11 +237,21 @@ struct item_action {
     // empty (uid 0, type 0) to pour onto `pos`.
     item_ref container;
     int pocket = -1;                     // put, pour: index into the container's pockets; -1 = CDDA's best pocket
-    bool has_spot = false;               // drop: keep where on the square it was placed
+    bool has_spot = false;               // drop, place, spot: keep where on the square it was placed
     uint16_t spot_x = 0;                 // permille of the square, east
     uint16_t spot_y = 0;                 // permille of the square, south
+    ui_point to;                         // place: the square the item comes to rest on
+    // drop, place, spot, only with a spot: how the item lies there, as the client's physics left it. Stored and
+    // given back in the snapshot; the sim never reads a meaning into it.
+    bool has_pose = false;
+    uint16_t yaw = 0;                    // whole degrees, 0 .. max_item_yaw
+    bool side = false;                   // lies on its side
+    // 0 = none. Else the client's own number for this action: an `item_result` event (events.h) says how it went.
+    uint32_t tag = 0;
 };
 constexpr int max_item_pocket = 255;
+constexpr uint16_t max_item_yaw = 359;
+constexpr uint32_t max_item_tag = INT32_MAX;
 // Client side. False if a field is out of range, a pour names no target or two (container and pos), or the queue
 // is full.
 bool queue_item_action( const item_action &a );
