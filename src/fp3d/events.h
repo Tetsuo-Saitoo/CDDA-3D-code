@@ -20,6 +20,7 @@ class Character;
 class Creature;
 class map;
 struct dealt_damage_instance;
+struct weakpoint;
 
 namespace fp3d
 {
@@ -70,8 +71,15 @@ void on_message( const std::string &text, int type );
 void on_attack( const Creature &attacker, const Creature &target, const std::string &weapon, bool hit,
                 const std::string &technique = std::string(), int family = 0 );
 // `source` (may be null) becomes `other` only when it is the player or a creature the player sees, else 0.
+// `wp` (may be null): the weak point the hit landed on (absorb_hit); a monster's is sent as `text` when its id is a
+// plain id (weakpoint_text), else `text` is "".
 void on_damage( const Creature &target, const Creature *source, const std::string &body_part, int amount,
-                const dealt_damage_instance &dealt );
+                const dealt_damage_instance &dealt, const weakpoint *wp = nullptr );
+// The longest weak point id a damage event names.
+constexpr size_t max_weakpoint_id = 32;
+// A weak point id as damage events send it: ASCII letters, digits and '_', not starting with a digit, at most
+// max_weakpoint_id bytes; anything else (a mod's id with spaces or markup, an empty one) is "".
+std::string weakpoint_text( const std::string &id );
 // `path` from the shooter's square; the projectile got as far as `end`.
 void on_projectile( const map &here, const Creature *shooter, const std::vector<tripoint_bub_ms> &path,
                     const tripoint_bub_ms &end, const Creature *hit, const std::string &thrown );

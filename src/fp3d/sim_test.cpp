@@ -2841,6 +2841,7 @@ static bool run_combat_checks()
         std::optional<fp3d::ui_request> target;     // the first target request
         std::vector<fp3d::ui_request> shots;        // the shot requests
         std::vector<fp3d::event> projectiles;       // projectile events from the action on
+        std::vector<fp3d::event> damages;           // damage events from the action on
         bool back = false;                          // back in the main loop afterwards
     };
     // How the target request is answered: FIRE, an aim-and-shoot action, a cancel (all with the shot), or FIRE
@@ -2962,6 +2963,8 @@ static bool run_combat_checks()
         for( fp3d::event &e : evs ) {
             if( e.kind == fp3d::event_kind::projectile ) {
                 r.projectiles.push_back( std::move( e ) );
+            } else if( e.kind == fp3d::event_kind::damage ) {
+                r.damages.push_back( std::move( e ) );
             }
         }
         return r;
@@ -3004,6 +3007,17 @@ static bool run_combat_checks()
                num( s.dispersion ) + " range " + std::to_string( s.range ) );
         check( fired( r, 1 ) && delta( r.c0.accepted, r.c1.accepted ) == 1 && r.after.hp < r.before.hp &&
                !r.after.has_plan, "accepted hit (point blank, head, 0.05)", counts( r ) );
+        // the damage event names the weak point the hit landed on: the head when the client's part landed (its odds
+        // are rolled, part_lands), else whatever CDDA picked, a plain id or none
+        const bool landed = delta( r.c0.parts, r.c1.parts ) == 1;
+        std::string named;
+        for( const fp3d::event &e : r.damages ) {
+            named += ( named.empty() ? "\"" : ", \"" ) + e.text + "\"";
+        }
+        const std::string wp = r.damages.size() == 1 ? r.damages[0].text : std::string( "-" );
+        check( r.damages.size() == 1 && ( landed ? wp == "head" : wp == fp3d::weakpoint_text( wp ) ),
+               "the damage event names the weak point hit", std::string( landed ? "landed" : "not landed" ) +
+               ", damage " + ( named.empty() ? "none" : named ) );
     }
     // Refused shot answers leave the projectile to CDDA's own path, not the FIRE answer's outcome (CDDA's own roll
     // hits the adjacent zombie).

@@ -12,14 +12,19 @@
 #include "damage.h"
 #include "fp3d/points.h"
 #include "fp3d/snapshot.h"
+#include "fp3d/swing.h"
 #include "line.h"
 #include "map.h"
 #include "monster.h"
 #include "mtype.h"
 #include "output.h"
+#include "weakpoint.h"
 
 namespace fp3d
 {
+
+// The attack event's family cap is the last family (swing.h): a new family must raise it, not clamp to push.
+static_assert( max_technique_family == technique_push, "max_technique_family must be the last technique family" );
 
 std::atomic<bool> events_on{ false };
 
@@ -146,8 +151,21 @@ void on_attack( const Creature &attacker, const Creature &target, const std::str
     push( std::move( e ) );
 }
 
+std::string weakpoint_text( const std::string &id )
+{
+    if( id.empty() || id.size() > max_weakpoint_id || ( id[0] >= '0' && id[0] <= '9' ) ) {
+        return std::string();
+    }
+    for( const char c : id ) {
+        if( !( ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || ( c >= '0' && c <= '9' ) || c == '_' ) ) {
+            return std::string();
+        }
+    }
+    return id;
+}
+
 void on_damage( const Creature &target, const Creature *source, const std::string &body_part, int amount,
-                const dealt_damage_instance &dealt )
+                const dealt_damage_instance &dealt, const weakpoint *wp )
 {
     if( !player_sees( target ) ) {
         return;
@@ -170,6 +188,9 @@ void on_damage( const Creature &target, const Creature *source, const std::strin
     e.amount = amount;
     e.type = intern_id( id_kind::damage_type, worst );
     e.detail = intern_id( id_kind::body_part, body_part );
+    if( wp != nullptr && target.is_monster() ) {
+        e.text = weakpoint_text( wp->id );   // the weak point hit (a monster's head, eye, leg)
+    }
     push( std::move( e ) );
 }
 
