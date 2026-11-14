@@ -34,6 +34,7 @@
 #include "avatar.h"
 #include "cached_options.h"
 #include "calendar.h"
+#include "character_martial_arts.h"
 #include "coordinates.h"
 #include "debug.h"
 #include "do_turn.h"
@@ -69,6 +70,7 @@
 #include "map.h"
 #include "map_scale_constants.h"
 #include "mapdata.h"
+#include "martialarts.h"
 #include "messages.h"
 #include "monster.h"
 #include "npc.h"
@@ -81,6 +83,7 @@
 #include "scenario.h"
 #include "start_location.h"
 #include "talker.h"
+#include "translation.h"
 #include "type_id.h"
 #include "units.h"
 #include "vehicle.h"
@@ -2548,6 +2551,8 @@ static bool run_combat_checks()
         bool armed = true;          // wield a loaded `gun`; else empty hands (throwing wields the rock)
         bool rock = false;          // carry a rock to throw
         std::string melee;          // wield this item instead of `gun` ("" = none)
+        // no martial-art style (only the wielded weapon's techniques apply), no pain, full stamina
+        bool plain_style = false;
     };
     struct seen {
         int ammo = -1;
@@ -2646,6 +2651,12 @@ static bool run_combat_checks()
                                    "stabbing", "cutting", "unarmed"
                                  } ) {
                 u.set_skill_level( skill_id( s ), sc->skill );
+            }
+            if( sc->plain_style ) {
+                u.martial_arts_data->set_style( matype_id( "style_none" ), true );
+                // the many strikes of the call checks add up to no pain or tiredness for the checks after them
+                u.set_pain( 0 );
+                u.set_stamina( u.get_stamina_max() );
             }
             u.recoil = sc->steady ? 0.0 : MAX_RECOIL;
             if( !sc->melee.empty() ) {
@@ -3873,7 +3884,8 @@ static bool run_combat_checks()
     }
     // Aimed melee (fp3d/swing.h): an aimed strike asks one swing request for the creature struck, a plain one
     // none; the client's part (an answer for that creature on its square) only weights CDDA's pick; any other
-    // answer leaves CDDA's pick; the off hand says so; a reach weapon strikes along the direction.
+    // answer leaves CDDA's pick; the off hand says so; a reach weapon strikes along the direction. The answer may
+    // also call a technique family (its action): CDDA's own techniques of that family go first, by CDDA's rules.
     {
         struct swung {
             bool back = false;
@@ -3882,10 +3894,14 @@ static bool run_combat_checks()
             seen after;
             fp3d::swing_counts c0;
             fp3d::swing_counts c1;
+            std::vector<fp3d::event> attacks;       // the avatar's attack events of the strike
         };
         using swing_answerer = std::function<std::optional<fp3d::shot_answer>( const fp3d::ui_request &,
                                const seen & )>;
-        const auto swing_run = [&]( const scene & sc, const std::string & action, const swing_answerer & reply ) {
+        // Builds `sc`, starts `action` and answers each swing request with `reply` (nullopt: a cancel) and the
+        // call `call` as the answer's action.
+        const auto swing_run = [&]( const scene & sc, const std::string & action, const swing_answerer & reply,
+        const std::string & call = std::string() ) {
             swung s;
             // A stray prompt is printed and answered, and the scene built again: the creature may have grabbed
             // the avatar after the last strike, and struggling free on the pause can tear a pocket off (a popup).
@@ -3925,6 +3941,10 @@ static bool run_combat_checks()
             }
             s.before = seen_now();
             s.c0 = fp3d::get_swing_counts();
+            {
+                std::vector<fp3d::event> old;
+                fp3d::drain_events( old );
+            }
             fp3d::queue_action( action );
             std::optional<fp3d::ui_request> c = fp3d::wait_request( 20000, q->id );
             int asked = 0;
@@ -3933,6 +3953,7 @@ static bool run_combat_checks()
                 a.id = c->id;
                 if( c->kind == fp3d::request_kind::swing ) {
                     s.swings.push_back( *c );
+                    a.action = call;
                     if( std::optional<fp3d::shot_answer> sa = reply( *c, s.before ) ) {
                         a.shot = sa;
                     } else {
@@ -3949,6 +3970,13 @@ static bool run_combat_checks()
             s.back = c && c->timed;
             s.after = seen_now();
             s.c1 = fp3d::get_swing_counts();
+            std::vector<fp3d::event> evs;
+            fp3d::drain_events( evs );
+            for( fp3d::event &e : evs ) {
+                if( e.kind == fp3d::event_kind::attack && e.uid == 1 ) {
+                    s.attacks.push_back( std::move( e ) );
+                }
+            }
             return s;
         };
         const auto aimed_at = []( const char *part ) {
@@ -3965,7 +3993,9 @@ static bool run_combat_checks()
                               std::to_string( s.c1.asked - s.c0.asked ) + " accepted +" +
                               std::to_string( s.c1.accepted - s.c0.accepted ) + " refused +" +
                               std::to_string( s.c1.refused - s.c0.refused ) + " parts +" +
-                              std::to_string( s.c1.parts - s.c0.parts ) + ", hp " + std::to_string( s.before.hp ) +
+                              std::to_string( s.c1.parts - s.c0.parts ) + " hints +" +
+                              std::to_string( s.c1.hints - s.c0.hints ) + " hinted +" +
+                              std::to_string( s.c1.hinted - s.c0.hinted ) + ", hp " + std::to_string( s.before.hp ) +
                               " -> " + std::to_string( s.after.hp );
             if( !s.swings.empty() ) {
                 const fp3d::ui_request &r = s.swings.front();
@@ -4031,6 +4061,151 @@ static bool run_combat_checks()
         check( swings == 3 && refused == 3 && parts == 0, "another creature, square or a cancel: CDDA's pick",
                std::to_string( swings ) + " swings, refused " + std::to_string( refused ) + ", parts " +
                std::to_string( parts ) );
+        // The call. With no martial-art style a quarterstaff's techniques are a plain strike (RAPID) and a sweep
+        // that downs (SWEEP), both only for a hit that isn't critical (a critical one has no technique then); a
+        // bat's only one is a stun on a critical hit (BRUTAL). The avatar's attack event names what it used.
+        // (Before the off-hand, reach and wall checks: the block ends on the scene it always ended on.)
+        const std::string aim_left = "fp3d_attack_main_aim_LEFT";
+        scene staff = point_blank;
+        staff.zx = -1;
+        staff.melee = "q_staff";
+        staff.plain_style = true;
+        // read while the sim waits for its next answer
+        const matec_id sweep( "SWEEP" );
+        const std::string sweep_name = sweep.is_valid() ? sweep->name.translated() : std::string( "?" );
+        // What some strikes did, added up.
+        struct tally {
+            int strikes = 0;
+            int clean = 0;          // strikes that came back, asked once and sent one attack event of the avatar
+            int accepted = 0;
+            int refused = 0;
+            int hints = 0;
+            int hinted = 0;
+            int hits[fp3d::max_technique_family + 1] = {};    // the avatar's hits, by technique family
+            int misnamed = 0;       // events whose technique name doesn't go with their family
+        };
+        const auto add = [&]( tally & t, const swung & r ) {
+            t.strikes++;
+            t.clean += r.back && r.swings.size() == 1 && r.c1.asked - r.c0.asked == 1 && r.attacks.size() == 1 ? 1 : 0;
+            t.accepted += static_cast<int>( r.c1.accepted - r.c0.accepted );
+            t.refused += static_cast<int>( r.c1.refused - r.c0.refused );
+            t.hints += static_cast<int>( r.c1.hints - r.c0.hints );
+            t.hinted += static_cast<int>( r.c1.hinted - r.c0.hinted );
+            for( const fp3d::event &e : r.attacks ) {
+                const int family = std::clamp<int>( e.amount, 0, fp3d::max_technique_family );
+                if( e.detail == 1 ) {
+                    t.hits[family]++;
+                }
+                // a miss and a hit with no technique name nothing; a sweep is the only technique here that downs
+                bool fits = !e.text.empty();
+                if( e.detail != 1 ) {
+                    fits = e.text.empty() && e.amount == 0;
+                } else if( family == fp3d::technique_none ) {
+                    fits = e.text.empty();
+                } else if( family == fp3d::technique_down ) {
+                    fits = e.text == sweep_name;
+                }
+                t.misnamed += fits ? 0 : 1;
+            }
+        };
+        const auto hit_count = []( const tally & t ) {
+            int n = 0;
+            for( const int h : t.hits ) {
+                n += h;
+            }
+            return n;
+        };
+        // every hit is of family `a` or `b`
+        const auto only = [&]( const tally & t, int a, int b ) {
+            return hit_count( t ) == t.hits[a] + ( a == b ? 0 : t.hits[b] );
+        };
+        const auto told = [&]( const tally & t ) {
+            std::string out = std::to_string( t.strikes ) + " strikes (" + std::to_string( t.clean ) +
+                              " asked once, one attack event), accepted +" + std::to_string( t.accepted ) +
+                              " refused +" + std::to_string( t.refused ) + " hints +" + std::to_string( t.hints ) +
+                              " hinted +" + std::to_string( t.hinted ) + ", hits by family";
+            for( const int h : t.hits ) {
+                out += " " + std::to_string( h );
+            }
+            return out + ( t.misnamed == 0 ? std::string() : ", misnamed " + std::to_string( t.misnamed ) );
+        };
+        // Strikes at `sc` with the answer `reply` and the call `call`: `least` of them, then more (up to `most`)
+        // until `enough` says so.
+        const auto strike_until = [&]( const scene & sc, const swing_answerer & reply, const std::string & call,
+        int least, int most, const std::function<bool( const tally & )> &enough ) {
+            tally t;
+            while( t.strikes < least || ( t.strikes < most && !enough( t ) ) ) {
+                add( t, swing_run( sc, aim_left, reply, call ) );
+            }
+            return t;
+        };
+        const auto any_hit = [&]( const tally & t ) {
+            return hit_count( t ) > 0;
+        };
+        const auto swept = []( const tally & t ) {
+            return t.hits[fp3d::technique_down] > 0;
+        };
+
+        // A hit that isn't critical sweeps (2), a critical one has no technique (0): never the plain strike (1).
+        tally sum = strike_until( staff, aimed_at( "leg" ), "down", 12, 12, any_hit );
+        check( sum.clean == 12 && sum.accepted == 12 && sum.hints == 12 && sum.misnamed == 0 &&
+               only( sum, fp3d::technique_none, fp3d::technique_down ) &&
+               sum.hinted == sum.hits[fp3d::technique_down], "a called family is used when CDDA allows it",
+               told( sum ) );
+        // and on until a sweep was seen, if none was
+        if( !swept( sum ) ) {
+            sum = strike_until( staff, aimed_at( "leg" ), "down", 1, 40, swept );
+        }
+        check( sum.clean == sum.strikes && swept( sum ) && sum.misnamed == 0 &&
+               sum.hinted == sum.hits[fp3d::technique_down] && sweep_name == "Sweep Attack",
+               "a called hit names CDDA's technique", "\"" + sweep_name + "\", " + told( sum ) );
+        sum = strike_until( staff, aimed_at( "leg" ), "", 1, 60, []( const tally & t ) {
+            return t.hits[fp3d::technique_strike] > 0 && t.hits[fp3d::technique_down] > 0;
+        } );
+        check( sum.clean == sum.strikes && sum.hits[fp3d::technique_strike] >= 1 && swept( sum ) &&
+               hit_count( sum ) == sum.hits[fp3d::technique_none] + sum.hits[fp3d::technique_strike] +
+               sum.hits[fp3d::technique_down] && sum.hints == 0 && sum.hinted == 0 && sum.misnamed == 0,
+               "no call: CDDA's own draw", told( sum ) );
+        sum = tally();
+        for( const swing_answerer *r : { &other_uid, &other_square, &cancel } ) {
+            add( sum, swing_run( staff, aim_left, *r, "down" ) );
+        }
+        check( sum.clean == 3 && sum.refused == 3 && sum.hints == 0 && sum.hinted == 0 && sum.misnamed == 0,
+               "a call for another creature, square or with a cancel is ignored", told( sum ) );
+        sum = tally();
+        const std::vector<std::string> words = { "DOWN", "down ", "sweep", "strike", std::string( 64, 'a' ) };
+        for( const std::string &word : words ) {
+            add( sum, swing_run( staff, aim_left, aimed_at( "leg" ), word ) );
+        }
+        check( sum.clean == 5 && sum.accepted == 5 && sum.hints == 0 && sum.hinted == 0 && sum.misnamed == 0,
+               "only the exact words call", told( sum ) );
+        // The word is read as the bridge hands it over: ask() takes control characters out of every answer's
+        // action first (contracts/ui_requests.md, Rules), so these three are "down".
+        sum = tally();
+        const std::vector<std::string> cleaned = { "down\n", "do\x01wn", "\x7f" "down" };
+        for( const std::string &word : cleaned ) {
+            add( sum, swing_run( staff, aim_left, aimed_at( "leg" ), word ) );
+        }
+        check( sum.clean == 3 && sum.accepted == 3 && sum.hints == 3 && sum.misnamed == 0 &&
+               only( sum, fp3d::technique_none, fp3d::technique_down ) &&
+               sum.hinted == sum.hits[fp3d::technique_down], "a call is read after the bridge's cleaning",
+               told( sum ) );
+        scene plain_bat = bat;
+        plain_bat.plain_style = true;
+        sum = strike_until( plain_bat, aimed_at( "leg" ), "down", 6, 30, any_hit );
+        check( sum.clean == sum.strikes && sum.hints == sum.strikes && sum.hinted == 0 && any_hit( sum ) &&
+               only( sum, fp3d::technique_none, fp3d::technique_stun ) && sum.misnamed == 0,
+               "a family the weapon lacks leaves CDDA's pick", told( sum ) );
+        scene unskilled = staff;
+        unskilled.skill = 1;
+        sum = strike_until( unskilled, aimed_at( "leg" ), "down", 6, 30, any_hit );
+        check( sum.clean == sum.strikes && sum.hints == sum.strikes && sum.hinted == 0 && any_hit( sum ) &&
+               only( sum, fp3d::technique_none, fp3d::technique_none ) && sum.misnamed == 0,
+               "skill gates still hold", told( sum ) );
+        sum = strike_until( staff, aimed_at( "" ), "down", 1, 1, any_hit );
+        check( sum.clean == 1 && sum.accepted == 0 && sum.refused == 1 && sum.hints == 1 && sum.misnamed == 0 &&
+               only( sum, fp3d::technique_none, fp3d::technique_down ) &&
+               sum.hinted == sum.hits[fp3d::technique_down], "a call without a part", told( sum ) );
         scene bare = point_blank;
         bare.zx = -1;
         bare.armed = false;

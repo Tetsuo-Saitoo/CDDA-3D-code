@@ -665,9 +665,9 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
     }
 
     const bool hits = hit_spread >= 0;
-    // FP3D: swing animation for the client
-    if( fp3d::events_enabled() ) {
-        fp3d::on_attack( *this, t, cur_weap.typeId().str(), hits );
+    // FP3D: swing animation for the client; a hit sends its event once its technique is picked (below)
+    if( !hits && fp3d::events_enabled() ) {
+        fp3d::on_attack( *this, t, cur_weap.typeId().str(), false );
     }
 
     if( monster *m = t.as_monster() ) {
@@ -772,7 +772,11 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
             attack = std::make_tuple( force_technique, attack_vector_id::NULL_ID(),
                                       sub_bodypart_str_id::NULL_ID() );
         } else if( allow_special ) {
-            attack = pick_technique( t, cur_weapon, critical_hit, false, false );
+            // FP3D: an aimed strike's call tries CDDA's own techniques of that family first (fp3d/swing.h);
+            // the ones it evaluated are left out of CDDA's pick. No call: nothing tried, CDDA's pick as it was.
+            std::vector<matec_id> fp3d_tried;
+            const auto fp3d_tec = fp3d::swing_technique( *this, t, cur_weapon, critical_hit, fp3d_tried );
+            attack = fp3d_tec ? *fp3d_tec : pick_technique( t, cur_weapon, critical_hit, false, false, fp3d_tried );
         } else {
             attack = std::make_tuple( tec_none, attack_vector_id::NULL_ID(), sub_bodypart_str_id::NULL_ID() );
         }
@@ -781,6 +785,12 @@ bool Character::melee_attack_abstract( Creature &t, bool allow_special,
         attack_vector_id vector_id;
         sub_bodypart_str_id contact_area;
         std::tie( attack_id, vector_id, contact_area ) = attack;
+
+        // FP3D: the hit's swing animation for the client, with the technique the avatar used (fp3d/swing.h)
+        if( fp3d::events_enabled() ) {
+            const fp3d::technique_note fp3d_note = fp3d::swing_note( *this, attack_id, seen );
+            fp3d::on_attack( *this, t, cur_weap.typeId().str(), true, fp3d_note.name, fp3d_note.family );
+        }
 
         // If no weapon is selected, use highest layer of clothing for attack vector instead.
         if( contact_area != sub_bodypart_str_id::NULL_ID() ) {

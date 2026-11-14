@@ -37,11 +37,11 @@ struct event {
     uint64_t uid = 0;              // actor: attacker, shooter, damaged / dying / busy creature (0 none)
     uint64_t other = 0;            // attack target, creature a projectile hit (0 none)
     ui_point pos;                  // sound source, attack target, explosion centre, death place (absolute)
-    int32_t amount = 0;            // sound volume, damage dealt, explosion radius
+    int32_t amount = 0;            // sound volume, damage dealt, explosion radius, attack technique family
     int32_t heard = 0;             // sound: volume at the player's ears
     uint32_t type = 0;             // session table index, see contracts/events.md
     uint32_t detail = 0;           // sound category, message type, body part index, attack hit (1) / miss (0)
-    std::string text;              // message text without colour tags, sound description
+    std::string text;              // message text without colour tags, sound description, attack technique name
     std::vector<ui_point> path;    // projectile path from the shooter (cap 256), explosion area (cap 1024)
 };
 
@@ -49,6 +49,7 @@ constexpr size_t max_events = 4096;        // queued; overflow drops the oldest 
 constexpr size_t max_event_text = 1024;    // bytes
 constexpr size_t max_projectile_path = 256;
 constexpr size_t max_explosion_area = 1024;
+constexpr int max_technique_family = 5;    // attack: 0 none, 1 strike, 2 down, 3 stun, 4 disarm, 5 push (swing.h)
 
 extern std::atomic<bool> events_on;
 inline bool events_enabled()
@@ -64,7 +65,10 @@ void reset_events();
 void on_sound( const tripoint_bub_ms &p, int volume, int heard, int category, const std::string &description,
                const std::string &id, const std::string &variant );
 void on_message( const std::string &text, int type );
-void on_attack( const Creature &attacker, const Creature &target, const std::string &weapon, bool hit );
+// One per swing. `technique` and `family` (fp3d/swing.h swing_note) are sent only with the avatar's own hit: the
+// technique's name in `text`, its family in `amount`; any other attack has "" and 0.
+void on_attack( const Creature &attacker, const Creature &target, const std::string &weapon, bool hit,
+                const std::string &technique = std::string(), int family = 0 );
 // `source` (may be null) becomes `other` only when it is the player or a creature the player sees, else 0.
 void on_damage( const Creature &target, const Creature *source, const std::string &body_part, int amount,
                 const dealt_damage_instance &dealt );
