@@ -278,6 +278,18 @@ void on_turn_end()
     push( std::move( e ) );
 }
 
+void on_item_result( uint64_t item_uid, uint32_t tag, bool done, const std::string &why )
+{
+    event e;
+    e.kind = event_kind::item_result;
+    e.uid = item_uid;
+    e.detail = tag;
+    e.amount = done ? 1 : 0;
+    // Plain text, as the message event's: item names carry color tags.
+    e.text = bounded_text( remove_color_tags( why ) );
+    push( std::move( e ) );
+}
+
 void on_lightning()
 {
     event e;

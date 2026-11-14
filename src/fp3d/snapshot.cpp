@@ -283,6 +283,12 @@ void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile
             if( item_spot( it, sx, sy ) ) {
                 h.spot_x = static_cast<int16_t>( sx );
                 h.spot_y = static_cast<int16_t>( sy );
+                uint16_t yaw = 0;
+                bool side = false;
+                if( item_pose( it, yaw, side ) ) {
+                    h.yaw = static_cast<int16_t>( yaw );
+                    h.side = side;
+                }
             }
             pile.handles.push_back( h );
         }
@@ -755,7 +761,8 @@ bool item_pile_view::operator==( const item_pile_view &o ) const
 
 bool item_handle_view::operator==( const item_handle_view &o ) const
 {
-    return uid == o.uid && type == o.type && spot_x == o.spot_x && spot_y == o.spot_y;
+    return uid == o.uid && type == o.type && spot_x == o.spot_x && spot_y == o.spot_y && yaw == o.yaw &&
+           side == o.side;
 }
 
 bool light_view::operator==( const light_view &o ) const
@@ -1131,6 +1138,22 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
                 jo.write( static_cast<int>( h.spot_x ) );
                 jo.write( static_cast<int>( h.spot_y ) );
                 jo.end_array();
+            }
+        }
+        jo.end_array();
+        // How placed items lie, only for those with a stored pose: [uid, yaw, side]. Its own list, so a handle
+        // keeps its five numbers.
+        jo.member( "poses" );
+        jo.start_array();
+        for( const item_pile_view &p : sm.items ) {
+            for( const item_handle_view &h : p.handles ) {
+                if( h.yaw >= 0 ) {
+                    jo.start_array();
+                    jo.write( static_cast<int64_t>( h.uid ) );
+                    jo.write( static_cast<int>( h.yaw ) );
+                    jo.write( h.side ? 1 : 0 );
+                    jo.end_array();
+                }
             }
         }
         jo.end_array();

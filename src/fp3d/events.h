@@ -25,10 +25,10 @@ namespace fp3d
 {
 
 enum class event_kind : uint8_t {
-    sound, message, attack, damage, projectile, explosion, death, anim, turn_end, lightning
+    sound, message, attack, damage, projectile, explosion, death, anim, turn_end, lightning, item_result
 };
 // How many kinds there are (tables indexed by kind).
-constexpr size_t event_kind_count = static_cast<size_t>( event_kind::lightning ) + 1;
+constexpr size_t event_kind_count = static_cast<size_t>( event_kind::item_result ) + 1;
 
 struct event {
     event_kind kind = event_kind::turn_end;
@@ -94,6 +94,9 @@ void on_turn_end();
 // CDDA's lightning flash (the `lightning` effect of its weather effects; npctalk.cpp). CDDA's own flag for it is
 // cleared again before the turn ends, so a snapshot never shows it. `pos` is the player's square.
 void on_lightning();
+// An item action that carried a tag (bridge.h item_action) has run: `uid` is the item's handle (not a creature),
+// `detail` the tag, `amount` 1 done or 0 refused, `text` why it was refused ("" when done or when nothing said why).
+void on_item_result( uint64_t item_uid, uint32_t tag, bool done, const std::string &why );
 
 } // namespace fp3d
 

@@ -48,6 +48,8 @@ struct item_handle_view {
     uint32_t type = 0;                            // itype index
     int16_t spot_x = -1;                          // where the client placed it, permille of the square; -1 none
     int16_t spot_y = -1;
+    int16_t yaw = -1;                             // how it lies there: whole degrees 0..359; -1 no pose stored
+    bool side = false;                            // lies on its side (only with a yaw)
     bool operator==( const item_handle_view &o ) const;
 };
 

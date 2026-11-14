@@ -6,6 +6,7 @@
 #include <optional>
 #include <random>
 #include <system_error>
+#include <unordered_set>
 #include <vector>
 
 #include "activity_actor_definitions.h"
@@ -17,6 +18,7 @@
 #include "enums.h"
 #include "flag.h"
 #include "fp3d/bridge.h"
+#include "fp3d/events.h"
 #include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
 #include "fp3d/snapshot.h"
@@ -58,6 +60,7 @@ namespace
 {
 const std::string uid_var = "fp3d_uid";
 const std::string spot_var = "fp3d_spot";
+const std::string pose_var = "fp3d_pose";
 
 std::mutex uid_mutex;
 
@@ -147,10 +150,46 @@ item_location find_carried( avatar &u, const item_ref &r )
     return found;
 }
 
+// How the action being run went, for its `item_result` event (run_item_action): refused with a reason, or done
+// without taking time (the free actions).
+bool action_refused = false;
+bool action_done_free = false;
+std::string action_refusal;
+
 bool refuse( avatar &u, const std::string &why )
 {
+    action_refused = true;
+    action_refusal = why;
     u.add_msg_if_player( m_info, "%s", why );
     return false;
+}
+
+// The free actions come from the client's physics, many a second: a refusal goes to the result event only, not
+// into the message log.
+bool refuse_quietly( const std::string &why )
+{
+    action_refused = true;
+    action_refusal = why;
+    return false;
+}
+
+// The item is where it came from no more: it lies as CDDA puts it.
+void forget_spot( item &it )
+{
+    it.erase_var( spot_var );
+    it.erase_var( pose_var );
+}
+
+// Where the client put the item on its square and how it lies there; neither when the action gives no spot.
+void store_spot( item &it, const item_action &a )
+{
+    forget_spot( it );
+    if( a.has_spot ) {
+        it.set_var( spot_var, std::to_string( a.spot_x ) + "," + std::to_string( a.spot_y ) );
+        if( a.has_pose ) {
+            it.set_var( pose_var, std::to_string( a.yaw ) + "," + ( a.side ? "1" : "0" ) );
+        }
+    }
 }
 
 void after_inventory_change( avatar &u )
@@ -203,7 +242,7 @@ bool take( avatar &u, const item_action &a )
         if( !can.success() ) {
             return refuse( u, can.str() );
         }
-        it.erase_var( spot_var );
+        forget_spot( it );
         // CDDA's wield: obtain cost, the item leaves the square.
         if( !u.wield( loc ) ) {
             return refuse( u, string_format( _( "You can't pick up the %s." ), name ) );
@@ -229,7 +268,7 @@ bool take( avatar &u, const item_action &a )
     }
     const int cost = loc.obtain_cost( u );
     item copy = it;
-    copy.erase_var( spot_var );
+    forget_spot( copy );
     if( a.hand == item_hand::off ) {
         mark_offhand_pending( copy );
     }
@@ -348,7 +387,7 @@ bool put( avatar &u, const item_action &a )
     const std::string dst_name = dst->type->nname( 1 );
     item copy = it;
     clear_offhand_mark( copy );
-    copy.erase_var( spot_var );
+    forget_spot( copy );
     if( pocket != nullptr ) {
         const ret_val<item *> in = pocket->insert_item( copy );
         if( !in.success() ) {
@@ -413,11 +452,7 @@ bool drop( avatar &u, const item_action &a )
     const int cost = src.obtain_cost( u ) + Pickup::cost_to_move_item( u, *src );
     item copy = *src;
     clear_offhand_mark( copy );
-    if( a.has_spot ) {
-        copy.set_var( spot_var, std::to_string( a.spot_x ) + "," + std::to_string( a.spot_y ) );
-    } else {
-        copy.erase_var( spot_var );
-    }
+    store_spot( copy, a );
     const item &placed = here.add_item_or_charges( *p, copy, /*overflow=*/false );
     if( placed.is_null() ) {
         return refuse( u, string_format( _( "There's no room for your %s there." ), name ) );
@@ -561,7 +596,7 @@ bool place( avatar &u, item &obj, item_hand hand, const item *avoid, const item 
     }
     item copy = obj;
     clear_offhand_mark( copy );
-    copy.erase_var( spot_var );
+    forget_spot( copy );
     if( hand == item_hand::main ) {
         return u.Character::wield( copy, 0 );
     }
@@ -1053,7 +1088,7 @@ bool throw_at( avatar &u, const item_action &a )
     const int handling = from_pack ? u.item_handling_cost( it, true, INVENTORY_HANDLING_PENALTY ) : 0;
     item thrown = it;
     clear_offhand_mark( thrown );
-    thrown.erase_var( spot_var );
+    forget_spot( thrown );
     if( it.count_by_charges() && it.charges > 1 ) {
         thrown.charges = 1;
         thrown.erase_var( uid_var );
@@ -1287,7 +1322,7 @@ bool pour( avatar &u, const item_action &a )
         const bool into_water = here.has_flag( ter_furn_flag::TFLAG_SWIMMABLE, *p );
         for( item_location &l : liquids ) {
             item spilt = *l;
-            spilt.erase_var( spot_var );
+            forget_spot( spilt );
             // map::add_item_or_charges never keeps a liquid on a square of liquid: it is gone, as CDDA pours it.
             if( !into_water && here.add_item_or_charges( *p, spilt ).is_null() ) {
                 if( moved_stacks == 0 ) {
@@ -1354,9 +1389,275 @@ bool item_spot( const item &it, uint16_t &x, uint16_t &y )
     return true;
 }
 
+bool item_pose( const item &it, uint16_t &yaw, bool &side )
+{
+    uint16_t x = 0;
+    uint16_t y = 0;
+    if( !it.has_var( pose_var ) || !item_spot( it, x, y ) ) {
+        return false;
+    }
+    const std::string s = text_var( it, pose_var );
+    const size_t comma = s.find( ',' );
+    if( s.size() > 8 || comma == std::string::npos ) {
+        return false;
+    }
+    const std::optional<uint64_t> deg = parse_decimal( s.substr( 0, comma ), max_item_yaw );
+    const std::optional<uint64_t> lies = parse_decimal( s.substr( comma + 1 ), 1 );
+    if( !deg || !lies ) {
+        return false;
+    }
+    yaw = static_cast<uint16_t>( *deg );
+    side = *lies == 1;
+    return true;
+}
+
+namespace
+{
+// The free actions (place, spot) take no time, so the turn bounds them: max_free_item_ops in one turn, and an item
+// is moved once. Sim thread only.
+struct free_ops {
+    time_point turn = calendar::before_time_starts;
+    int used = 0;
+    std::unordered_set<uint64_t> moved;
+};
+free_ops free_ops_now;
+
+// "" when one more free action may run this turn (and it is counted), else why not.
+std::string free_op_refusal( uint64_t uid, bool moves )
+{
+    free_ops &f = free_ops_now;
+    if( f.turn != calendar::turn ) {
+        f.turn = calendar::turn;
+        f.used = 0;
+        f.moved.clear();
+    }
+    if( f.used >= max_free_item_ops ) {
+        return "Too many at once.";
+    }
+    if( moves && f.moved.count( uid ) != 0 ) {
+        return "That was moved a moment ago.";
+    }
+    f.used++;
+    if( moves ) {
+        f.moved.insert( uid );
+    }
+    return "";
+}
+
+// The lying item a free action names, when the client's physics can have touched it: on a square near the avatar
+// (physics_reach, same level) that it sees and whose items can be got at, not someone else's, not spilt liquid or
+// gas. `why` says what is wrong otherwise.
+item_location find_for_physics( avatar &u, map &here, const item_action &a, tripoint_bub_ms &at, std::string &why )
+{
+    const std::optional<tripoint_bub_ms> p = bubble_square( here, a.pos );
+    if( !p || p->z() != u.posz() || square_dist( u.pos_bub(), *p ) > physics_reach ||
+        ( *p != u.pos_bub() && !u.sees( here, *p ) ) ) {
+        why = "That is out of reach.";
+        return item_location();
+    }
+    if( !here.accessible_items( *p ) || !here.could_see_items( *p, u.pos_bub() ) ) {
+        why = "The items there can't be got at.";
+        return item_location();
+    }
+    item_location loc = find_on_square( here, *p, a.item );
+    if( !loc ) {
+        why = "That isn't there any more.";
+        return item_location();
+    }
+    if( loc->made_of_from_type( phase_id::LIQUID ) || loc->made_of_from_type( phase_id::GAS ) ||
+        loc->is_frozen_liquid() ) {
+        why = "That can't be moved by hand.";
+        return item_location();
+    }
+    if( !loc->is_owned_by( u, true ) ) {
+        why = "That isn't yours.";
+        return item_location();
+    }
+    at = *p;
+    return loc;
+}
+
+// place: the client's physics moved a lying item onto the next square. No time, no message: CDDA's rules for what
+// the square takes, and the item is one the avatar could have lifted there itself.
+bool move_lying( avatar &u, const item_action &a )
+{
+    map &here = get_map();
+    tripoint_bub_ms from;
+    std::string why;
+    item_location src = find_for_physics( u, here, a, from, why );
+    if( !src ) {
+        return refuse_quietly( why );
+    }
+    const std::optional<tripoint_bub_ms> to = bubble_square( here, a.to );
+    if( !to || to->z() != from.z() || square_dist( from, *to ) != 1 ) {
+        return refuse_quietly( "It can only move to the next square." );
+    }
+    // Items that act when dropped (CDDA's drop_action) aren't shoved around either.
+    if( src->type->drop_action || !u.can_lift( *src ) ) {
+        return refuse_quietly( "That can't be moved like that." );
+    }
+    // Not through what blocks the way (a closed door or gate, a vehicle's wall), and not over an edge: an item that
+    // falls is CDDA's to drop, with its time and its harm, never a free action's.
+    if( here.impassable( *to ) || !here.has_floor_or_water( *to ) ) {
+        return refuse_quietly( "It can't go there." );
+    }
+    if( !here.can_put_items_ter_furn( *to ) || here.has_flag( ter_furn_flag::TFLAG_DESTROY_ITEM, *to ) ||
+        here.free_volume( *to ) < src->volume() ) {
+        return refuse_quietly( "There's no room for it there." );
+    }
+    why = free_op_refusal( a.item.uid, true );
+    if( !why.empty() ) {
+        return refuse_quietly( why );
+    }
+    item copy = *src;
+    store_spot( copy, a );
+    // On that square or not at all. A stack counted by charges can merge with the same thing there and take
+    // that stack's handle, as when it is put into a pocket.
+    item &placed = here.add_item_or_charges( *to, copy, /*overflow=*/false );
+    if( placed.is_null() ) {
+        return refuse_quietly( "There's no room for it there." );
+    }
+    // A merged stack keeps the other stack's handle (and its spot): that one has moved this turn too.
+    free_ops_now.moved.insert( read_item_handle( placed ) );
+    src.remove_item();
+    action_done_free = true;
+    return false;
+}
+
+// spot: how a lying item rests on its square changes. No time, no message.
+bool set_rest( avatar &u, const item_action &a )
+{
+    map &here = get_map();
+    tripoint_bub_ms at;
+    std::string why;
+    item_location src = find_for_physics( u, here, a, at, why );
+    if( !src ) {
+        return refuse_quietly( why );
+    }
+    why = free_op_refusal( a.item.uid, false );
+    if( !why.empty() ) {
+        return refuse_quietly( why );
+    }
+    store_spot( *src, a );
+    action_done_free = true;
+    return false;
+}
+
+// hold: a carried item into the main hand (CDDA's wield and its cost) or the off hand (held.h). Nothing is ever put
+// away to make room: a hand that holds something else refuses.
+bool hold_in_hand( avatar &u, const item_action &a )
+{
+    item_location src = find_carried( u, a.item );
+    if( !src ) {
+        return refuse( u, _( "You don't have that any more." ) );
+    }
+    const std::string name = src->tname();
+    if( u.is_worn( *src ) ) {
+        return refuse( u, string_format( _( "Take off your %s first." ), name ) );
+    }
+    // Only what can be taken out by hand: not from a sealed or forbidden pocket, not a part of something (a gun's
+    // magazine, a mod), not a liquid or gas out of its container.
+    const std::string blocked_in = pocket_block( src );
+    if( !blocked_in.empty() ) {
+        return refuse( u, blocked_in );
+    }
+    if( src.has_parent() && !src.parent_pocket()->is_type( pocket_type::CONTAINER ) ) {
+        return refuse( u, string_format( _( "Your %s is part of something else." ), name ) );
+    }
+    if( src->made_of_from_type( phase_id::LIQUID ) || src->made_of_from_type( phase_id::GAS ) ) {
+        return refuse( u, string_format( _( "You can't hold the %s in your hand." ), name ) );
+    }
+    const item_location weapon = u.get_wielded_item();
+    const bool wielded = weapon && weapon.get_item() == src.get_item();
+    const item_location off = offhand_item( u );
+    const bool in_off = off && off.get_item() == src.get_item();
+    if( a.hand == item_hand::main ) {
+        if( wielded ) {
+            return refuse( u, string_format( _( "You're already holding your %s." ), name ) );
+        }
+        if( weapon ) {
+            return refuse( u, string_format( _( "Your hand is full: you're holding your %s." ), weapon->tname() ) );
+        }
+        const ret_val<void> can = u.can_wield( *src );
+        if( !can.success() ) {
+            return refuse( u, can.str() );
+        }
+        // Both hands for a two-handed item: what the other hand holds isn't put away for it.
+        if( off && !in_off && src->is_two_handed( u ) ) {
+            return refuse( u, string_format( _( "You need both hands free for your %s." ), name ) );
+        }
+        // CDDA's wield from where the item is carried, with its cost; no theft question (it is carried already).
+        if( !u.Character::wield( src ) ) {
+            return refuse( u, string_format( _( "You can't hold your %s." ), name ) );
+        }
+        // From the other hand: it is no longer held there.
+        if( item_location held = u.get_wielded_item() ) {
+            clear_offhand_mark( *held );
+        }
+        after_inventory_change( u );
+        u.add_msg_if_player( _( "You take your %s in hand." ), name );
+        return true;
+    }
+    if( in_off ) {
+        return refuse( u, string_format( _( "You're already holding your %s." ), name ) );
+    }
+    if( src->is_two_handed( u ) ) {
+        return refuse( u, string_format( _( "Your %s is too heavy to hold in one hand." ), name ) );
+    }
+    if( off ) {
+        return refuse( u, string_format( _( "Your other hand is full: you're holding your %s." ), off->tname() ) );
+    }
+    // A wielded two-handed item was refused above, so what is left here is an arm that can't hold anything.
+    const std::string blocked = offhand_unavailable( u );
+    if( !blocked.empty() ) {
+        return refuse( u, blocked );
+    }
+    if( !wielded ) {
+        const int cost = u.item_handling_cost( *src );
+        const std::string why = hold_carried( u, src );
+        if( !why.empty() ) {
+            return refuse( u, why );
+        }
+        u.mod_moves( -cost );
+        u.add_msg_if_player( _( "You take your %s in your other hand." ), name );
+        return true;
+    }
+    // From the main hand to the other: off-hand items are carried in a pocket, so it needs room in one. An open
+    // container with something in it would spill (CDDA asks what to do with it), so it stays where it is.
+    if( src->is_bucket_nonempty() ) {
+        return refuse( u, string_format( _( "Your %s would spill." ), name ) );
+    }
+    const ret_val<void> can_let_go = u.can_unwield( *src );
+    if( !can_let_go.success() ) {
+        return refuse( u, can_let_go.str() );
+    }
+    if( !u.can_stash( *src ) ) {
+        return refuse( u, string_format( _( "There's no room in your inventory for the %s." ), name ) );
+    }
+    const int cost = u.item_handling_cost( *src );
+    item copy = *src;
+    mark_offhand_pending( copy );
+    item_location added = u.i_add( copy, true, &*src, nullptr, /*allow_drop=*/false, /*allow_wield=*/false );
+    if( !added ) {
+        return refuse( u, string_format( _( "There's no room in your inventory for the %s." ), name ) );
+    }
+    u.remove_weapon();
+    const std::string why = hold_carried( u, added );
+    if( !why.empty() ) {
+        // It stays put away in the pocket it went to.
+        clear_offhand_mark( *added );
+        u.add_msg_if_player( m_info, "%s", why );
+    }
+    u.mod_moves( -cost );
+    after_inventory_change( u );
+    u.add_msg_if_player( _( "You take your %s in your other hand." ), name );
+    return true;
+}
+} // namespace
+
 void register_item_actions( input_context &ctxt )
 {
-    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw or pour one item" ) );
+    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw, pour, place, spot or hold one item" ) );
 }
 
 bool is_item_action( const std::string &action )
@@ -1364,18 +1665,19 @@ bool is_item_action( const std::string &action )
     return action == item_action_name;
 }
 
-bool run_item_action( avatar &u )
+namespace
 {
-    const std::optional<item_action> a = take_item_action();
-    if( !a ) {
-        return false;
-    }
-    // As CDDA's do_regular_action for pickup and drop.
+bool run_one_item_action( avatar &u, const std::optional<item_action> &a )
+{
+    // As CDDA's do_regular_action for pickup and drop. Place and spot never print a message.
+    const bool free_op = a->op == item_op::place || a->op == item_op::spot;
     if( u.has_active_mutation( trait_SHELL2 ) || u.has_active_mutation( trait_SHELL3 ) ) {
-        return refuse( u, _( "You can't do that while you're in your shell." ) );
+        const std::string why = _( "You can't do that while you're in your shell." );
+        return free_op ? refuse_quietly( why ) : refuse( u, why );
     }
     if( u.has_effect( effect_incorporeal ) && a->op != item_op::drop ) {
-        return refuse( u, _( "You lack the substance to affect anything." ) );
+        const std::string why = _( "You lack the substance to affect anything." );
+        return free_op ? refuse_quietly( why ) : refuse( u, why );
     }
     switch( a->op ) {
         case item_op::take:
@@ -1394,8 +1696,33 @@ bool run_item_action( avatar &u )
             return throw_at( u, *a );
         case item_op::pour:
             return pour( u, *a );
+        case item_op::place:
+            return move_lying( u, *a );
+        case item_op::spot:
+            return set_rest( u, *a );
+        case item_op::hold:
+            return hold_in_hand( u, *a );
     }
     return false;
+}
+} // namespace
+
+bool run_item_action( avatar &u )
+{
+    const std::optional<item_action> a = take_item_action();
+    if( !a ) {
+        return false;
+    }
+    action_refused = false;
+    action_done_free = false;
+    action_refusal.clear();
+    const bool took_time = run_one_item_action( u, a );
+    // Done: it took time (an activity it started counts) or it was a free action that went through.
+    if( a->tag != 0 && events_enabled() ) {
+        const bool done = !action_refused && ( took_time || action_done_free );
+        on_item_result( a->item.uid, a->tag, done, done ? std::string() : action_refusal );
+    }
+    return took_time;
 }
 
 } // namespace fp3d
