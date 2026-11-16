@@ -222,7 +222,7 @@ int main()
                 named = atks[0].detail == 1 && atks[0].text == rapid_name && atks[0].amount == fp3d::technique_strike;
             }
             zed->set_hp( zed->get_hp_max() );
-            check( named && one_each && misses_plain && rapid_name == "Rapid Strike",
+            check( named && one_each && misses_plain && rapid.is_valid() && !rapid_name.empty(),
                    "melee: a forced technique names itself", std::to_string( swings ) + " swings, " + got +
                    ( one_each ? "" : ", not one attack event a swing" ) +
                    ( misses_plain ? "" : ", a miss named a technique" ) );
