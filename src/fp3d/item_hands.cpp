@@ -19,6 +19,7 @@
 #include "enums.h"
 #include "flag.h"
 #include "fp3d/bridge.h"
+#include "fp3d/cooking.h"
 #include "fp3d/events.h"
 #include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
@@ -1808,7 +1809,7 @@ bool consume( avatar &u, const item_action &a )
 
 void register_item_actions( input_context &ctxt )
 {
-    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw, pour, place, spot, hold or consume one item" ) );
+    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw, pour, place, spot, hold, consume or cook one item" ) );
 }
 
 bool is_item_action( const std::string &action )
@@ -1856,6 +1857,10 @@ bool run_one_item_action( avatar &u, const std::optional<item_action> &a )
             return hold_in_hand( u, *a );
         case item_op::consume:
             return consume( u, *a );
+        case item_op::cook: {
+            const std::string why = start_cooking( u, *a );
+            return why.empty() || refuse( u, why );
+        }
     }
     return false;
 }

@@ -141,6 +141,7 @@ const ter_str_id ter_t_stairs_down( "t_stairs_down" );
 const ter_str_id ter_t_stairs_up( "t_stairs_up" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
 const itype_id itype_pot( "pot" );
+const itype_id itype_log( "log" );
 const itype_id itype_meat( "meat" );
 const furn_str_id furn_f_fireplace( "f_fireplace" );
 const furn_str_id furn_f_woodstove( "f_woodstove" );
@@ -227,6 +228,7 @@ std::atomic<uint64_t> cook_gone_uid{ 0 };     // the pot taken away again (a sta
 std::atomic<double> cook_capture_ms{ 0 };     // one full capture of the scene
 std::atomic<double> cook_heat_ms{ 0 };        // the heat and cookware part of it
 std::atomic<size_t> cook_heat_squares{ 0 };   // squares it built a crafting inventory for
+std::atomic<int> cook_full_free_ml{ -1 };     // scene 26: the room left on the avatar's square once filled
 // Gun item checks: the handles scene 16 gave (sim thread writes, driver reads).
 std::atomic<uint64_t> gun_glock_uid{ 0 };      // a carried Glock 19 with a full magazine
 std::atomic<uint64_t> gun_spare_uid{ 0 };      // a carried empty Glock magazine
@@ -681,6 +683,18 @@ void ask_numbers()
     std::lock_guard<std::mutex> lk( number_mutex );
     number_out = res;
     number_done.store( true );
+}
+
+// The cooking scene's pot on the fire holds 4 fresh water again (sim thread).
+static void fresh_cook_water( map &here, const tripoint_bub_ms &fire_at )
+{
+    for( item &it : here.i_at( fire_at ) ) {
+        if( it.typeId() == itype_pot ) {
+            it.clear_items();
+            it.put_in( item( itype_water, calendar::turn, 4 ), pocket_type::CONTAINER );
+            it.on_contents_changed();
+        }
+    }
 }
 
 void observe()
@@ -1249,6 +1263,39 @@ void observe()
             item_location wielded = u.get_wielded_item();
             pk_wielded_uid = wielded ? fp3d::item_handle( *wielded ) : 0;
             here.build_map_cache( p.z() );
+            break;
+        }
+        case 26: {
+            // Cooking: the avatar's square filled (logs, then single rocks) until less room is left than a rock;
+            // 4 fresh water in the pot on the fire (CDDA boils it clean there in time).
+            fresh_cook_water( here, p + tripoint_rel_ms( -1, 1, 0 ) );
+            int n = 0;
+            const item log( itype_log );
+            while( n < 200 && log.volume() > 0_ml && here.free_volume( p ) >= log.volume() ) {
+                here.add_item( p, log );
+                n++;
+            }
+            const item rock( itype_rock, calendar::turn, 1 );
+            while( n < 2000 && rock.volume() > 0_ml && here.free_volume( p ) >= rock.volume() ) {
+                here.add_item( p, rock );
+                n++;
+            }
+            cook_full_free_ml = units::to_milliliter( here.free_volume( p ) );
+            break;
+        }
+        case 27: {
+            // The fillers gone again (anything else on the square stays); 4 fresh water in the pot again.
+            fresh_cook_water( here, p + tripoint_rel_ms( -1, 1, 0 ) );
+            for( bool again = true; again; ) {
+                again = false;
+                for( item &it : here.i_at( p ) ) {
+                    if( it.typeId() == itype_log || it.typeId() == itype_rock ) {
+                        here.i_rem( p, &it );
+                        again = true;
+                        break;
+                    }
+                }
+            }
             break;
         }
         case 24: {
@@ -2962,6 +3009,186 @@ static bool run_cooking_checks()
     check( held && prompt && prompt->timed && taken == static_cast<int>( ids.size() ),
            "held during a prompt, run by the main loop", std::to_string( taken ) + " results" );
     check( again == 0 && !fp3d::take_query_result( 999999 ), "a result is taken once", "" );
+
+    // Starting the craft (the `cook` item action). Malformed actions are refused when queued. The sim refuses a
+    // recipe the contents don't make, an unknown one, too big a batch and a pot two squares away, with nothing used
+    // up, and a full square at the avatar's feet too. water_clean x2 on the fire takes 2 of the 4 water out of the
+    // pot, lays the craft at the avatar's feet (the pot's cookware entry shows it) and starts CDDA's craft; stopped
+    // with CDDA's question, the craft stays.
+    uint32_t cook_tag = 500;
+    const auto cook_action = [&]( uint64_t uid, const fp3d::ui_point & pos, const std::string & recipe, int batch ) {
+        fp3d::item_action ia;
+        ia.op = fp3d::item_op::cook;
+        ia.item = fp3d::item_ref{ uid, t_pot };
+        ia.pos = pos;
+        ia.recipe = recipe;
+        ia.batch = batch;
+        ia.tag = ++cook_tag;
+        return ia;
+    };
+    {
+        fp3d::item_action not_cook = cook_action( pot.uid, fire_at, "water_clean", 1 );
+        not_cook.op = fp3d::item_op::take;
+        fp3d::item_action batch_on_take = cook_action( pot.uid, fire_at, "", 2 );
+        batch_on_take.op = fp3d::item_op::take;
+        const bool refused_all =
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water clean", 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water\"clean", 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water\x01", 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "", 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, std::string( fp3d::max_cook_recipe_bytes + 1,
+                                      'a' ), 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water_clean", 0 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water_clean", fp3d::max_cook_batch + 1 ) ) &&
+            !fp3d::queue_item_action( not_cook ) && !fp3d::queue_item_action( batch_on_take );
+        check( refused_all, "cook: malformed actions refused when queued", "" );
+    }
+    struct cook_result {
+        bool queued = false;
+        bool back = false;        // in the main loop again
+        int answers = 0;          // item_result events for the tag
+        bool done = false;
+        std::string why;
+        int prompts = 0;
+        bool stopped = false;     // interrupt() taken
+        std::string texts;        // the prompts' and messages' texts
+    };
+    // Queues `ia` and waits for the main loop to ask again; with `stop`, interrupts the craft once it started and
+    // answers CDDA's question yes. Other prompts are cancelled.
+    const auto run_cook = [&]( const fp3d::item_action & ia, bool stop ) {
+        cook_result res;
+        std::vector<fp3d::event> evs;
+        r = fp3d::wait_request( 5000 );
+        if( !r || !r->timed ) {
+            return res;
+        }
+        fp3d::drain_events( evs );
+        evs.clear();
+        res.queued = fp3d::queue_item_action( ia );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = r->id;
+        const auto read_events = [&]() {
+            fp3d::drain_events( evs );
+            for( const fp3d::event &e : evs ) {
+                if( e.kind == fp3d::event_kind::item_result && e.detail == ia.tag ) {
+                    res.answers++;
+                    res.done = e.amount == 1;
+                    res.why = e.text;
+                } else if( e.kind == fp3d::event_kind::message ) {
+                    res.texts += " | msg: " + e.text.substr( 0, 80 );
+                }
+            }
+            evs.clear();
+        };
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 120000 * fp3d::slow_build ) {
+            read_events();
+            if( stop && res.done && !res.stopped ) {
+                res.stopped = fp3d::interrupt();
+            }
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 100, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( r->timed ) {
+                if( r->id != before ) {
+                    res.back = true;
+                    break;
+                }
+                continue;
+            }
+            res.prompts++;
+            res.texts += " | asked: " + r->text.substr( 0, 80 );
+            fp3d::ui_answer a;
+            a.id = r->id;
+            if( stop && std::find( r->actions.begin(), r->actions.end(), "YES" ) != r->actions.end() ) {
+                a.action = "YES";
+            } else {
+                a.cancel = true;
+            }
+            fp3d::answer( a );
+        }
+        read_events();
+        return res;
+    };
+    // The pot's cookware entry on the fire in the newest snapshot.
+    const auto pot_now = [&]() {
+        std::optional<fp3d::cookware_view> out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        const auto floor_div = []( int a ) {
+            return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+        };
+        const int sx = floor_div( fire_at.x );
+        const int sy = floor_div( fire_at.y );
+        const int tile = ( fire_at.y - sy * fp3d::sm_size ) * fp3d::sm_size + ( fire_at.x - sx * fp3d::sm_size );
+        for( const std::shared_ptr<const fp3d::submap_view> &sm : s->submaps ) {
+            if( sm->pos.x != sx || sm->pos.y != sy || sm->pos.z != fire_at.z ) {
+                continue;
+            }
+            for( const fp3d::cookware_view &cw : sm->cookware ) {
+                if( cw.tile == tile && cw.uid == pot.uid ) {
+                    out = cw;
+                }
+            }
+        }
+        return out;
+    };
+    // Water left in the pot, clean or not (CDDA boils the water in a pot on a fire clean by itself).
+    const uint32_t t_clean = type_of( "water_clean" );
+    const auto water_left = [&]( const std::optional<fp3d::cookware_view> &cw ) {
+        int n = 0;
+        if( cw ) {
+            for( const fp3d::cookware_item_view &c : cw->contents ) {
+                n += c.type == t_water || c.type == t_clean ? c.count : 0;
+            }
+        }
+        return n;
+    };
+    const auto cook_text = []( const cook_result & c ) {
+        return std::string( c.queued ? "" : "not queued " ) + ( c.done ? "done" : "not done" ) + " [" + c.why + "] " +
+               std::to_string( c.answers ) + " answers, " + std::to_string( c.prompts ) + " prompts" +
+               ( c.back ? "" : ", main loop not back" ) + c.texts;
+    };
+    const cook_result wrong = run_cook( cook_action( pot.uid, fire_at, "meat_cooked", 1 ), false );
+    const cook_result unknown = run_cook( cook_action( pot.uid, fire_at, "no_such_recipe", 1 ), false );
+    const cook_result too_many = run_cook( cook_action( pot.uid, fire_at, "water_clean", 5 ), false );
+    const cook_result too_far = run_cook( cook_action( meat_pot, meat_at, "meat_cooked", 1 ), false );
+    const int water_before = water_left( pot_now() );
+    check( wrong.back && wrong.answers == 1 && !wrong.done && unknown.back && unknown.answers == 1 && !unknown.done &&
+           too_many.back && too_many.answers == 1 && !too_many.done && too_far.back && too_far.answers == 1 &&
+           !too_far.done && water_before == 4, "cook: refusals, nothing used up",
+           cook_text( wrong ) + " | " + cook_text( unknown ) + " | " + cook_text( too_many ) + " | " +
+           cook_text( too_far ) + " | water " + std::to_string( water_before ) );
+    // No room for the craft at the avatar's feet: refused before anything is used up.
+    hand_setup = 26;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r ? r->id : 0 );
+    const cook_result full = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), false );
+    const std::optional<fp3d::cookware_view> full_cw = pot_now();
+    hand_setup = 27;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r ? r->id : 0 );
+    const int full_free = cook_full_free_ml.load();
+    check( full.back && full.answers == 1 && !full.done && full.why.find( "room" ) != std::string::npos && full_cw &&
+           water_left( full_cw ) == 4 && full_cw->craft_recipe.empty() && full_free >= 0 && full_free < 500,
+           "cook: no room at the feet, nothing used up",
+           cook_text( full ) + " | free " + std::to_string( full_free ) + " ml, water " +
+           std::to_string( water_left( full_cw ) ) );
+    const cook_result boiling = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), true );
+    const std::optional<fp3d::cookware_view> after = pot_now();
+    check( boiling.back && boiling.done && boiling.answers == 1 && boiling.stopped,
+           "cook: water_clean x2 started, then stopped", cook_text( boiling ) );
+    check( after && water_left( after ) == 2 && after->craft_recipe == "water_clean" &&
+           after->craft_result == type_of( "water_clean" ) && after->craft_progress <= 1000,
+           "cook: 2 water used, the craft shown with the pot",
+           after ? "water " + std::to_string( water_left( after ) ) + ", craft '" + after->craft_recipe + "' " +
+           std::to_string( after->craft_progress ) + " permille" : "pot not seen" );
     return failed == 0;
 }
 

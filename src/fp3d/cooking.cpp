@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <charconv>
 #include <chrono>
 #include <climits>
 #include <functional>
@@ -14,10 +15,12 @@
 #include <utility>
 #include <vector>
 
+#include "activity_actor_definitions.h"
 #include "avatar.h"
 #include "calendar.h"
 #include "character.h"
 #include "coordinates.h"
+#include "craft_command.h"
 #include "crafting.h"
 #include "field.h"
 #include "field_type.h"
@@ -28,11 +31,13 @@
 #include "game_constants.h"
 #include "inventory.h"
 #include "item.h"
+#include "item_components.h"
 #include "item_location.h"
 #include "itype.h"
 #include "json.h"
 #include "map.h"
 #include "mapdata.h"
+#include "math_parser_diag_value.h"
 #include "output.h"
 #include "pocket_type.h"
 #include "proficiency.h"
@@ -40,6 +45,8 @@
 #include "recipe_dictionary.h"
 #include "requirements.h"
 #include "skill.h"
+#include "string_formatter.h"
+#include "translations.h"
 #include "type_id.h"
 #include "veh_type.h"
 #include "vehicle.h"
@@ -245,8 +252,27 @@ itype_id vehicle_heat_tool( map &here, const tripoint_bub_ms &p, const heat_tabl
     return itype_id::NULL_ID();
 }
 
+// A craft the `cook` item action started names its pot (the pot's handle) in this item var.
+const std::string cook_pot_var = "fp3d_cook_pot";
+
+// The pot handle a craft names, read strictly (saves are hostile); 0 if none.
+uint64_t read_cook_pot( const item &it )
+{
+    const diag_value *v = it.maybe_get_value( cook_pot_var );
+    if( v == nullptr || !v->is_str() ) {
+        return 0;
+    }
+    const std::string &s = v->str();
+    uint64_t n = 0;
+    if( s.empty() || s.size() > 16 ) {
+        return 0;
+    }
+    const std::from_chars_result r = std::from_chars( s.data(), s.data() + s.size(), n );
+    return r.ec == std::errc() && r.ptr == s.data() + s.size() && n <= max_item_uid ? n : 0;
+}
+
 void capture_cookware( map &here, const tripoint_bub_ms &p, uint8_t tile, submap_view &sm,
-                       std::unordered_set<uint64_t> &seen )
+                       std::unordered_set<uint64_t> &seen, const tripoint_bub_ms &me )
 {
     size_t index = 0;
     for( item &it : here.i_at( p ) ) {
@@ -263,6 +289,16 @@ void capture_cookware( map &here, const tripoint_bub_ms &p, uint8_t tile, submap
         const uint64_t listed = at < max_handles_per_tile ? read_item_handle( it ) : 0;
         cw.uid = listed != 0 ? listed : item_handle( it, &seen );
         cw.type = type_index( it );
+        const auto take_craft = [&cw]( const item & c ) {
+            const recipe &making = c.get_making();
+            if( making.is_null() ) {
+                return;
+            }
+            cw.craft_recipe = cap_utf8( making.ident().str(), 128 );
+            cw.craft_result = making.result().is_null() ? 0 : intern_id( id_kind::itype, making.result().str() );
+            // CDDA's craft progress: item_counter of 10,000,000 = done.
+            cw.craft_progress = static_cast<uint16_t>( std::clamp( c.item_counter / 10000, 0, 1000 ) );
+        };
         size_t visited = 0;
         for( item *in : it.all_items_top( pocket_type::CONTAINER ) ) {
             if( visited++ >= 256 ) {
@@ -276,13 +312,19 @@ void capture_cookware( map &here, const tripoint_bub_ms &p, uint8_t tile, submap
                 cw.contents.push_back( c );
             }
             if( cw.craft_recipe.empty() && in->is_craft() ) {
-                const recipe &making = in->get_making();
-                if( !making.is_null() ) {
-                    cw.craft_recipe = cap_utf8( making.ident().str(), 128 );
-                    cw.craft_result = making.result().is_null() ? 0 : intern_id( id_kind::itype,
-                                      making.result().str() );
-                    // CDDA's craft progress: item_counter of 10,000,000 = done.
-                    cw.craft_progress = static_cast<uint16_t>( std::clamp( in->item_counter / 10000, 0, 1000 ) );
+                take_craft( *in );
+            }
+        }
+        // A craft the `cook` action started lies at the avatar's feet, next to its pot, naming it.
+        if( cw.craft_recipe.empty() && cw.uid != 0 && square_dist( me, p ) <= 1 ) {
+            size_t looked = 0;
+            for( const item &other : here.i_at( me ) ) {
+                if( looked++ >= 256 ) {
+                    break;
+                }
+                if( other.is_craft() && read_cook_pot( other ) == cw.uid ) {
+                    take_craft( other );
+                    break;
                 }
             }
         }
@@ -370,6 +412,123 @@ std::string result_json( uint64_t query_id, uint64_t container, const std::vecto
     jo.end_object();
     return os.str();
 }
+
+// What a container holds, as recipe components: its first max_query_contents items (one level), and every type in
+// them.
+struct contents_view {
+    inventory comps;
+    std::vector<itype_id> types;
+};
+
+contents_view read_contents( const item &cont )
+{
+    contents_view out;
+    size_t taken = 0;
+    for( const item *in : cont.all_items_top( pocket_type::CONTAINER ) ) {
+        if( taken++ >= max_query_contents ) {
+            break;
+        }
+        out.comps.add_item( *in, true, false );
+        in->visit_items( [&]( item * e, item * ) {
+            if( out.types.size() >= max_query_content_types ) {
+                return VisitResponse::ABORT;
+            }
+            if( std::find( out.types.begin(), out.types.end(), e->typeId() ) == out.types.end() ) {
+                out.types.push_back( e->typeId() );
+            }
+            return VisitResponse::NEXT;
+        } );
+    }
+    return out;
+}
+
+// The cooking recipes that take one of `types` as a component.
+std::vector<recipe_id> candidates_for( const std::vector<itype_id> &types )
+{
+    const recipe_index &idx = recipes_now();
+    std::vector<recipe_id> candidates;
+    std::unordered_set<recipe_id> listed;
+    for( const itype_id &t : types ) {
+        const auto found = idx.by_component.find( t );
+        if( found == idx.by_component.end() ) {
+            continue;
+        }
+        for( const recipe_id &rid : found->second ) {
+            if( candidates.size() < max_query_candidates && listed.insert( rid ).second ) {
+                candidates.push_back( rid );
+            }
+        }
+    }
+    return candidates;
+}
+
+// Tools and qualities: the avatar's crafting inventory plus the container emptied (as CDDA's crafting_inventory
+// adds a carried non-empty container's empty copy, and BOIL needs an empty one). Built once, when first needed.
+struct tool_source {
+    const avatar &u;
+    const item &cont;
+    std::optional<inventory> inv;
+    inventory &get() {
+        if( !inv ) {
+            // Item by item, not a copy: a copied inventory keeps the original's quality cache, which add_item
+            // doesn't reset (a cached "no BOIL" would hide the emptied pot).
+            inv.emplace();
+            for( const std::list<item> *stack : u.crafting_inventory().const_slice() ) {
+                for( const item &it : *stack ) {
+                    inv->add_item( it, true, false, false );
+                }
+            }
+            inv->add_item( item( cont.typeId(), cont.birthday() ), true, false, false );
+        }
+        return *inv;
+    }
+};
+
+struct alt_choice {
+    const requirement_data *alt = nullptr;
+    std::optional<requirement_data> comps;        // its components only
+    bool tools_ok = false;
+};
+
+// The alternative of `r` whose components the contents cover `batch` times, one whose tools are there if any.
+alt_choice choose_alternative( const recipe &r, const contents_view &cv,
+                               const std::function<bool( const item & )> &filter, tool_source &tools, int batch )
+{
+    alt_choice chosen;
+    for( const requirement_data &alt : r.deduped_requirements().alternatives() ) {
+        if( alt.get_components().empty() ) {
+            continue;
+        }
+        // Quick: every component group has a type that is in the container.
+        const bool possible = std::all_of( alt.get_components().begin(), alt.get_components().end(),
+        [&]( const std::vector<item_comp> &group ) {
+            return std::any_of( group.begin(), group.end(), [&]( const item_comp & ic ) {
+                return std::find( cv.types.begin(), cv.types.end(), ic.type ) != cv.types.end();
+            } );
+        } );
+        if( !possible ) {
+            continue;
+        }
+        requirement_data comps_only( requirement_data::alter_tool_comp_vector(),
+                                     requirement_data::alter_quali_req_vector(), alt.get_components() );
+        if( !comps_only.can_make_with_inventory( cv.comps, filter, batch ) ) {
+            continue;
+        }
+        requirement_data tools_only( alt.get_tools(), alt.get_qualities(),
+                                     requirement_data::alter_item_comp_vector() );
+        const bool tools_ok = tools_only.can_make_with_inventory( tools.get(), filter, batch,
+                              craft_flags::start_only );
+        if( chosen.alt == nullptr || ( tools_ok && !chosen.tools_ok ) ) {
+            chosen.alt = &alt;
+            chosen.comps = std::move( comps_only );
+            chosen.tools_ok = tools_ok;
+        }
+        if( tools_ok ) {
+            break;
+        }
+    }
+    return chosen;
+}
 } // namespace
 
 void capture_heat_and_cookware( map &here, const avatar &u, const tripoint_bub_ms &corner, submap_view &sm,
@@ -417,7 +576,7 @@ void capture_heat_and_cookware( map &here, const avatar &u, const tripoint_bub_m
         sm.heat.push_back( hv );
         // What is in or on it only as CDDA shows it (an oven is a container: seen into from next to it).
         if( here.could_see_items( p, u.pos_bub() ) ) {
-            capture_cookware( here, p, hv.tile, sm, seen );
+            capture_cookware( here, p, hv.tile, sm, seen, u.pos_bub() );
         }
     }
     heat_ms_total += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
@@ -502,45 +661,10 @@ std::string match_recipes_json( avatar &u, uint64_t query_id, const item_ref &c,
         return refuse( "not a container" );
     }
 
-    // Components: the contents only.
-    inventory comps;
-    std::vector<itype_id> content_types;
-    size_t taken = 0;
-    for( const item *in : cont->all_items_top( pocket_type::CONTAINER ) ) {
-        if( taken++ >= max_query_contents ) {
-            break;
-        }
-        comps.add_item( *in, true, false );
-        in->visit_items( [&]( item * e, item * ) {
-            if( content_types.size() >= max_query_content_types ) {
-                return VisitResponse::ABORT;
-            }
-            if( std::find( content_types.begin(), content_types.end(), e->typeId() ) == content_types.end() ) {
-                content_types.push_back( e->typeId() );
-            }
-            return VisitResponse::NEXT;
-        } );
-    }
-
-    // Recipes that take one of those as a component and need heat.
-    const recipe_index &idx = recipes_now();
-    std::vector<recipe_id> candidates;
-    std::unordered_set<recipe_id> listed;
-    for( const itype_id &t : content_types ) {
-        const auto found = idx.by_component.find( t );
-        if( found == idx.by_component.end() ) {
-            continue;
-        }
-        for( const recipe_id &rid : found->second ) {
-            if( candidates.size() < max_query_candidates && listed.insert( rid ).second ) {
-                candidates.push_back( rid );
-            }
-        }
-    }
-
-    // Tools and qualities: the avatar's crafting inventory plus the container emptied (as CDDA's
-    // crafting_inventory adds a carried non-empty container's empty copy, and BOIL needs an empty one).
-    std::optional<inventory> tools;
+    // Components: the contents only. Recipes: those that take one of them as a component and need heat.
+    const contents_view cv = read_contents( *cont );
+    const std::vector<recipe_id> candidates = candidates_for( cv.types );
+    tool_source tools{ u, *cont, std::nullopt };
     std::optional<std::unordered_set<const recipe *>> available;
     std::vector<match> found;
     size_t checked = 0;
@@ -554,64 +678,20 @@ std::string match_recipes_json( avatar &u, uint64_t query_id, const item_ref &c,
         }
         checked++;
         const std::function<bool( const item & )> filter = r.get_component_filter();
-        // The alternative whose components the contents cover (and whose tools are there, if one is).
-        const requirement_data *chosen = nullptr;
-        std::optional<requirement_data> chosen_comps;
-        bool chosen_tools_ok = false;
-        for( const requirement_data &alt : r.deduped_requirements().alternatives() ) {
-            if( alt.get_components().empty() ) {
-                continue;
-            }
-            // Quick: every component group has a type that is in the container.
-            const bool possible = std::all_of( alt.get_components().begin(), alt.get_components().end(),
-            [&]( const std::vector<item_comp> &group ) {
-                return std::any_of( group.begin(), group.end(), [&]( const item_comp & ic ) {
-                    return std::find( content_types.begin(), content_types.end(), ic.type ) != content_types.end();
-                } );
-            } );
-            if( !possible ) {
-                continue;
-            }
-            requirement_data comps_only( requirement_data::alter_tool_comp_vector(),
-                                         requirement_data::alter_quali_req_vector(), alt.get_components() );
-            if( !comps_only.can_make_with_inventory( comps, filter, 1 ) ) {
-                continue;
-            }
-            if( !tools ) {
-                // Item by item, not a copy: a copied inventory keeps the original's quality cache, which
-                // add_item doesn't reset (a cached "no BOIL" would hide the emptied pot).
-                tools.emplace();
-                for( const std::list<item> *stack : u.crafting_inventory().const_slice() ) {
-                    for( const item &it : *stack ) {
-                        tools->add_item( it, true, false, false );
-                    }
-                }
-                tools->add_item( item( cont->typeId(), cont->birthday() ), true, false, false );
-            }
-            requirement_data tools_only( alt.get_tools(), alt.get_qualities(),
-                                         requirement_data::alter_item_comp_vector() );
-            const bool tools_ok = tools_only.can_make_with_inventory( *tools, filter, 1, craft_flags::start_only );
-            if( chosen == nullptr || ( tools_ok && !chosen_tools_ok ) ) {
-                chosen = &alt;
-                chosen_comps = std::move( comps_only );
-                chosen_tools_ok = tools_ok;
-            }
-            if( tools_ok ) {
-                break;
-            }
-        }
+        const alt_choice choice = choose_alternative( r, cv, filter, tools, 1 );
+        const requirement_data *chosen = choice.alt;
         if( chosen == nullptr ) {
             continue;
         }
         match m;
         m.r = &r;
-        m.tools_ok = chosen_tools_ok;
+        m.tools_ok = choice.tools_ok;
         while( m.batch_max < max_recipe_batch &&
-               chosen_comps->can_make_with_inventory( comps, filter, m.batch_max + 1 ) ) {
+               choice.comps->can_make_with_inventory( cv.comps, filter, m.batch_max + 1 ) ) {
             m.batch_max++;
         }
         for( const std::vector<item_comp> &group : chosen->get_components() ) {
-            for( const itype_id &t : content_types ) {
+            for( const itype_id &t : cv.types ) {
                 if( std::any_of( group.begin(), group.end(), [&t]( const item_comp & ic ) {
                 return ic.type == t;
             } ) ) {
@@ -649,7 +729,7 @@ std::string match_recipes_json( avatar &u, uint64_t query_id, const item_ref &c,
             // The availability CDDA's check left on this copy says which groups are missing.
             requirement_data tools_only( chosen->get_tools(), chosen->get_qualities(),
                                          requirement_data::alter_item_comp_vector() );
-            tools_only.can_make_with_inventory( *tools, filter, 1, craft_flags::start_only );
+            tools_only.can_make_with_inventory( tools.get(), filter, 1, craft_flags::start_only );
             for( const std::vector<tool_comp> &group : tools_only.get_tools() ) {
                 if( std::none_of( group.begin(), group.end(), []( const tool_comp & t ) {
                 return t.available == available_status::a_true;
@@ -697,6 +777,174 @@ std::string match_recipes_json( avatar &u, uint64_t query_id, const item_ref &c,
 std::string run_recipe_query( uint64_t query_id, const item_ref &c, const ui_point &pos )
 {
     return match_recipes_json( get_avatar(), query_id, c, tripoint_abs_ms( pos.x, pos.y, pos.z ) );
+}
+
+std::string start_cooking( avatar &u, const item_action &a )
+{
+    map &here = get_map();
+    const tripoint_bub_ms p = here.get_bub( tripoint_abs_ms( a.pos.x, a.pos.y, a.pos.z ) );
+    const tripoint_bub_ms me = u.pos_bub( here );
+    // The pot lies on the avatar's square or one next to it (where CDDA works on a craft from).
+    if( !here.inbounds( p ) || p.z() != me.z() || square_dist( p, me ) > 1 || !here.accessible_items( p ) ) {
+        return _( "You can't reach that from here." );
+    }
+    item *pot = nullptr;
+    for( item &it : here.i_at( p ) ) {
+        if( matches( it, a.item ) ) {
+            pot = &it;
+            break;
+        }
+    }
+    if( pot == nullptr ) {
+        return _( "That isn't there any more." );
+    }
+    if( !pot->is_container() ) {
+        return _( "Nothing can be cooked in that." );
+    }
+    // Only a cooking recipe match_recipes would list for these contents. The client's text is compared, never
+    // made an id itself.
+    const contents_view cv = read_contents( *pot );
+    const std::vector<recipe_id> candidates = candidates_for( cv.types );
+    const auto named = std::find_if( candidates.begin(), candidates.end(), [&a]( const recipe_id & c ) {
+        return c.str() == a.recipe;
+    } );
+    if( named == candidates.end() || !named->is_valid() || ( *named )->never_learn ) {
+        return string_format( _( "Nothing in the %s makes that." ), pot->type_name() );
+    }
+    const recipe_id rid = *named;
+    const recipe &r = rid.obj();
+    // CDDA's own checks before a craft (crafting_allowed, craft_command::execute).
+    if( u.is_driving() ) {
+        return _( "You can't craft while driving!" );
+    }
+    if( u.morale_crafting_speed_multiplier( r ) <= 0.0f ) {
+        return _( "Your morale is too low to craft such a difficult thing…" );
+    }
+    if( u.lighting_craft_speed_multiplier( r ) <= 0.0f ) {
+        return _( "You can't see to craft!" );
+    }
+    const recipe_subset &known = u.get_group_available_recipes();
+    if( std::find( known.begin(), known.end(), &r ) == known.end() ) {
+        return _( "You don't know how to make that." );
+    }
+    if( !r.character_has_required_proficiencies( u ) ) {
+        return _( "You don't have the required proficiencies to craft this!" );
+    }
+    const std::function<bool( const item & )> filter = r.get_component_filter();
+    tool_source tools{ u, *pot, std::nullopt };
+    const alt_choice choice = choose_alternative( r, cv, filter, tools, a.batch );
+    if( choice.alt == nullptr ) {
+        return string_format( _( "There isn't enough in the %s for that." ), pot->type_name() );
+    }
+    if( !choice.tools_ok ) {
+        return _( "You don't have the tools to make that here." );
+    }
+    // Each component group: the first kind the contents have enough of (never the pot itself).
+    std::vector<item_comp> picks;
+    for( const std::vector<item_comp> &group : choice.alt->get_components() ) {
+        const auto pick = std::find_if( group.begin(), group.end(), [&]( const item_comp & ic ) {
+            return ic.type != pot->typeId() && ic.has( cv.comps, filter, a.batch );
+        } );
+        if( pick == group.end() ) {
+            return string_format( _( "There isn't enough in the %s for that." ), pot->type_name() );
+        }
+        picks.push_back( *pick );
+    }
+    // Tools before anything is used up: the heat under the pot first, else CDDA's pick (it may ask).
+    inventory square_inv;
+    square_inv.form_from_map( &here, p, 0, &u, false, false );
+    inventory map_inv;
+    map_inv.form_from_map( me, PICKUP_RANGE, &u );
+    std::vector<comp_selection<tool_comp>> tool_picks;
+    for( const std::vector<tool_comp> &group : choice.alt->get_tools() ) {
+        comp_selection<tool_comp> sel;
+        for( const tool_comp &tc : group ) {
+            if( tc.has( square_inv, return_true<item>, a.batch, craft_flags::start_only ) ) {
+                sel.use_from = usage_from::map;
+                sel.comp = tc;
+                break;
+            }
+        }
+        if( sel.use_from == usage_from::none ) {
+            sel = u.select_tool_component( group, a.batch, map_inv, true, true, false, []( int charges ) {
+                return charges / 20 + charges % 20;
+            } );
+        }
+        if( sel.use_from == usage_from::none || sel.use_from == usage_from::cancel ) {
+            return _( "You don't have the tools to make that here." );
+        }
+        tool_picks.push_back( sel );
+    }
+    // The components come out of the pot only (CDDA's consume_items would take them from anywhere near).
+    const auto take_components = [&]( item & from, item_components & used, std::vector<item_comp> &comps_used ) {
+        for( const item_comp &ic : picks ) {
+            int qty = ic.count * a.batch;
+            std::list<item> taken;
+            if( item::count_by_charges( ic.type ) ) {
+                from.use_charges( ic.type, qty, taken, p, filter );
+            } else {
+                from.use_amount( ic.type, qty, taken, filter );
+            }
+            for( item &it : taken ) {
+                used.add( it );
+            }
+            item_comp total = ic;
+            total.count *= a.batch;
+            const auto same = std::find_if( comps_used.begin(), comps_used.end(), [&]( const item_comp & c ) {
+                return c.type == total.type;
+            } );
+            if( same != comps_used.end() ) {
+                same->count += total.count;
+            } else {
+                comps_used.push_back( total );
+            }
+        }
+    };
+    // The craft is made from a copy of the pot and laid down first: nothing is used up unless it has its place.
+    item_components used;
+    std::vector<item_comp> comps_used;
+    {
+        item trial = *pot;
+        take_components( trial, used, comps_used );
+    }
+    // As craft_command::create_in_progress_craft and Character::start_craft.
+    item craft( &r, a.batch, used, comps_used );
+    craft.set_cached_tool_selections( tool_picks );
+    craft.set_tools_to_continue( true );
+    craft.set_next_failure_point( u );
+    craft.set_owner( u );
+    craft.set_var( cook_pot_var, std::to_string( a.item.uid ) );
+    // At the avatar's feet only, as CDDA's crafting without a workbench or a free hand: never into the hands (they
+    // stay as they are) and never spilled over to a square next to it (the fire would burn it).
+    item_location craft_loc = here.add_item_or_charges_ret_loc( me, craft, false );
+    if( !craft_loc ) {
+        return _( "There's no room for that here." );
+    }
+    // Placed: the same out of the pot itself (found again, the craft may share its square), then the tools'
+    // start charges.
+    pot = nullptr;
+    for( item &it : here.i_at( p ) ) {
+        if( matches( it, a.item ) ) {
+            pot = &it;
+            break;
+        }
+    }
+    if( pot == nullptr ) {
+        craft_loc.remove_item();
+        return _( "That isn't there any more." );
+    }
+    {
+        item_components taken;
+        std::vector<item_comp> taken_comps;
+        take_components( *pot, taken, taken_comps );
+    }
+    pot->on_contents_changed();
+    u.craft_consume_tools( *craft_loc, 1, true );
+    u.last_batch = a.batch;
+    u.lastrecipe = rid;
+    u.assign_activity( craft_activity_actor( craft_loc, false ) );
+    u.add_msg_if_player( pgettext( "in progress craft", "You start working on the %s." ), craft_loc->tname() );
+    return std::string();
 }
 
 } // namespace fp3d
