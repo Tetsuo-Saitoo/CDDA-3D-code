@@ -516,6 +516,57 @@ void write_template_choices( JsonOut &jo, const std::string &name, const templat
 }
 } // namespace
 
+namespace
+{
+const char *const fallback_name = "Survivor";
+constexpr int max_name_picks = 8;
+
+// A name from the game's own data made to pass name_ok where it can: what name_ok refuses is dropped, then as a
+// typed name (checked_name). "" when nothing passes.
+std::string tidied_name( const std::string &raw )
+{
+    std::string s;
+    for( const char ch : raw ) {
+        const unsigned char c = static_cast<unsigned char>( ch );
+        if( c >= 0x20 && c != 0x7f && ch != '/' && ch != '\\' ) {
+            s += ch;
+        }
+    }
+    for( size_t at = s.find( ".." ); at != std::string::npos; at = s.find( ".." ) ) {
+        s.erase( at, 1 );
+    }
+    const size_t first = s.find_first_not_of( "# " );
+    s.erase( 0, first == std::string::npos ? s.size() : first );
+    s = checked_name( s );
+    return name_ok( s ) ? s : std::string();
+}
+} // namespace
+
+void settle_new_character( avatar &u )
+{
+    for( int i = 0; i < max_name_picks && !name_ok( u.name ); i++ ) {
+        u.pick_name();
+    }
+    if( !name_ok( u.name ) ) {
+        u.name = fallback_name;
+    }
+    u.set_save_id( u.name );
+}
+
+void settle_taken_name( avatar &u )
+{
+    if( name_ok( u.name ) ) {
+        return;
+    }
+    const std::string tidy = tidied_name( u.name );
+    u.name = tidy.empty() ? std::string( fallback_name ) : tidy;
+}
+
+bool save_id_ok( const std::string &id )
+{
+    return plain_text( id, max_name_bytes ) && id.front() != '#';
+}
+
 std::vector<std::string> list_templates()
 {
     namespace fs = std::filesystem;

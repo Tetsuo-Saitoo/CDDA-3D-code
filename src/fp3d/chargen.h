@@ -30,6 +30,16 @@ std::string apply_chargen( avatar &u, const std::string &choices_json );
 // Asks the client for a character (a `chargen` request, re-asked with `status` set to the problem until the
 // answer is valid) and builds the avatar. False if the client cancelled. Throws shutdown_signal on shutdown.
 bool run_chargen();
+
+// Input validation for the name of a new game's character, whatever made it (the client, a template, the game's
+// own name lists): a name that fails is picked again a few times, then a fixed name is used. The save id is set
+// once here, to that name. Sim side, once per new game before it starts.
+void settle_new_character( avatar &u );
+// Input validation for a name the avatar takes over in play (CDDA's control_npc): one that fails is tidied, else
+// the fixed name is used. The save id stays as it is.
+void settle_taken_name( avatar &u );
+// Input validation for the id the game saves under.
+bool save_id_ok( const std::string &id );
 } // namespace fp3d
 
 #endif // CATA_SRC_FP3D_CHARGEN_H

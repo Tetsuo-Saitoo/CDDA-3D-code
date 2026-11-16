@@ -71,6 +71,7 @@
 #include "item_location.h"
 #include "line.h"
 #include "math_parser_diag_value.h"
+#include "memory_fast.h"
 #include "json_loader.h"
 #include "map.h"
 #include "map_selector.h"
@@ -145,6 +146,7 @@ const ter_str_id ter_t_stairs_up( "t_stairs_up" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
 const itype_id itype_pot( "pot" );
 const itype_id itype_log( "log" );
+const faction_id faction_your_followers( "your_followers" );
 const itype_id itype_splinter( "splinter" );
 const itype_id itype_lighter( "lighter" );
 const itype_id itype_meat( "meat" );
@@ -324,6 +326,17 @@ struct number_results {
 };
 std::mutex number_mutex;
 number_results number_out;
+// Name checks: what scene 33 saw (sim thread writes, driver reads).
+struct name_results {
+    bool ran = false;
+    bool swapped = false;        // the avatar is the NPC's character now
+    bool taken_ok = false;       // the name it took is the tidied one
+    bool id_kept = false;        // the save id as before
+    bool save_refused = false;   // game::save under a refused id
+    size_t name_bytes = 0;
+};
+std::mutex names_mutex;
+name_results names_out;
 std::atomic<int> interrupt_route{ -1 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
@@ -1365,6 +1378,36 @@ void observe()
             }
             here.remove_field( fire_at, fd_fire );
             here.add_field( fire_at, fd_fire, 2 );
+            break;
+        }
+        case 33: {
+            // Names: an ally with a refused name is taken over (CDDA's control_npc), then a save under a refused
+            // save id is tried. Last scene of the game: the avatar is another character afterwards.
+            avatar &u = get_avatar();
+            name_results res;
+            const std::string id_before = u.get_save_id();
+            const tripoint_bub_ms npc_at = p + tripoint_rel_ms( 2, 0, 0 );
+            shared_ptr_fast<npc> guy = make_shared_fast<npc>();
+            guy->normalize();
+            guy->randomize();
+            guy->spawn_at_precise( here.get_abs( npc_at ) );
+            overmap_buffer.insert_npc( guy );
+            g->load_npcs();
+            guy->set_fac( faction_your_followers );
+            g->add_npc_follower( guy->getID() );
+            guy->name = std::string( "#Ann\x01/Lee.." );
+            const character_id guy_id = guy->getID();
+            u.control_npc( *guy );
+            res.ran = true;
+            res.swapped = u.getID() == guy_id;
+            res.taken_ok = u.name == "AnnLee.";
+            res.name_bytes = u.name.size();
+            res.id_kept = u.get_save_id() == id_before;
+            u.set_save_id( "#fp3d refused" );
+            res.save_refused = !g->save();
+            u.set_save_id( id_before );
+            const std::lock_guard<std::mutex> lk( names_mutex );
+            names_out = res;
             break;
         }
         case 24: {
@@ -3367,6 +3410,42 @@ static bool run_cooking_checks()
            cook_text( finished ) + " | clean water " + std::to_string( clean ) +
            ( served ? ", craft '" + served->craft_recipe + "'" : ", pot not seen" ) );
     scene( 32 );
+    return failed == 0;
+}
+
+// Input validation for names in play (fp3d/chargen.h): scene 33 on the sim thread. Run last on this game.
+static bool run_name_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  names: %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 33;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 30000, r->id );
+    for( int i = 0; i < 10 && r && !r->timed; i++ ) {
+        fp3d::ui_answer cancel;
+        cancel.id = r->id;
+        cancel.cancel = true;
+        fp3d::answer( cancel );
+        r = fp3d::wait_request( 10000, r->id );
+    }
+    name_results res;
+    {
+        const std::lock_guard<std::mutex> lk( names_mutex );
+        res = names_out;
+    }
+    check( r && r->timed && res.ran && res.swapped && res.taken_ok && res.id_kept,
+           "a taken-over name is checked, the save id stays",
+           std::string( res.ran ? "" : "scene not run " ) + ( res.swapped ? "" : "not taken over " ) +
+           ( res.id_kept ? "" : "save id changed " ) + std::to_string( res.name_bytes ) + " bytes" );
+    check( res.ran && res.save_refused, "a save under a refused id is refused", "" );
     return failed == 0;
 }
 
@@ -7993,6 +8072,7 @@ int main()
     const bool character_ok = lying_ok && run_character_query_checks();
     const bool peek_ok = character_ok && run_peek_checks();
     const bool number_ok = peek_ok && run_number_checks();
+    const bool names_ok = number_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -8052,6 +8132,7 @@ int main()
     std::printf( "character query: %s\n", character_ok ? "ok" : "BAD" );
     std::printf( "peek: %s\n", peek_ok ? "ok" : "BAD" );
     std::printf( "number requests: %s\n", number_ok ? "ok" : "BAD" );
+    std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -8063,6 +8144,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok ?
+           peek_ok && number_ok && names_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

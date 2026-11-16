@@ -30,6 +30,7 @@
 #include "profession.h"
 #include "rng.h"
 #include "scenario.h"
+#include "text_snippets.h"
 
 namespace
 {
@@ -471,6 +472,57 @@ int main()
                                          opts, mods );
             check( w.empty() && mods_ordered( mods ) && mods.size() >= 3 && mods[1].str() == nodeps_mod &&
                    mods.back().str() == dep_mod, "core mod first, before mods picked ahead of it", w );
+        }
+
+        // Input validation for names from the game's own data: a new character's (picked again, else a fixed name; the
+        // save id set once) and one taken over in play. Last of the name checks: the game's name lists are replaced.
+        {
+            const auto passes = []( const std::string & n ) {
+                return !n.empty() && n.size() <= 64 && n.front() != '#' &&
+                       n.find_first_of( "/\\" ) == std::string::npos && n.find( ".." ) == std::string::npos &&
+                std::none_of( n.begin(), n.end(), []( char ch ) {
+                    const unsigned char c = static_cast<unsigned char>( ch );
+                    return c < 0x20 || c == 0x7f;
+                } );
+            };
+            const auto name_lists = []( const std::string & json ) {
+                SNIPPET.clear_snippets();
+                const JsonValue v = json_loader::from_string( json );
+                for( const char *category : { "<male_full_name>", "<female_full_name>" } ) {
+                    SNIPPET.add_snippets_from_json( category, v.get_array(), "fp3d test" );
+                }
+            };
+            u.name = "Good Name";
+            u.set_save_id( "" );
+            fp3d::settle_new_character( u );
+            check( u.name == "Good Name" && u.get_save_id() == "Good Name", "a good name stays, the save id is set" );
+            // One good name among refused ones: picked again until it comes, or the fixed name after 8 picks.
+            name_lists( "[\"#../a\", \"b/c\", \"d\\\\e\", \"..\", \"\\u0001x\", \"Ok Name\"]" );
+            bool settled = true;
+            std::string seen;
+            for( int i = 0; i < 20; i++ ) {
+                u.name = "#bad";
+                fp3d::settle_new_character( u );
+                settled = settled && passes( u.name ) && ( u.name == "Ok Name" || u.name == "Survivor" ) &&
+                          u.get_save_id() == u.name;
+                seen = u.name;
+            }
+            check( settled, "a new character's name from a list with refused names", seen );
+            name_lists( "[\"#../a\", \"b/c\", \"..\"]" );
+            u.name = "x/y";
+            fp3d::settle_new_character( u );
+            check( u.name == "Survivor" && u.get_save_id() == "Survivor", "only refused names: the fixed name", u.name );
+            // A name taken over in play: tidied, else the fixed name; the save id stays.
+            u.name = std::string( "#Ann\x01/Lee.." );
+            fp3d::settle_taken_name( u );
+            const std::string tidied = u.name;
+            u.name = "#/\\";
+            fp3d::settle_taken_name( u );
+            check( tidied == "AnnLee." && u.name == "Survivor" && u.get_save_id() == "Survivor",
+                   "a taken-over name: tidied, else the fixed name", tidied + " | " + u.name );
+            check( fp3d::save_id_ok( "Good Name" ) && !fp3d::save_id_ok( "#x" ) && !fp3d::save_id_ok( "" ) &&
+                   !fp3d::save_id_ok( std::string( 65, 'a' ) ) && !fp3d::save_id_ok( std::string( "a\x01" ) ),
+                   "save ids: plain text only" );
         }
 
         // A cancelled start deletes the world it made (fp3d::remove_new_world; the one this test booted): never while

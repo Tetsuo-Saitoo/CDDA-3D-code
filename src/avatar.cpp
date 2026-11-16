@@ -40,6 +40,8 @@
 #include "game_constants.h"
 #include "game_inventory.h"
 #include "help.h"
+#include "fp3d/bridge.h" // FP3D:
+#include "fp3d/chargen.h" // FP3D:
 #include "inventory.h"
 #include "item.h"
 #include "item_location.h"
@@ -171,6 +173,10 @@ void avatar::control_npc( npc &np, const bool debug )
     std::swap( get_shadow_npc(), np );
     // move shadow npc character data into avatar
     swap_character( get_shadow_npc() );
+    // FP3D: input validation of the name taken over (fp3d/chargen.h)
+    if( fp3d::active() ) {
+        fp3d::settle_taken_name( *this );
+    }
     // the avatar character is no longer a follower NPC
     g->remove_npc_follower( getID() );
     // the previous avatar character is now a follower

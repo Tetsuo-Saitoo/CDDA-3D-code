@@ -1071,6 +1071,7 @@ void make_avatar()
     if( !why.empty() ) {
         throw std::runtime_error( "range avatar: " + why );
     }
+    fp3d::settle_new_character( u );
 }
 } // namespace
 
