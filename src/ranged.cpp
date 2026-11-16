@@ -1091,6 +1091,9 @@ int Character::fire_gun( map &here, const tripoint_bub_ms &target, int shots, it
             break;
         }
         if( !handle_gun_damage( gun ) ) {
+            if( fp3d::events_enabled() ) {
+                fp3d::on_misfire( *this, gun ); // FP3D: the trigger was pulled and no round went off
+            }
             break;
         }
         if( !handle_gun_overheat( gun ) ) {

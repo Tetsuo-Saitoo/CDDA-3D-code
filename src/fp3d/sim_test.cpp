@@ -2634,6 +2634,7 @@ static bool run_combat_checks()
         std::string gun = "glock_19";
         std::string mode;           // gun mode, "" = its default
         std::string fault;          // a fault set on the gun ("" = none)
+        int dirt = -1;              // the gun's fouling (item var dirt, -1 = none); 10000 always misfires
         std::string ammo;           // the gun's ammo, "" = 9mm
         bool spare_gun = false;     // also a jammed loaded `gun` in the pack
         bool ground_gun = false;    // and one lying a square west
@@ -2763,7 +2764,12 @@ static bool run_combat_checks()
                 }
                 // No random malfunction (CDDA's roll, about 1 in 300 shots even for a new gun and a skilled
                 // shooter: the shot silently doesn't happen): the checks are about the hooks. Jams are set above.
-                gun.set_flag( flag_NEVER_JAMS );
+                // A fouled gun keeps CDDA's misfire roll (NEVER_JAMS turns it off): at 10000 it always misfires.
+                if( sc->dirt >= 0 ) {
+                    gun.set_var( "dirt", sc->dirt );
+                } else {
+                    gun.set_flag( flag_NEVER_JAMS );
+                }
                 u.set_wielded_item( gun );
             } else {
                 u.remove_weapon();
@@ -2933,6 +2939,7 @@ static bool run_combat_checks()
         std::vector<fp3d::ui_request> shots;        // the shot requests
         std::vector<fp3d::event> projectiles;       // projectile events from the action on
         std::vector<fp3d::event> damages;           // damage events from the action on
+        std::vector<fp3d::event> misfires;          // misfire events from the action on
         bool back = false;                          // back in the main loop afterwards
     };
     // How the target request is answered: FIRE, an aim-and-shoot action, a cancel (all with the shot), or FIRE
@@ -3056,6 +3063,8 @@ static bool run_combat_checks()
                 r.projectiles.push_back( std::move( e ) );
             } else if( e.kind == fp3d::event_kind::damage ) {
                 r.damages.push_back( std::move( e ) );
+            } else if( e.kind == fp3d::event_kind::misfire ) {
+                r.misfires.push_back( std::move( e ) );
             }
         }
         return r;
@@ -3109,6 +3118,21 @@ static bool run_combat_checks()
         check( r.damages.size() == 1 && ( landed ? wp == "head" : wp == fp3d::weakpoint_text( wp ) ),
                "the damage event names the weak point hit", std::string( landed ? "landed" : "not landed" ) +
                ", damage " + ( named.empty() ? "none" : named ) );
+        check( r.misfires.empty(), "a round that fires sends no misfire event",
+               std::to_string( r.misfires.size() ) + " misfire events" );
+    }
+    // A gun fouled to CDDA's most (dirt 10000) misfires: the trigger is pulled, no round goes off (no shot request,
+    // no projectile, the round stays), and the player's misfire event says so with the gun.
+    {
+        scene fouled = point_blank;
+        fouled.dirt = 10000;
+        const result r = run( fouled, "fire", answer_with::fire, head, true, head );
+        const fp3d::event m = r.misfires.empty() ? fp3d::event() : r.misfires.front();
+        check( fired( r, 0 ) && r.shots.empty() && r.projectiles.empty() && r.misfires.size() == 1 && m.uid == 1 &&
+               m.detail == 1 && m.type != 0,
+               "a fouled gun misfires: a misfire event, nothing fired", counts( r ) + ", " +
+               std::to_string( r.misfires.size() ) + " misfire events, detail " + std::to_string( m.detail ) +
+               ", " + std::to_string( r.shots.size() ) + " shot requests" );
     }
     // Refused shot answers leave the projectile to CDDA's own path, not the FIRE answer's outcome (CDDA's own roll
     // hits the adjacent zombie).

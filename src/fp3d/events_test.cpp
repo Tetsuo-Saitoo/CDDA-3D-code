@@ -32,6 +32,7 @@
 #include "fp3d/snapshot.h"
 #include "fp3d/swing.h"
 #include "game.h"
+#include "item.h"
 #include "map.h"
 #include "martialarts.h"
 #include "messages.h"
@@ -432,6 +433,22 @@ int main()
                            " \"" + on_head[0].text + "\"" ) + ( on_body.empty() ? " none" : " \"" + on_body[0].text + "\"" ) +
                    ( ids_ok ? "" : " ids wrong" ) );
             zed->set_hp( zed->get_hp_max() );   // the checks after this one want it alive
+        }
+        {
+            // a trigger pull with no round: the shooter, its square, the gun, 1 a misfire / 2 the gun is jammed now
+            item clean_gun( itype_id( "glock_19" ) );
+            item jammed_gun( itype_id( "glock_19" ) );
+            jammed_gun.set_fault( fault_id( "fault_stovepipe" ), true, false );
+            drain( event_kind::misfire );
+            fp3d::on_misfire( u, clean_gun );
+            fp3d::on_misfire( u, jammed_gun );
+            const std::vector<event> mis = drain( event_kind::misfire );
+            const fp3d::ui_point me = fp3d::to_ui_point( u.pos_abs() );
+            check( mis.size() == 2 && mis[0].uid == 1 && mis[0].pos.x == me.x && mis[0].pos.y == me.y &&
+                   name_of( fp3d::id_kind::itype, mis[0].type ) == "glock_19" && mis[0].detail == 1 &&
+                   mis[1].detail == 2, "misfire: the shooter, its square, the gun; a jam says so",
+                   std::to_string( mis.size() ) + " events" + ( mis.empty() ? "" : ", detail " +
+                           std::to_string( mis[0].detail ) ) );
         }
         {
             const tripoint_bub_ms under = at + tripoint_rel_ms( 0, 0, -1 );
