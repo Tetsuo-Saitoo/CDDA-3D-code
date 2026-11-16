@@ -1,26 +1,36 @@
 #include "fp3d/snapshot.h"
 
 #include <algorithm>
+#include <climits>
 #include <cmath>
+#include <cstdint>
 #include <map>
-#include <optional>
 #include <mutex>
+#include <optional>
 #include <ostream>
 #include <set>
+#include <sstream>
 #include <tuple>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
 
 #include "avatar.h"
+#include "bionics.h"
+#include "bodypart.h"
 #include "calendar.h"
 #include "catacharset.h"
+#include "character.h"
 #include "character_id.h"
 #include "coordinates.h"
 #include "creature.h"
 #include "display.h"
 #include "effect.h"
 #include "enums.h"
+#include "mutation.h"
+#include "profession.h"
+#include "proficiency.h"
+#include "skill.h"
 #include "type_id.h"
 #include "field.h"
 #include "fp3d/bridge.h"
@@ -1382,6 +1392,475 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     }
     jo.end_object();
     jo.end_object();
+}
+
+
+// ---- Character sheet (G4): the character screen's data for a character query (bridge.h). ----
+
+namespace
+{
+struct speed_mod {
+    std::string name;
+    int value = 0;
+    bool percent = false;
+    bool move_cost = false;   // a move cost change (CDDA's MOVE COST list), not a speed change
+};
+struct enc_view {
+    int enc = 0;
+    int layer = 0;
+    int warmth = 0;
+};
+struct skill_view {
+    std::string id;
+    std::string name;
+    std::string description;
+    int level = 0;
+    int knowledge = 0;
+    int progress = 0;
+    int knowledge_progress = 0;
+};
+struct prof_view {
+    std::string id;
+    std::string name;
+    std::string description;
+    int percent = 0;
+};
+struct trait_view {
+    std::string id;
+    std::string name;
+    std::string description;
+    int rating = 0;
+    bool mutation = false;
+};
+struct bionic_view {
+    std::string id;
+    std::string name;
+    std::string description;
+    bool active = false;
+};
+struct sheet {
+    std::string name;
+    std::string profession;
+    int age = 0;
+    int height_cm = 0;
+    int stats[4][2] = {};
+    int speed = 0;
+    int move_cost = 0;
+    std::vector<speed_mod> speed_mods;
+    std::vector<enc_view> encumbrance;
+    std::vector<skill_view> skills;
+    std::vector<prof_view> known;
+    std::vector<prof_view> learning;
+    std::vector<trait_view> traits;
+    std::vector<bionic_view> bionics;
+    int power_kj = 0;
+    int max_power_kj = 0;
+    std::vector<std::pair<std::string, std::string>> effects;   // id, description
+};
+
+// An id from game data the client gets as is: printable ASCII, at most max_sheet_id_bytes; empty if not.
+std::string clean_id( const std::string &id )
+{
+    if( id.empty() || id.size() > max_sheet_id_bytes ) {
+        return std::string();
+    }
+    for( const char ch : id ) {
+        const unsigned char u = static_cast<unsigned char>( ch );
+        if( u < 0x20 || u >= 0x7f || ch == '<' || ch == '>' ) {
+            return std::string();
+        }
+    }
+    return id;
+}
+
+std::string name_text( const std::string &raw )
+{
+    return client_text( raw, max_sheet_name_columns, 4 * max_sheet_name_columns );
+}
+
+// Line breaks and tabs become spaces (client_text drops control characters), runs of spaces one.
+std::string description_text( const std::string &raw )
+{
+    std::string flat;
+    flat.reserve( std::min<size_t>( raw.size(), 8 * max_sheet_description_columns ) );
+    for( const char ch : raw ) {
+        if( flat.size() >= 8 * max_sheet_description_columns ) {
+            break;
+        }
+        const char c = ch == '\n' || ch == '\r' || ch == '\t' ? ' ' : ch;
+        if( c == ' ' && ( flat.empty() || flat.back() == ' ' ) ) {
+            continue;
+        }
+        flat.push_back( c );
+    }
+    while( !flat.empty() && flat.back() == ' ' ) {
+        flat.pop_back();
+    }
+    return client_text( flat, max_sheet_description_columns, 4 * max_sheet_description_columns );
+}
+
+int clamp_int( double v, int lo, int hi )
+{
+    if( !std::isfinite( v ) ) {
+        return lo;
+    }
+    return static_cast<int>( std::clamp( v, static_cast<double>( lo ), static_cast<double>( hi ) ) );
+}
+
+// CDDA's speed tab (player_display.cpp get_speedlist_entries): effects' SPEED mods by speed name, the other speed
+// bonuses, then the move cost changes.
+void read_speed( const avatar &u, sheet &s )
+{
+    std::map<std::string, int> by_effect;
+    for( const effect &e : u.get_effects() ) {
+        const int adjust = e.get_mod( "SPEED", u.resists_effect( e ) );
+        if( adjust != 0 ) {
+            by_effect[e.get_speed_name()] += adjust;
+        }
+    }
+    const auto add = [&s]( const std::string & raw, int value, bool percent, bool move_cost ) {
+        const std::string name = name_text( raw );
+        if( value == 0 || name.empty() || s.speed_mods.size() >= max_sheet_speed_modifiers ) {
+            return;
+        }
+        s.speed_mods.push_back( speed_mod{ name, value, percent, move_cost } );
+    };
+    for( const std::pair<const std::string, int> &e : by_effect ) {
+        add( e.first, e.second, false, false );
+    }
+    for( const speed_bonus_effect &b : u.get_speed_bonus_effects() ) {
+        if( by_effect.find( b.description ) == by_effect.end() ) {
+            add( b.description, b.bonus, false, false );
+        }
+    }
+    float movecost = 100;
+    for( const run_cost_effect &r : u.run_cost_effects( movecost ) ) {
+        const int percent = clamp_int( std::trunc( r.times * 100 - 100 ), -10000, 10000 );
+        const int constant = clamp_int( std::trunc( r.plus ), -10000, 10000 );
+        if( ( r.times != 1.0f && percent == 0 ) || ( r.plus != 0 && constant == 0 ) ) {
+            continue;
+        }
+        add( r.description, percent != 0 ? percent : constant, percent != 0, true );
+    }
+    s.speed = u.get_speed();
+    s.move_cost = clamp_int( movecost, 0, 100000 );
+}
+
+void read_skills( const avatar &u, sheet &s )
+{
+    const std::vector<const Skill *> sorted = Skill::get_skills_sorted_by(
+    []( const Skill & a, const Skill & b ) {
+        return a.get_sort_rank() < b.get_sort_rank();
+    } );
+    for( const Skill *sk : sorted ) {
+        if( s.skills.size() >= max_sheet_skills ) {
+            break;
+        }
+        skill_view v;
+        v.id = clean_id( sk->ident().str() );
+        v.name = name_text( sk->name() );
+        if( v.id.empty() || v.name.empty() ) {
+            continue;
+        }
+        const SkillLevel &level = u.get_skill_level_object( sk->ident() );
+        v.level = level.level();
+        v.knowledge = level.knowledgeLevel();
+        v.progress = std::clamp( level.exercise(), 0, 100 );
+        v.knowledge_progress = std::clamp( level.knowledgeExperience(), 0, 100 );
+        v.description = description_text( sk->description() );
+        s.skills.push_back( std::move( v ) );
+    }
+}
+
+void read_proficiencies( const avatar &u, sheet &s )
+{
+    for( const display_proficiency &p : u.display_proficiencies() ) {
+        const bool learning = !p.known && p.id->can_learn();
+        std::vector<prof_view> &list = p.known ? s.known : s.learning;
+        if( ( !p.known && !learning ) || list.size() >= max_sheet_proficiencies ) {
+            continue;
+        }
+        prof_view v;
+        v.id = clean_id( p.id.str() );
+        v.name = name_text( p.id->name() );
+        if( v.id.empty() || v.name.empty() ) {
+            continue;
+        }
+        v.percent = p.known ? 100 : clamp_int( std::floor( p.practice * 100 ), 0, 99 );
+        v.description = description_text( p.id->description() );
+        list.push_back( std::move( v ) );
+    }
+}
+
+void read_traits( const avatar &u, sheet &s )
+{
+    std::vector<trait_and_var> traits = u.get_mutations_variants( false );
+    std::sort( traits.begin(), traits.end(), trait_var_display_sort );
+    for( const trait_and_var &t : traits ) {
+        if( s.traits.size() >= max_sheet_traits ) {
+            break;
+        }
+        trait_view v;
+        v.id = clean_id( t.trait.str() );
+        v.name = name_text( t.name() );
+        if( v.id.empty() || v.name.empty() ) {
+            continue;
+        }
+        const int points = t.trait->points;
+        v.rating = points > 0 ? 1 : points < 0 ? -1 : 0;
+        v.mutation = !u.has_base_trait( t.trait );
+        v.description = description_text( u.mutation_desc( t.trait ) );
+        s.traits.push_back( std::move( v ) );
+    }
+}
+
+void read_bionics( const avatar &u, sheet &s )
+{
+    for( const bionic_id &b : u.get_bionics() ) {
+        if( s.bionics.size() >= max_sheet_bionics ) {
+            break;
+        }
+        bionic_view v;
+        v.id = clean_id( b.str() );
+        v.name = name_text( b->name.translated() );
+        if( v.id.empty() || v.name.empty() ) {
+            continue;
+        }
+        v.active = u.has_active_bionic( b );
+        v.description = description_text( b->description.translated() );
+        s.bionics.push_back( std::move( v ) );
+    }
+    s.power_kj = clamp_int( units::to_kilojoule( u.get_power_level() ), 0, INT32_MAX );
+    s.max_power_kj = clamp_int( units::to_kilojoule( u.get_max_power_level() ), 0, INT32_MAX );
+}
+
+// The effects the snapshot lists (same filter), each id once.
+void read_effects( const avatar &u, sheet &s )
+{
+    std::unordered_set<std::string> seen;
+    for( const effect &e : u.get_effects() ) {
+        if( s.effects.size() >= max_sheet_effects ) {
+            break;
+        }
+        const std::string &id = e.get_id().str();
+        if( id.empty() || id.size() > max_effect_id_bytes ||
+            client_text( e.disp_name(), max_effect_name_columns, 4 * max_effect_name_columns ).empty() ||
+            !seen.insert( id ).second ) {
+            continue;
+        }
+        const std::string clean = sanitize_text( id, max_effect_id_bytes );
+        if( clean != id ) {
+            continue;
+        }
+        s.effects.emplace_back( id, description_text( e.disp_desc() ) );
+    }
+}
+
+sheet read_sheet( const avatar &u )
+{
+    sheet s;
+    s.name = name_text( u.get_name() );
+    s.profession = u.prof != nullptr ? name_text( u.prof->gender_appropriate_name( u.male ) ) : std::string();
+    s.age = clamp_int( u.age(), 0, 100000 );
+    s.height_cm = clamp_int( u.height(), 0, 100000 );
+    const int stats[4][2] = {
+        { u.get_str(), u.get_str_base() }, { u.get_dex(), u.get_dex_base() },
+        { u.get_int(), u.get_int_base() }, { u.get_per(), u.get_per_base() }
+    };
+    std::copy( &stats[0][0], &stats[0][0] + 8, &s.stats[0][0] );
+    read_speed( u, s );
+    // Same parts and order as the snapshot's body_parts.
+    for( const bodypart_id &bp : u.get_all_body_parts( get_body_part_flags::only_main ) ) {
+        if( s.encumbrance.size() >= max_body_parts_listed ) {
+            break;
+        }
+        enc_view e;
+        e.layer = u.get_part_layer_penalty( bp );
+        e.enc = u.get_part_encumbrance( bp ) - e.layer;
+        // CDDA's warmth number (player_display.cpp temperature_print_rescaling).
+        e.warmth = clamp_int( units::to_legacy_bodypart_temp( u.get_part_temp_conv( bp ) ) / 100.0 * 2 - 100,
+                              -1000, 1000 );
+        s.encumbrance.push_back( e );
+    }
+    read_skills( u, s );
+    read_proficiencies( u, s );
+    read_traits( u, s );
+    read_bionics( u, s );
+    read_effects( u, s );
+    return s;
+}
+
+std::string write_sheet( uint64_t query_id, const sheet &s, bool truncated )
+{
+    static const char *const stat_ids[4] = { "str", "dex", "int", "per" };
+    std::ostringstream os;
+    JsonOut jo( os );
+    jo.start_object();
+    jo.member( "id", static_cast<int64_t>( query_id ) );
+    jo.member( "ok", true );
+    jo.member( "kind", std::string( "character" ) );
+    jo.member( "name", s.name );
+    jo.member( "profession", s.profession );
+    jo.member( "age", s.age );
+    jo.member( "height_cm", s.height_cm );
+    jo.member( "stats" );
+    jo.start_array();
+    for( int i = 0; i < 4; i++ ) {
+        jo.start_object();
+        jo.member( "id", std::string( stat_ids[i] ) );
+        jo.member( "cur", s.stats[i][0] );
+        jo.member( "base", s.stats[i][1] );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.member( "speed" );
+    jo.start_object();
+    jo.member( "cur", s.speed );
+    jo.member( "move_cost", s.move_cost );
+    jo.member( "modifiers" );
+    jo.start_array();
+    for( const speed_mod &m : s.speed_mods ) {
+        jo.start_object();
+        jo.member( "name", m.name );
+        jo.member( "value", m.value );
+        jo.member( "percent", m.percent );
+        jo.member( "move_cost", m.move_cost );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.end_object();
+    jo.member( "encumbrance" );
+    jo.start_array();
+    for( const enc_view &e : s.encumbrance ) {
+        jo.start_object();
+        jo.member( "enc", e.enc );
+        jo.member( "layer", e.layer );
+        jo.member( "warmth", e.warmth );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.member( "skills" );
+    jo.start_array();
+    for( const skill_view &v : s.skills ) {
+        jo.start_object();
+        jo.member( "id", v.id );
+        jo.member( "name", v.name );
+        jo.member( "level", v.level );
+        jo.member( "knowledge", v.knowledge );
+        jo.member( "progress", v.progress );
+        jo.member( "knowledge_progress", v.knowledge_progress );
+        jo.member( "description", v.description );
+        jo.end_object();
+    }
+    jo.end_array();
+    const auto write_profs = [&jo]( const char *key, const std::vector<prof_view> &list, bool percent ) {
+        jo.member( key );
+        jo.start_array();
+        for( const prof_view &v : list ) {
+            jo.start_object();
+            jo.member( "id", v.id );
+            jo.member( "name", v.name );
+            if( percent ) {
+                jo.member( "percent", v.percent );
+            }
+            jo.member( "description", v.description );
+            jo.end_object();
+        }
+        jo.end_array();
+    };
+    jo.member( "proficiencies" );
+    jo.start_object();
+    write_profs( "known", s.known, false );
+    write_profs( "learning", s.learning, true );
+    jo.end_object();
+    jo.member( "traits" );
+    jo.start_array();
+    for( const trait_view &v : s.traits ) {
+        jo.start_object();
+        jo.member( "id", v.id );
+        jo.member( "name", v.name );
+        jo.member( "rating", v.rating );
+        jo.member( "mutation", v.mutation );
+        jo.member( "description", v.description );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.member( "bionics" );
+    jo.start_array();
+    for( const bionic_view &v : s.bionics ) {
+        jo.start_object();
+        jo.member( "id", v.id );
+        jo.member( "name", v.name );
+        jo.member( "active", v.active );
+        jo.member( "description", v.description );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.member( "power" );
+    jo.start_object();
+    jo.member( "cur_kj", s.power_kj );
+    jo.member( "max_kj", s.max_power_kj );
+    jo.end_object();
+    jo.member( "effect_descriptions" );
+    jo.start_object();
+    for( const std::pair<std::string, std::string> &e : s.effects ) {
+        jo.member( e.first, e.second );
+    }
+    jo.end_object();
+    jo.member( "truncated", truncated );
+    jo.end_object();
+    return os.str();
+}
+} // namespace
+
+std::string run_character_query( uint64_t query_id, size_t max_bytes )
+{
+    sheet s = read_sheet( get_avatar() );
+    std::string out = write_sheet( query_id, s, false );
+    if( out.size() <= max_bytes ) {
+        return out;
+    }
+    // Empty descriptions from the end. Each saves at least its raw size (JSON escaping only adds), so this drops
+    // enough; the margin covers "truncated": true.
+    std::vector<std::string *> descriptions;
+    for( skill_view &v : s.skills ) {
+        descriptions.push_back( &v.description );
+    }
+    for( prof_view &v : s.known ) {
+        descriptions.push_back( &v.description );
+    }
+    for( prof_view &v : s.learning ) {
+        descriptions.push_back( &v.description );
+    }
+    for( trait_view &v : s.traits ) {
+        descriptions.push_back( &v.description );
+    }
+    for( bionic_view &v : s.bionics ) {
+        descriptions.push_back( &v.description );
+    }
+    for( std::pair<std::string, std::string> &e : s.effects ) {
+        descriptions.push_back( &e.second );
+    }
+    size_t excess = out.size() - max_bytes + 16;
+    for( auto it = descriptions.rbegin(); it != descriptions.rend() && excess > 0; ++it ) {
+        const size_t n = ( *it )->size();
+        ( *it )->clear();
+        excess = n >= excess ? 0 : excess - n;
+    }
+    return write_sheet( query_id, s, true );
+}
+
+std::string character_query_error_json( uint64_t query_id, const std::string &error )
+{
+    std::ostringstream os;
+    JsonOut jo( os );
+    jo.start_object();
+    jo.member( "id", static_cast<int64_t>( query_id ) );
+    jo.member( "ok", false );
+    jo.member( "kind", std::string( "character" ) );
+    jo.member( "error", error );
+    jo.end_object();
+    return os.str();
 }
 
 } // namespace fp3d

@@ -299,6 +299,10 @@ constexpr size_t max_query_result_bytes = 64 * 1024;
 // Client side. The query's id (from 1 up), or 0 if refused: a malformed ref (uid 0 or above max_item_uid, type
 // 0), a position out of range, max_pending_queries pending already, or after shutdown.
 uint64_t post_recipe_query( const item_ref &container, const ui_point &pos );
+// Character queries (G4, fp3d/snapshot.h): the character screen's data, run like recipe queries. Client side.
+// The query's id, or 0 if refused: a character query pending already (one at a time), max_pending_queries pending,
+// or after shutdown.
+uint64_t post_character_query();
 // Client side. The result (once), nullopt while it is pending or for an unknown or already taken id.
 std::optional<std::string> take_query_result( uint64_t id );
 size_t pending_queries();
