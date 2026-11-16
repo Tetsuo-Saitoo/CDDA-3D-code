@@ -493,9 +493,11 @@ static std::set<tripoint_bub_ms> spell_effect_area( const spell &sp, const tripo
 
         explosion_handler::draw_custom_explosion( explosion_colors,
                 exp_name );
-        if( fp3d::events_enabled() ) { // FP3D: the spell's squares, coloured by its damage type in the client
+        // FP3D: the spell's squares, coloured by its damage type in the client. The set is sorted, so past the
+        // event's 1024-square cap only the lowest-coordinate part is sent (real spells stay far below it).
+        if( fp3d::events_enabled() ) {
             fp3d::on_explosion( target, 0, std::vector<tripoint_bub_ms>( targets.begin(), targets.end() ),
-                                "spell:" + sp.id()->dmg_type.str() );
+                                fp3d::spell_explosion_kind( sp.id()->dmg_type.str() ) );
         }
     }
     return targets;

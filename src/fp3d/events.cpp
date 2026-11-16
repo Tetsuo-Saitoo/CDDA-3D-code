@@ -263,12 +263,26 @@ void on_explosion( const tripoint_bub_ms &centre, int radius, const std::vector<
     }
     e.pos = abs_of( centre );
     e.amount = radius;
-    e.type = intern_id( id_kind::explosion, kind );
-    e.text = kind;
+    const std::string name = bounded_text( kind );
+    e.type = intern_id( id_kind::explosion, name );
+    e.text = name;
     if( !explosion_item.empty() ) {
         e.detail = intern_id( id_kind::itype, explosion_item );
     }
     push( std::move( e ) );
+}
+
+std::string spell_explosion_kind( const std::string &damage_type )
+{
+    if( damage_type.empty() || damage_type.size() > 32 ) {
+        return "spell";
+    }
+    for( const char c : damage_type ) {
+        if( c < 0x21 || c > 0x7e ) { // a high byte is negative or above 0x7e, whatever char's sign
+            return "spell";
+        }
+    }
+    return "spell:" + damage_type;
 }
 
 void on_death( const Creature &c )

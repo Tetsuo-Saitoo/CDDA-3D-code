@@ -587,6 +587,12 @@ int main()
                    " events" + ( cast.empty() ? "" : ", " + cast[0].text + ", " + std::to_string( cast[0].path.size() ) +
                                  " squares, radius " + std::to_string( cast[0].amount ) ) );
         }
+        check( fp3d::spell_explosion_kind( "heat" ) == "spell:heat" &&
+               fp3d::spell_explosion_kind( std::string( 32, 'x' ) ) == "spell:" + std::string( 32, 'x' ) &&
+               fp3d::spell_explosion_kind( std::string( 33, 'x' ) ) == "spell" &&
+               fp3d::spell_explosion_kind( "" ) == "spell" && fp3d::spell_explosion_kind( "a b" ) == "spell" &&
+               fp3d::spell_explosion_kind( "a\nb" ) == "spell" && fp3d::spell_explosion_kind( "h\xc3\xa9" ) == "spell",
+               "explosions: a spell's damage type is used only if short printable ASCII" );
 
         // Overflow: 10 sounds then a full queue of messages. The sounds go first; every message stays.
         fp3d::reset_events();
