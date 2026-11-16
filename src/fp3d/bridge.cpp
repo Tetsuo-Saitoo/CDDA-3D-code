@@ -361,7 +361,7 @@ std::optional<ui_request> wait_request( int timeout_ms, uint64_t newer_than )
 {
     channel &c = chan();
     std::unique_lock<std::mutex> lk( c.m );
-    c.cv.wait_for( lk, std::chrono::milliseconds( timeout_ms ), [&] {
+    c.cv.wait_for( lk, std::chrono::milliseconds( static_cast<int64_t>( timeout_ms ) * slow_build ), [&] {
         return c.shut_down || ( c.pending && !c.reply && c.pending->id > newer_than );
     } );
     if( c.shut_down || !c.pending || c.reply || c.pending->id <= newer_than ) {

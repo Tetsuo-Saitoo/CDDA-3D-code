@@ -1340,7 +1340,7 @@ double ms_since( std::chrono::steady_clock::time_point t )
 bool realtime_checks( fp3d::ui_request &req )
 {
     bool ok = true;
-    fp3d::set_timescale( 4.0 );
+    fp3d::set_timescale( 4.0 / fp3d::slow_build );   // 250 ms turns, times slow_build
     fp3d::set_clock_mode( fp3d::clock_mode::real_time );
     std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
     for( int i = 0; i < 3; i++ ) {
@@ -1352,10 +1352,12 @@ bool realtime_checks( fp3d::ui_request &req )
             return false;
         }
         // A turn is 250 ms at this timescale: never faster (paced), but a loaded machine (parallel builds) may be
-        // slower, so the upper bound is loose and a slow step may have let a turn or two more pass.
+        // slower, so the upper bound is loose and a slow step may have let a turn or two more pass. A slow build
+        // (TSan) has turns longer than their slot, so it checks no lower bound.
         const int64_t turns = next->turn - req.turn;
-        const bool step_ok = turns >= 1 && ms >= 150 && turns <= 2 + static_cast<int64_t>( ms / 250 ) &&
-                             ms <= 10000;
+        const double turn_ms = 250.0 * fp3d::slow_build;
+        const bool step_ok = turns >= 1 && ( fp3d::slow_build > 1 || ms >= 150 ) &&
+                             turns <= 2 + static_cast<int64_t>( ms / turn_ms ) && ms <= 10000.0 * fp3d::slow_build;
         std::printf( "    real time: turn %lld -> %lld after %.0f ms %s\n", static_cast<long long>( req.turn ),
                      static_cast<long long>( next->turn ), ms, step_ok ? "ok" : "BAD" );
         ok = ok && step_ok;
@@ -1365,7 +1367,7 @@ bool realtime_checks( fp3d::ui_request &req )
     spawn_zombie = true; // placed by the sim right before its next request
     t = std::chrono::steady_clock::now();
     // Up to 10 s: on a loaded machine the game thread may be busy for seconds (an overmap loading, say).
-    while( !fp3d::get_clock().paused && ms_since( t ) < 10000 ) {
+    while( !fp3d::get_clock().paused && ms_since( t ) < 10000 * fp3d::slow_build ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, req.id ) ) {
             req = *next;
         }
@@ -1381,7 +1383,7 @@ bool realtime_checks( fp3d::ui_request &req )
     const int64_t turn_at_pause = req.turn;
     int while_paused = 0;
     t = std::chrono::steady_clock::now();
-    while( ms_since( t ) < 750 ) {
+    while( ms_since( t ) < 750 * fp3d::slow_build ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, req.id ) ) {
             while_paused++;
             ok = ok && next->paused && next->turn <= turn_at_pause + 1;
@@ -1586,7 +1588,7 @@ static bool run_siphon_checks()
     fp3d::queue_action( "fp3d_use_UP" );
     std::vector<int64_t> levels;
     std::optional<fp3d::ui_request> done;
-    while( !done && std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 40 ) ) {
+    while( !done && std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 40 * fp3d::slow_build ) ) {
         done = fp3d::wait_request( 200, r->id );
         h = fp3d::latest_held();
         if( h.activity == "ACT_FILL_LIQUID" && ( levels.empty() || levels.back() != h.off.ml ) ) {
@@ -1775,7 +1777,7 @@ static bool run_shoot_checks()
     const auto t0 = std::chrono::steady_clock::now();
     std::optional<fp3d::ui_request> cur = fp3d::wait_request( 20000, r->id );
     while( cur && !cur->timed && targets < 20 && others < 20 &&
-           std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 60 ) ) {
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 60 * fp3d::slow_build ) ) {
         fp3d::ui_answer a;
         a.id = cur->id;
         std::string note;
@@ -2297,7 +2299,7 @@ static bool run_cooking_checks()
             return std::string( "refused" );
         }
         const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-        while( ms_since( t0 ) < 20000 ) {
+        while( ms_since( t0 ) < 20000 * fp3d::slow_build ) {
             if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
                 return *res;
             }
@@ -4384,7 +4386,7 @@ static bool run_safemode_checks()
     }
     const int placed_before = snapshot().zombies_placed;
     fp3d::set_auto_pause_hostiles( false );
-    fp3d::set_timescale( 4.0 );
+    fp3d::set_timescale( 4.0 / fp3d::slow_build );   // 250 ms turns, times slow_build
     fp3d::set_clock_mode( fp3d::clock_mode::real_time );
     spawn_zombie = true;
     const int64_t turn0 = r->turn;
@@ -4393,7 +4395,8 @@ static bool run_safemode_checks()
     // 10 s with parallel builds running). A prompt (a request that doesn't expire) would stop the clock: noted,
     // cancelled so the game goes on.
     std::string prompts;
-    while( ms_since( t ) < 2000 || ( r->turn < turn0 + 3 && ms_since( t ) < 30000 ) ) {
+    while( ms_since( t ) < 2000 * fp3d::slow_build ||
+           ( r->turn < turn0 + 3 && ms_since( t ) < 30000 * fp3d::slow_build ) ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, r->id ) ) {
             r = next;
             if( !next->timed ) {
@@ -4682,7 +4685,7 @@ static bool run_point_teleport_checks()
         fp3d::request_range_op( heal );
         std::vector<std::string> got;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 20000 ) {
+        while( ms_since( t ) < 20000 * fp3d::slow_build ) {
             got.clear();
             const std::vector<fp3d::range_op_result> res = fp3d::latest_range_results();
             for( size_t i = 0; i < count; i++ ) {
@@ -5115,7 +5118,8 @@ static bool run_weather_mood_checks()
         fp3d::queue_action( "pause" );
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 30000 && ( weather_mood_setup.load() != 0 || r->id == before || !r->timed ) ) {
+        while( ms_since( t ) < 30000 * fp3d::slow_build &&
+               ( weather_mood_setup.load() != 0 || r->id == before || !r->timed ) ) {
             if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id ) ) {
                 r = next;
             }
@@ -5208,7 +5212,7 @@ static bool run_weather_cheat_checks( const std::function<size_t()> &lightning_s
         }
         std::vector<std::string> got;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 20000 ) {
+        while( ms_since( t ) < 20000 * fp3d::slow_build ) {
             got.clear();
             const std::vector<fp3d::range_op_result> res = fp3d::latest_range_results();
             for( const uint64_t id : ids ) {
@@ -5901,7 +5905,8 @@ int main()
         std::optional<fp3d::ui_request> req = fp3d::wait_request( 180000 );
         if( !req && !fp3d::is_shut_down() ) {
             // The sim is stuck outside ask() (a loop that never asks); join() would hang.
-            std::printf( "FAIL: no request within 180 s; timed-out polls: %s\n", fp3d::poll_report().c_str() );
+            std::printf( "FAIL: no request within %d s; timed-out polls: %s\n", 180 * fp3d::slow_build,
+                         fp3d::poll_report().c_str() );
             std::_Exit( 2 );
         }
         if( !req ) {
