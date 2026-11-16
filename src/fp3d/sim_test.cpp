@@ -212,6 +212,9 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 // checks: strength 8 for "too heavy: not offered" (stage 3 sets 12, stage 8 puts the random start's back), 22 =
 // lying-container checks, 23 = character query checks (see the case), 24 = their traits and effect taken away.
 // Done on the sim thread right before its next request.
+// Peek checks (scene 25): the rock carried and the rock wielded.
+uint64_t pk_rock_uid = 0;
+uint64_t pk_wielded_uid = 0;
 std::atomic<int> hand_setup{ 0 };
 // The random start's strength while a scene sets its own (sim thread only; -1 = nothing saved).
 int siphon_str_saved = -1;
@@ -1166,6 +1169,34 @@ void observe()
             cq_cut = cut;
             cq_tiny = tiny;
             cq_name = fp3d::client_text( u.get_name(), fp3d::max_sheet_name_columns, 4 * fp3d::max_sheet_name_columns );
+            break;
+        }
+        case 25: {
+            // Peek (B2): floor 6 squares around, nothing lying there; a backpack worn, a rock carried, a rock wielded.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -6; dx <= 6; dx++ ) {
+                for( int dy = -6; dy <= 6; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_floor );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            u.clear_worn();
+            u.inv->clear();
+            u.remove_weapon();
+            u.wear_item( item( itype_backpack ), false );
+            item_location carried = u.i_add( item( itype_rock ) );
+            pk_rock_uid = carried ? fp3d::item_handle( *carried ) : 0;
+            u.set_wielded_item( item( itype_rock ) );
+            item_location wielded = u.get_wielded_item();
+            pk_wielded_uid = wielded ? fp3d::item_handle( *wielded ) : 0;
+            here.build_map_cache( p.z() );
             break;
         }
         case 24: {
@@ -6335,6 +6366,163 @@ static bool run_lying_container_checks()
 // Character queries (G4, 2026-11-16): the character screen's data. A starting trait and a mutation told apart, a
 // bionic and power, an effect's description; with less room descriptions go from the end and the lists stay whole;
 // the bridge runs one at a time.
+// Peeking (B2): CDDA's peek asks a `target` request in mode "peek" that offers the blind throws as actions:
+// throw_blind (CDDA asks what to throw) and, while something is wielded, throw_blind_wielded; then CDDA asks where
+// ("throw_blind" target). An action the request didn't offer, or one sent to a plain look, throws nothing.
+static bool run_peek_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  peek: %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 25;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 || pk_rock_uid == 0 || pk_wielded_uid == 0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    struct peeked {
+        bool queued = false;
+        bool back = false;                   // in the main loop again
+        std::vector<std::string> offered;    // the look / peek request's actions
+        std::string modes;                   // target modes asked, in order
+        int item_menus = 0;
+        std::string msgs;
+    };
+    // Queues `start` ("peek" or "look"), peeks east (`dir` 1) or west (-1), answers the look / peek request with
+    // `act` and no square, an item request with a rock, a blind throw's target 3 squares on that way from its
+    // origin. The two rocks go opposite ways: rocks stack, so one landing on the other would merge into it.
+    const auto run = [&]( const char *start, const std::string & act, int dir ) {
+        peeked res;
+        std::vector<fp3d::event> evs;
+        fp3d::drain_events( evs );
+        evs.clear();
+        res.queued = fp3d::queue_action( start );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = r->id;
+        bool first_target = true;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 30000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( r->timed ) {
+                if( r->id != before ) {
+                    res.back = true;
+                    break;
+                }
+                continue;
+            }
+            fp3d::ui_answer a;
+            a.id = r->id;
+            if( r->kind == fp3d::request_kind::direction ) {
+                a.pos = fp3d::ui_point{ dir, 0, 0 };
+            } else if( r->kind == fp3d::request_kind::target && first_target ) {
+                first_target = false;
+                res.modes += r->mode;
+                res.offered = r->actions;
+                a.action = act;
+            } else if( r->kind == fp3d::request_kind::target ) {
+                res.modes += " " + r->mode;
+                a.pos = fp3d::ui_point{ r->origin.x + 3 * dir, r->origin.y, r->origin.z };
+                a.action = "FIRE";
+            } else if( r->kind == fp3d::request_kind::item_select ) {
+                res.item_menus++;
+                std::string label;
+                a.entry = first_entry_with( *r, "rock", label );
+                a.cancel = a.entry < 0;
+            } else {
+                a.cancel = true;
+            }
+            fp3d::answer( a );
+        }
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msgs += ( res.msgs.empty() ? "" : " | " ) + e.text;
+            }
+        }
+        return res;
+    };
+    const auto join = []( const std::vector<std::string> &v ) {
+        std::string out;
+        for( const std::string &x : v ) {
+            out += ( out.empty() ? "" : "," ) + x;
+        }
+        return out;
+    };
+    const auto show = [&]( const peeked & p ) {
+        return std::string( p.queued ? "" : "not queued " ) + ( p.back ? "" : "not back " ) + "offered [" +
+               join( p.offered ) + "] modes [" + p.modes + "] " + std::to_string( p.item_menus ) +
+               " item menus, msgs [" + p.msgs + "]";
+    };
+    const auto carried_has = []( uint64_t uid ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.uid == uid ) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Where `uid` lies, 1-10 squares east (`dir` 1) or west (-1) and up to 3 off the row; nullopt if not there.
+    const auto lies_on = [&here]( uint64_t uid, int dir ) -> std::optional<fp3d::ui_point> {
+        for( int dx = 1; dx <= 10; dx++ ) {
+            for( int dy = -3; dy <= 3; dy++ ) {
+                const fp3d::ui_point q{ here.x + dx * dir, here.y + dy, here.z };
+                for( const fp3d::item_handle_view &h : handles_at( q ) ) {
+                    if( h.uid == uid ) {
+                        return q;
+                    }
+                }
+            }
+        }
+        return std::nullopt;
+    };
+    const auto at = []( const std::optional<fp3d::ui_point> &q ) {
+        return q ? "(" + std::to_string( q->x ) + "," + std::to_string( q->y ) + ")" : std::string( "nowhere" );
+    };
+    const std::vector<std::string> both{ "throw_blind", "throw_blind_wielded" };
+    const std::vector<std::string> one{ "throw_blind" };
+
+    // A look offers nothing, and a blind throw sent to it throws nothing.
+    peeked p = run( "look", "throw_blind", 1 );
+    check( p.back && p.offered.empty() && p.modes == "look" && p.item_menus == 0 && carried_has( pk_wielded_uid ) &&
+           carried_has( pk_rock_uid ), "look: no blind throw", show( p ) );
+    // The wielded rock, thrown blind from the peek: no item menu.
+    p = run( "peek", "throw_blind_wielded", 1 );
+    std::optional<fp3d::ui_point> landed = lies_on( pk_wielded_uid, 1 );
+    check( p.back && p.offered == both && p.modes == "peek throw_blind" && p.item_menus == 0 &&
+           !carried_has( pk_wielded_uid ) && landed, "throw_blind_wielded throws the wielded rock",
+           show( p ) + " landed " + at( landed ) );
+    // Nothing wielded now: only throw_blind is offered, and throw_blind_wielded is ignored.
+    p = run( "peek", "throw_blind_wielded", -1 );
+    check( p.back && p.offered == one && p.modes == "peek" && p.item_menus == 0 && carried_has( pk_rock_uid ),
+           "not offered: ignored", show( p ) );
+    p = run( "peek", "fire_blind", -1 );
+    check( p.back && p.offered == one && p.modes == "peek" && p.item_menus == 0 && carried_has( pk_rock_uid ),
+           "unknown action: ignored", show( p ) );
+    // The carried rock, west: CDDA asks which item first.
+    p = run( "peek", "throw_blind", -1 );
+    landed = lies_on( pk_rock_uid, -1 );
+    check( p.back && p.offered == one && p.modes == "peek throw_blind" && p.item_menus == 1 &&
+           !carried_has( pk_rock_uid ) && landed, "throw_blind asks what, then throws it",
+           show( p ) + " landed " + at( landed ) );
+    return failed == 0;
+}
+
 static bool run_character_query_checks()
 {
     int failed = 0;
@@ -7251,6 +7439,7 @@ int main()
     const bool offhand_ok = consume_ok && run_offhand_weight_checks();
     const bool lying_ok = offhand_ok && run_lying_container_checks();
     const bool character_ok = lying_ok && run_character_query_checks();
+    const bool peek_ok = character_ok && run_peek_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -7308,6 +7497,7 @@ int main()
     std::printf( "off hand: %s\n", offhand_ok ? "ok" : "BAD" );
     std::printf( "lying containers: %s\n", lying_ok ? "ok" : "BAD" );
     std::printf( "character query: %s\n", character_ok ? "ok" : "BAD" );
+    std::printf( "peek: %s\n", peek_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -7318,6 +7508,7 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
+           peek_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

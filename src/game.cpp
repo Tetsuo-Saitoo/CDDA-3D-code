@@ -7945,7 +7945,8 @@ std::optional<std::vector<tripoint_bub_ms>> game::safe_route_to( Character &who,
     return shortest_route;
 }
 
-// FP3D: look_around for the bridge. Peeking's blind throw/fire (peek_action) isn't offered yet.
+// FP3D: look_around for the bridge. A peek offers CDDA's blind throws (peek_action) as the request's actions:
+// `throw_blind` (pick what to throw) and, while something is wielded, `throw_blind_wielded`. CDDA has no blind fire.
 static look_around_result fp3d_look_around( tripoint_bub_ms &center, const tripoint_bub_ms &start_point,
         bool select_zone, bool peeking )
 {
@@ -7961,9 +7962,24 @@ static look_around_result fp3d_look_around( tripoint_bub_ms &center, const tripo
             req.candidates.push_back( fp3d::to_ui_point( critter->pos_abs() ) );
         }
     }
+    if( peeking ) {
+        req.actions.emplace_back( "throw_blind" );
+        if( u.get_wielded_item() ) {
+            req.actions.emplace_back( "throw_blind_wielded" );
+        }
+    }
     look_around_result result;
     const fp3d::ui_answer a = fp3d::ask( req );
-    if( a.cancel || !a.pos ) {
+    if( a.cancel ) {
+        return result;
+    }
+    // Only an action this request offered; anything else is ignored.
+    if( !a.action.empty() &&
+        std::find( req.actions.begin(), req.actions.end(), a.action ) != req.actions.end() ) {
+        result.peek_action = a.action == "throw_blind" ? PA_BLIND_THROW : PA_BLIND_THROW_WIELDED;
+        return result;
+    }
+    if( !a.pos ) {
         return result;
     }
     const tripoint_bub_ms picked = here.get_bub( fp3d::to_abs_ms( *a.pos ) );
