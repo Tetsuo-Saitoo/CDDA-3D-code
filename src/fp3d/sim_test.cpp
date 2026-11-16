@@ -19,6 +19,7 @@
 #include <functional>
 #include <mutex>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -141,6 +142,10 @@ const itype_id itype_pot( "pot" );
 const itype_id itype_meat( "meat" );
 const furn_str_id furn_f_fireplace( "f_fireplace" );
 const furn_str_id furn_f_woodstove( "f_woodstove" );
+const trait_id trait_BADHEARING( "BADHEARING" );
+const trait_id trait_NIGHTVISION( "NIGHTVISION" );
+const bionic_id bio_flashlight( "bio_flashlight" );
+const efftype_id effect_winded( "winded" );
 
 // Game state the driver checks; copied on the sim thread right before every request.
 struct observed {
@@ -205,7 +210,7 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 // 16 = gun item checks (run_gun_item_checks; see the case below), 17 = throw and pour checks
 // (run_throw_pour_checks; see the case below), 18 = consume checks, 19 and 20 = off-hand weight checks, 21 = siphon
 // checks: strength 8 for "too heavy: not offered" (stage 3 sets 12, stage 8 puts the random start's back), 22 =
-// lying-container checks.
+// lying-container checks, 23 = character query checks (see the case), 24 = their traits and effect taken away.
 // Done on the sim thread right before its next request.
 std::atomic<int> hand_setup{ 0 };
 // The random start's strength while a scene sets its own (sim thread only; -1 = nothing saved).
@@ -259,6 +264,11 @@ std::atomic<uint64_t> lc_rock_uid{ 0 };         // the rock
 std::atomic<uint64_t> lc_sealed_uid{ 0 };       // a sealed bottle of water west
 std::atomic<uint64_t> lc_sealed_water_uid{ 0 };
 std::atomic<uint64_t> lc_far_pack_uid{ 0 };     // a backpack 2 squares west holding a rock
+// The character query checks' scene (hand_setup 23): the sheet as the sim thread ran it.
+std::mutex cq_m;
+std::string cq_full;   // run_character_query with no byte limit
+std::string cq_cut;    // the same with 300 bytes less room than it needs
+std::string cq_name;   // the avatar's name as the sheet shows it
 
 // Range op checks: 32 operations queued from inside the sim's hook (so none run before the queue is full), then one
 // more, which is refused. They run at the next main-loop request.
@@ -1123,6 +1133,49 @@ void observe()
             get_avatar().str_max = 8;
             get_avatar().reset_stats();
             break;
+        case 23: {
+            // Character query (G4): bad hearing as a starting trait, night vision as a mutation, a cranial
+            // flashlight (off), 50 of 100 kJ, winded. Then the sheet run here, in full and with 300 bytes less room.
+            avatar &u = get_avatar();
+            if( u.has_trait( trait_NIGHTVISION ) ) {
+                if( u.has_base_trait( trait_NIGHTVISION ) ) {
+                    u.toggle_trait( trait_NIGHTVISION );
+                } else {
+                    u.unset_mutation( trait_NIGHTVISION );
+                }
+            }
+            u.set_mutation( trait_NIGHTVISION );
+            if( u.has_trait( trait_BADHEARING ) && !u.has_base_trait( trait_BADHEARING ) ) {
+                u.unset_mutation( trait_BADHEARING );
+            }
+            if( !u.has_trait( trait_BADHEARING ) ) {
+                u.toggle_trait( trait_BADHEARING );
+            }
+            if( !u.has_bionic( bio_flashlight ) ) {
+                u.add_bionic( bio_flashlight );
+            }
+            u.set_max_power_level( 100_kJ );
+            u.set_power_level( 50_kJ );
+            u.add_effect( effect_winded, 1_hours );
+            const std::string full = fp3d::run_character_query( 901, SIZE_MAX );
+            const std::string cut = fp3d::run_character_query( 902, full.size() > 300 ? full.size() - 300 : 0 );
+            std::lock_guard<std::mutex> lk( cq_m );
+            cq_full = full;
+            cq_cut = cut;
+            cq_name = fp3d::client_text( u.get_name(), fp3d::max_sheet_name_columns, 4 * fp3d::max_sheet_name_columns );
+            break;
+        }
+        case 24: {
+            avatar &u = get_avatar();
+            u.remove_effect( effect_winded );
+            if( u.has_base_trait( trait_BADHEARING ) ) {
+                u.toggle_trait( trait_BADHEARING );
+            }
+            if( u.has_trait( trait_NIGHTVISION ) && !u.has_base_trait( trait_NIGHTVISION ) ) {
+                u.unset_mutation( trait_NIGHTVISION );
+            }
+            break;
+        }
         case 19: {
             // Off-hand weight: a backpack worn, nothing wielded, an empty jerrycan carried and held in the off hand;
             // strength 8 until stage 20.
@@ -6276,6 +6329,229 @@ static bool run_lying_container_checks()
     return failed == 0;
 }
 
+// Character queries (G4, 2026-11-16): the character screen's data. A starting trait and a mutation told apart, a
+// bionic and power, an effect's description; with less room descriptions go from the end and the lists stay whole;
+// the bridge runs one at a time.
+static bool run_character_query_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  character query: %-44s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct entry {
+        std::string id;
+        std::string name;
+        std::string description;
+        int rating = 0;
+        bool flag = false;   // traits: mutation; bionics: active
+    };
+    struct parsed {
+        bool valid = false;
+        bool ok = false;
+        int64_t id = 0;
+        std::string kind;
+        std::string name;
+        std::vector<std::string> stat_ids;
+        int stats_low = 0;   // stats with cur or base below 1
+        int speed = 0;
+        size_t encumbrance = 0;
+        std::vector<entry> skills;
+        std::vector<entry> traits;
+        std::vector<entry> bionics;
+        size_t known = 0;
+        size_t learning = 0;
+        int power = -1;
+        int max_power = -1;
+        std::map<std::string, std::string> effects;
+        bool truncated = false;
+    };
+    const auto parse = []( const std::string & text ) {
+        parsed out;
+        try {
+            const JsonValue root = json_loader::from_string( text );
+            JsonObject jo = root.get_object();
+            jo.allow_omitted_members();
+            out.ok = jo.get_bool( "ok" );
+            out.id = jo.get_member( "id" ).get_int64();
+            out.kind = jo.get_string( "kind" );
+            if( out.ok ) {
+                out.name = jo.get_string( "name" );
+                for( JsonObject s : jo.get_array( "stats" ) ) {
+                    s.allow_omitted_members();
+                    out.stat_ids.push_back( s.get_string( "id" ) );
+                    out.stats_low += s.get_int( "cur" ) < 1 || s.get_int( "base" ) < 1 ? 1 : 0;
+                }
+                JsonObject sp = jo.get_object( "speed" );
+                sp.allow_omitted_members();
+                out.speed = sp.get_int( "cur" );
+                for( JsonObject e : jo.get_array( "encumbrance" ) ) {
+                    e.allow_omitted_members();
+                    out.encumbrance++;
+                }
+                const auto list = []( const JsonObject & from, const char *key, std::vector<entry> &to ) {
+                    for( JsonObject o : from.get_array( key ) ) {
+                        o.allow_omitted_members();
+                        entry e;
+                        e.id = o.get_string( "id" );
+                        e.name = o.get_string( "name" );
+                        e.description = o.get_string( "description" );
+                        e.rating = o.get_int( "rating", 0 );
+                        e.flag = o.has_member( "mutation" ) ? o.get_bool( "mutation" ) : o.get_bool( "active", false );
+                        to.push_back( e );
+                    }
+                };
+                list( jo, "skills", out.skills );
+                list( jo, "traits", out.traits );
+                list( jo, "bionics", out.bionics );
+                JsonObject profs = jo.get_object( "proficiencies" );
+                profs.allow_omitted_members();
+                for( JsonObject o : profs.get_array( "known" ) ) {
+                    o.allow_omitted_members();
+                    out.known++;
+                }
+                for( JsonObject o : profs.get_array( "learning" ) ) {
+                    o.allow_omitted_members();
+                    out.learning++;
+                }
+                JsonObject power = jo.get_object( "power" );
+                power.allow_omitted_members();
+                out.power = power.get_int( "cur_kj" );
+                out.max_power = power.get_int( "max_kj" );
+                JsonObject eff = jo.get_object( "effect_descriptions" );
+                eff.allow_omitted_members();
+                for( const JsonMember m : eff ) {
+                    out.effects[m.name()] = m.get_string();
+                }
+                out.truncated = jo.get_bool( "truncated" );
+            }
+            out.valid = true;
+        } catch( const std::exception & ) {
+            out.valid = false;
+        }
+        return out;
+    };
+    const auto find = []( const std::vector<entry> &in, const std::string & id ) -> const entry * {
+        for( const entry &e : in ) {
+            if( e.id == id ) {
+                return &e;
+            }
+        }
+        return nullptr;
+    };
+    const auto await = []( uint64_t id ) {
+        const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        while( id != 0 && ms_since( t0 ) < 20000 ) {
+            if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
+                return *res;
+            }
+            std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
+        }
+        return std::string( "timeout" );
+    };
+
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 23;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    std::string full;
+    std::string cut;
+    std::string name;
+    {
+        std::lock_guard<std::mutex> lk( cq_m );
+        full = cq_full;
+        cut = cq_cut;
+        name = cq_name;
+    }
+    if( !r || !r->timed || !s0 || full.empty() ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const parsed f = parse( full );
+    check( f.valid && f.ok && f.kind == "character" && f.id == 901 && !f.name.empty() && f.name == name &&
+           !f.truncated, "the avatar's sheet", f.name + ", " + std::to_string( full.size() ) + " bytes" );
+    check( f.stat_ids == std::vector<std::string>( { "str", "dex", "int", "per" } ) && f.stats_low == 0 && f.speed > 0,
+           "stats and speed", std::to_string( f.stat_ids.size() ) + " stats, speed " + std::to_string( f.speed ) );
+    check( f.encumbrance > 0 && f.encumbrance == s0->player.body_parts.size(), "encumbrance: one per body part",
+           std::to_string( f.encumbrance ) + " of " + std::to_string( s0->player.body_parts.size() ) );
+    size_t named_skills = 0;
+    for( const entry &e : f.skills ) {
+        named_skills += !e.id.empty() && !e.name.empty() && !e.description.empty() ? 1 : 0;
+    }
+    check( f.skills.size() >= 5 && named_skills == f.skills.size(), "skills with names and descriptions",
+           std::to_string( f.skills.size() ) + " skills" );
+    const entry *bad = find( f.traits, "BADHEARING" );
+    const entry *night = find( f.traits, "NIGHTVISION" );
+    check( bad && bad->rating == -1 && !bad->flag && !bad->description.empty(), "a starting trait: bad, not a mutation",
+           bad ? bad->name : "missing" );
+    check( night && night->rating == 1 && night->flag, "a mutation: good, a mutation", night ? night->name : "missing" );
+    const entry *light = find( f.bionics, "bio_flashlight" );
+    check( light && !light->flag && !light->description.empty() && f.power == 50 && f.max_power == 100,
+           "a bionic, off, and 50 of 100 kJ", ( light ? light->name : std::string( "missing" ) ) + ", " +
+           std::to_string( f.power ) + "/" + std::to_string( f.max_power ) );
+    const auto winded = f.effects.find( "winded" );
+    check( winded != f.effects.end() && !winded->second.empty() && winded->second.find( '\n' ) == std::string::npos,
+           "an effect's description, one line", winded != f.effects.end() ? winded->second : "missing" );
+    const parsed c = parse( cut );
+    const auto cut_winded = c.effects.find( "winded" );
+    check( c.valid && c.ok && c.truncated && cut.size() <= full.size() - 300 && c.skills.size() == f.skills.size() &&
+           c.traits.size() == f.traits.size() && c.bionics.size() == f.bionics.size() && c.known == f.known &&
+           c.learning == f.learning && !c.skills.empty() && !c.skills.front().description.empty() &&
+           cut_winded != c.effects.end() && cut_winded->second.empty(),
+           "less room: descriptions go from the end", std::to_string( cut.size() ) + " of " +
+           std::to_string( full.size() ) + " bytes" );
+
+    // Through the bridge: run by the main loop.
+    r = fp3d::wait_request( 5000 );
+    const uint64_t id = r && r->timed ? fp3d::post_character_query() : 0;
+    const parsed b = parse( await( id ) );
+    check( id != 0 && b.valid && b.ok && b.id == static_cast<int64_t>( id ) && b.name == name,
+           "posted: answered by the main loop", std::to_string( id ) );
+    // One at a time: posted during the wait menu, a second one is refused; the first runs back at the main loop.
+    r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting again", "" );
+        return false;
+    }
+    fp3d::ui_answer wait;
+    wait.id = r->id;
+    wait.action = "wait";
+    fp3d::answer( wait );
+    std::optional<fp3d::ui_request> prompt = fp3d::wait_request( 5000, r->id );
+    uint64_t first = 0;
+    uint64_t second = 1;
+    if( prompt && !prompt->timed ) {
+        first = fp3d::post_character_query();
+        second = fp3d::post_character_query();
+    }
+    check( prompt && !prompt->timed && first != 0 && second == 0, "a second pending one refused",
+           prompt ? std::string( fp3d::kind_name( prompt->kind ) ) + " prompt" : "no prompt" );
+    for( int i = 0; i < 10 && prompt && !prompt->timed; i++ ) {
+        fp3d::ui_answer cancel;
+        cancel.id = prompt->id;
+        cancel.cancel = true;
+        fp3d::answer( cancel );
+        prompt = fp3d::wait_request( 5000, prompt->id );
+    }
+    const parsed p = parse( await( first ) );
+    check( prompt && prompt->timed && p.valid && p.ok && p.id == static_cast<int64_t>( first ),
+           "held during a prompt, then answered", std::to_string( first ) );
+    // Take the scene's traits and effect away again.
+    r = fp3d::wait_request( 5000 );
+    if( r && r->timed ) {
+        hand_setup = 24;
+        fp3d::queue_action( "pause" );
+        r = fp3d::wait_request( 20000, r->id );
+    }
+    check( r && r->timed, "back at the main loop", "" );
+    return failed == 0;
+}
+
 // A saved range game resumes only in a range world (fp3d/test_range.h resume_test_range, 2026-11-10): this normal
 // world's save carries the range's avatar values (mark_as_range), and resumed after the reload as the bridge does, it
 // stays a normal game: no range, no zones, AI not frozen.
@@ -6958,6 +7234,7 @@ int main()
     const bool consume_ok = furniture_ok && run_consume_checks();
     const bool offhand_ok = consume_ok && run_offhand_weight_checks();
     const bool lying_ok = offhand_ok && run_lying_container_checks();
+    const bool character_ok = lying_ok && run_character_query_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -7014,6 +7291,7 @@ int main()
     std::printf( "consume: %s\n", consume_ok ? "ok" : "BAD" );
     std::printf( "off hand: %s\n", offhand_ok ? "ok" : "BAD" );
     std::printf( "lying containers: %s\n", lying_ok ? "ok" : "BAD" );
+    std::printf( "character query: %s\n", character_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -7024,6 +7302,6 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

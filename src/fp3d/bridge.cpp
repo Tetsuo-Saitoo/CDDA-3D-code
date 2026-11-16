@@ -13,6 +13,7 @@
 
 #include "calendar.h"
 #include "fp3d/cooking.h"
+#include "fp3d/snapshot.h"
 #include "map_scale_constants.h"
 
 namespace fp3d
@@ -27,9 +28,11 @@ struct queued_action {
     std::optional<ui_point> square;      // queue_action_at
 };
 
-// A recipe query (L9) waiting for the sim.
+// A query waiting for the sim: a recipe query (L9) or a character query (G4).
+enum class query_kind : uint8_t { recipe, character };
 struct recipe_query {
     uint64_t id = 0;
+    query_kind kind = query_kind::recipe;
     item_ref container;
     ui_point pos;
 };
@@ -90,7 +93,7 @@ std::chrono::steady_clock::duration turn_length( double timescale )
                std::chrono::duration<double, std::milli>( 1000.0 / timescale ) );
 }
 
-// Sim side, with `lk` holding c.m: runs the pending recipe queries one by one, the lock released while CDDA code
+// Sim side, with `lk` holding c.m: runs the pending queries one by one, the lock released while CDDA code
 // runs. Returns with the lock held; stops early on shutdown (the caller then unwinds).
 void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
 {
@@ -98,6 +101,10 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
         const recipe_query q = c.queries.front();
         c.queries.pop_front();
         lk.unlock();
+        const auto failed = [&q]( const std::string & error ) {
+            return q.kind == query_kind::character ? character_query_error_json( q.id, error ) :
+                   recipe_query_error_json( q.id, q.container.uid, error );
+        };
         std::string result;
         {
             struct query_scope {
@@ -109,15 +116,16 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
                 }
             } scope;
             try {
-                result = run_recipe_query( q.id, q.container, q.pos );
+                result = q.kind == query_kind::character ? run_character_query( q.id, max_query_result_bytes ) :
+                         run_recipe_query( q.id, q.container, q.pos );
             } catch( const query_prompt & ) {
-                result = recipe_query_error_json( q.id, q.container.uid, "internal" );
+                result = failed( "internal" );
             } catch( const std::exception & ) {
-                result = recipe_query_error_json( q.id, q.container.uid, "internal" );
+                result = failed( "internal" );
             }
         }
         if( result.size() > max_query_result_bytes ) {
-            result = recipe_query_error_json( q.id, q.container.uid, "too large" );
+            result = failed( "too large" );
         }
         lk.lock();
         while( c.query_results.size() >= max_query_results ) {
@@ -583,7 +591,26 @@ uint64_t post_recipe_query( const item_ref &container, const ui_point &pos )
         return 0;
     }
     const uint64_t id = c.next_query_id++;
-    c.queries.push_back( recipe_query{ id, container, pos } );
+    c.queries.push_back( recipe_query{ id, query_kind::recipe, container, pos } );
+    c.cv.notify_all();
+    return id;
+}
+
+uint64_t post_character_query()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.queries.size() >= max_pending_queries ||
+        std::any_of( c.queries.begin(), c.queries.end(), []( const recipe_query & q ) {
+        return q.kind == query_kind::character;
+    } ) ) {
+        return 0;
+    }
+    const uint64_t id = c.next_query_id++;
+    recipe_query q;
+    q.id = id;
+    q.kind = query_kind::character;
+    c.queries.push_back( q );
     c.cv.notify_all();
     return id;
 }

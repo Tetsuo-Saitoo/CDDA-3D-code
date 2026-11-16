@@ -350,6 +350,25 @@ std::shared_ptr<const snapshot> latest_snapshot();
 // Writes `s` as JSON (submaps with z in [z_min, z_max] only) plus the names of the ids it uses.
 void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z_max );
 
+// Character sheet (G4): the character screen's data (CDDA's character sheet) for a character query (bridge.h).
+// Read-only; runs on the sim thread. All text is game data (mods): color tags, line breaks and control characters
+// removed, every string and list capped. Shape: contracts/bridge_api.md "Character queries".
+constexpr size_t max_sheet_speed_modifiers = 32;
+constexpr size_t max_sheet_skills = 64;
+constexpr size_t max_sheet_proficiencies = 64;   // known and learning, each
+constexpr size_t max_sheet_traits = 128;
+constexpr size_t max_sheet_bionics = 64;
+constexpr size_t max_sheet_effects = 64;
+constexpr size_t max_sheet_name_columns = 60;
+constexpr size_t max_sheet_description_columns = 400;
+constexpr size_t max_sheet_id_bytes = 64;
+
+// The avatar's character sheet as JSON. Over `max_bytes`, descriptions are emptied from the end (effects first,
+// then bionics, traits, proficiencies, skills) and "truncated" is true; the lists stay whole. The result can still
+// be over `max_bytes` when the rest alone is (the bridge then answers "too large").
+std::string run_character_query( uint64_t query_id, size_t max_bytes );
+std::string character_query_error_json( uint64_t query_id, const std::string &error );
+
 } // namespace fp3d
 
 #endif // CATA_SRC_FP3D_SNAPSHOT_H
