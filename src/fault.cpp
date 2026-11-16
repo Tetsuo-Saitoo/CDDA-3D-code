@@ -25,12 +25,14 @@ std::map<std::string, std::vector<fault_id>> faults_by_type;
 
 } // namespace
 
-std::vector<fault_id> faults::all_of_type( const std::string &type )
+// FP3D: the stored list itself, not a copy: random_of_type and random_of_type_item_has return references into it.
+const std::vector<fault_id> &faults::all_of_type( const std::string &type )
 {
+    static const std::vector<fault_id> none;   // FP3D: for a type with no faults
     const auto &typed = faults_by_type.find( type );
     if( typed == faults_by_type.end() ) {
         debugmsg( "there are no faults with type '%s'", type );
-        return {};
+        return none;   // FP3D
     }
     return typed->second ;
 }
