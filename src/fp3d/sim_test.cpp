@@ -5753,7 +5753,7 @@ static bool run_interrupt_checks()
         }
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 20000 && ( interrupt_setup.load() != 0 || r->id == before || !r->timed ) ) {
+        while( ms_since( t ) < 20000 * fp3d::slow_build && ( interrupt_setup.load() != 0 || r->id == before || !r->timed ) ) {
             if( std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id ) ) {
                 r = next;
             }
@@ -5771,7 +5771,7 @@ static bool run_interrupt_checks()
         }
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 120000 ) {
+        while( ms_since( t ) < 120000 * fp3d::slow_build ) {
             std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
             if( !next ) {
                 continue;
@@ -5873,7 +5873,7 @@ static bool run_furniture_checks()
         }
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 20000 ) {
+        while( ms_since( t ) < 20000 * fp3d::slow_build ) {
             std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
             if( !next ) {
                 continue;
@@ -5989,7 +5989,7 @@ static bool run_consume_checks()
         }
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 60000 ) {
+        while( ms_since( t ) < 60000 * fp3d::slow_build ) {
             std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
             if( !next ) {
                 continue;
@@ -6444,7 +6444,7 @@ static bool run_character_query_checks()
     };
     const auto await = []( uint64_t id ) {
         const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-        while( id != 0 && ms_since( t0 ) < 20000 ) {
+        while( id != 0 && ms_since( t0 ) < 20000 * fp3d::slow_build ) {
             if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
                 return *res;
             }

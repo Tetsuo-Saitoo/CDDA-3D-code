@@ -72,6 +72,17 @@ bool has_start_terrain( const overmap &om, const start_location &loc );
 // afterwards only go to the log.
 void shutdown_world();
 
+// Several games in one process, one after another, as CDDA's own main menu plays them: on one game thread, which
+// keeps CDDA's window, options, fonts and tilesets from the first boot (a later boot skips making them; the folders
+// stay the first boot's). end_game() on the game thread once a game is over (ended, failed or unwound by a
+// shutdown): what CDDA's cleanup_at_end clears before its main menu (zones, the map and overmap buffers), the game
+// object, the state game::setup resets outside it (sounds, missions, messages, combat text) and FP3D's per-game
+// state on that thread. reset_for_next_game() on the client side before the next boot, while no game runs: the
+// bridge channel, events, published snapshot, held state, id tables, cheats and range info, as a fresh process has
+// them (ids and seqs keep counting). shutdown_world() still ends it all.
+void end_game();
+void reset_for_next_game();
+
 // Saves the game the client asked for (fp3d::request_save), on the sim thread at the main loop, and records the
 // result with note_saved(); the message log says how it went. Does nothing if no save was asked for.
 void run_save();

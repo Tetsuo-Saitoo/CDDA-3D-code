@@ -66,6 +66,8 @@ struct held_view {
 void publish_held();
 // Client side.
 held_view latest_held();
+// Between two games: nothing held is published (seq keeps counting).
+void clear_held();
 } // namespace fp3d
 
 #endif // CATA_SRC_FP3D_HELD_H

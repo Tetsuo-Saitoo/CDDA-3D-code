@@ -342,6 +342,12 @@ std::shared_ptr<const id_tables> latest_id_tables()
     return latest;
 }
 
+void clear_id_tables()
+{
+    std::lock_guard<std::mutex> lk( tables_mutex );
+    latest = nullptr;
+}
+
 void write_id_tables_json( std::ostream &out, const id_tables &t )
 {
     JsonOut jo( out, false );

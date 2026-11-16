@@ -1863,8 +1863,8 @@ std::string run_character_query( uint64_t query_id, size_t max_bytes )
     out = write_sheet( query_id, s, true );
     // Still over (a long-modded character): entries go from the ends of the lists, least needed first. Each saves its
     // strings' raw size plus `keys`: the bytes write_sheet puts around them with empty strings and one-digit numbers
-    // (a lower bound, close to the real size), so one round drops enough and little more; more rounds only guard
-    // against a miscount.
+    // (close to the real size, not a strict bound: `true` and a last entry without its comma differ by a few
+    // bytes), so one round drops enough and little more; more rounds guard against a miscount.
     for( int round = 0; round < 4 && out.size() > max_bytes; round++ ) {
         size_t over = out.size() - max_bytes + 16;
         const auto cut = [&over]( auto & list, size_t keys ) {

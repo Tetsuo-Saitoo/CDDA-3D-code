@@ -772,6 +772,38 @@ bool is_shut_down()
     return chan().shut_down;
 }
 
+void reset_channel()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    c.pending.reset();
+    c.reply.reset();
+    c.shut_down = false;
+    c.before_ask = nullptr;
+    c.actions.clear();
+    c.item_now.reset();
+    c.stairs_now.reset();
+    c.square_now.reset();
+    c.save_wanted = false;
+    c.job_wanted = false;
+    c.save_if_changed = false;
+    c.saves.pending = false;    // `done` keeps counting
+    c.saves.ok = false;
+    c.clock = clock_state();
+    c.turn_start = std::chrono::steady_clock::now();
+    c.queries.clear();
+    c.query_results.clear();
+    interrupt_requested.store( false );
+    c.cv.notify_all();
+}
+
+void reset_sim_thread_state()
+{
+    next_timed = false;
+    hook_timed = false;
+    in_query = false;
+}
+
 std::string sanitize_text( const std::string &s, size_t max_len )
 {
     std::string out;

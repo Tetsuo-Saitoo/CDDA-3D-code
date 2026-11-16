@@ -2016,4 +2016,11 @@ range_info latest_range_info()
     return info_latest;
 }
 
+void clear_range_info()
+{
+    std::lock_guard<std::mutex> lk( info_mutex );
+    info_latest = range_info();
+    info_latest.seq = ++info_seq;
+}
+
 } // namespace fp3d

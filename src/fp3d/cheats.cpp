@@ -275,6 +275,21 @@ bool cheats_allowed()
     return r.allowed;
 }
 
+void reset_cheats()
+{
+    requests &r = reqs();
+    std::lock_guard<std::mutex> lk( r.m );
+    r.want = {};
+    r.kit = false;
+    r.allowed = false;
+    const uint64_t seq = r.latest.seq;
+    r.latest = cheats_view();
+    r.latest.seq = seq + 1;
+    r.kits_given = 0;
+    r.range_ops.clear();
+    r.range_results.clear();
+}
+
 bool request_cheat( cheat c, bool on )
 {
     const size_t i = static_cast<size_t>( c );

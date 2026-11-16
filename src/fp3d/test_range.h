@@ -265,6 +265,8 @@ struct range_info {
 };
 void capture_range_info();
 range_info latest_range_info();
+// Between two games, either side: no range published (seq keeps counting).
+void clear_range_info();
 } // namespace fp3d
 
 #endif // CATA_SRC_FP3D_TEST_RANGE_H
