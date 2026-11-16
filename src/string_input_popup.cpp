@@ -33,6 +33,7 @@
 #endif
 
 #include <algorithm>
+#include <limits>
 #include <memory>
 #include <string>
 #include <vector>
@@ -337,6 +338,12 @@ void string_input_popup::query( const bool loop, const bool draw_only )
 template<typename T>
 std::optional<T> query_int_impl( string_input_popup &p, const bool loop, const bool draw_only )
 {
+    // FP3D: a number request instead of typed text
+    if( fp3d::active() && !draw_only ) {
+        const std::optional<int64_t> n = p.fp3d_query_number( std::numeric_limits<T>::min(),
+                                         std::numeric_limits<T>::max() );
+        return n ? std::optional<T>( static_cast<T>( *n ) ) : std::nullopt;
+    }
     do {
         const std::string &queried_string = p.query_string( loop, draw_only );
         ret_val<T> result = try_parse_integer<T>( queried_string, true );
@@ -378,6 +385,36 @@ std::optional<int> string_input_popup::query_int( const bool loop, const bool dr
 std::optional<int64_t> string_input_popup::query_int64_t( const bool loop, const bool draw_only )
 {
     return query_int_impl<int64_t>( *this, loop, draw_only );
+}
+
+// FP3D: the client sends the number itself. The range is the caller's type's (never beyond what a float64 holds
+// exactly); an answer outside it, or with no number, is asked again with a status, a few times, then cancels.
+std::optional<int64_t> string_input_popup::fp3d_query_number( int64_t lo, int64_t hi )
+{
+    lo = std::clamp( lo, -fp3d::max_number_answer, fp3d::max_number_answer );
+    hi = std::clamp( hi, lo, fp3d::max_number_answer );
+    fp3d::ui_request req;
+    req.kind = fp3d::request_kind::number;
+    req.title = _title;
+    req.text = _description;
+    req.number_min = lo;
+    req.number_max = hi;
+    const ret_val<int64_t> shown = try_parse_integer<int64_t>( _text, false );
+    req.number_default = std::clamp<int64_t>( shown.success() ? shown.value() : 0, lo, hi );
+    for( int asked = 0; asked < fp3d::max_number_asks; asked++ ) {
+        const fp3d::ui_answer a = fp3d::ask( req );
+        if( a.cancel || a.timed_out ) {
+            break;
+        }
+        if( a.number && *a.number >= lo && *a.number <= hi ) {
+            _canceled = false;
+            _text = std::to_string( *a.number );
+            return a.number;
+        }
+        req.status = "enter a whole number from " + std::to_string( lo ) + " to " + std::to_string( hi );
+    }
+    _canceled = true;
+    return std::nullopt;
 }
 
 const std::string &string_input_popup::query_string( const bool loop, const bool draw_only )
@@ -666,6 +703,15 @@ template<typename T>
 static void edit_integer( string_input_popup &p, T &value )
 {
     p.only_digits( true );
+    // FP3D: a number request instead of typed text; cancel keeps the value
+    if( fp3d::active() ) {
+        p.text( std::to_string( value ) );
+        if( const std::optional<int64_t> n = p.fp3d_query_number( std::numeric_limits<T>::min(),
+                                             std::numeric_limits<T>::max() ) ) {
+            value = static_cast<T>( *n );
+        }
+        return;
+    }
     while( true ) {
         p.text( std::to_string( value ) );
         p.query();

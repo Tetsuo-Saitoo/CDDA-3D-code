@@ -164,6 +164,8 @@ const char *kind_name( request_kind k )
             return "shot";
         case request_kind::swing:
             return "swing";
+        case request_kind::number:
+            return "number";
     }
     return "?";
 }
@@ -349,6 +351,9 @@ ui_answer ask( ui_request req )
     a.timed_out = false;
     a.text = sanitize_text( a.text, kind == request_kind::chargen || kind == request_kind::world_setup ? max_answer_json : max_answer_text );
     a.action = sanitize_text( a.action, 128 );
+    if( kind != request_kind::number ) {
+        a.number.reset();
+    }
     if( a.picks.size() > max_answer_picks ) {
         a.picks.resize( max_answer_picks );
     }

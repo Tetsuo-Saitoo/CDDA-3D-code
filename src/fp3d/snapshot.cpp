@@ -77,6 +77,9 @@ namespace fp3d
 namespace
 {
 constexpr size_t max_creatures = 1024;
+// Names come from saves and mods: untrusted text, cleaned and capped like the sheet's.
+constexpr size_t max_creature_name_columns = 40;
+constexpr size_t max_vehicle_name_columns = 60;
 constexpr size_t max_vehicles = 256;
 constexpr size_t max_vehicle_parts = 4096;
 constexpr size_t max_fields_per_tile = 4;
@@ -729,7 +732,7 @@ void capture_vehicles( map &here, snapshot &s, std::vector<uint8_t> &vehicle_til
         vv.face_deg = static_cast<float>( units::to_degrees( v->face.dir() ) );
         vv.turn_deg = static_cast<float>( units::to_degrees( v->turn_dir ) );
         vv.velocity = static_cast<float>( v->velocity / 100.0 * 0.44704 );   // vmiph (mph * 100) -> m/s
-        vv.name = v->name;
+        vv.name = client_text( v->name, max_vehicle_name_columns, 4 * max_vehicle_name_columns );
         for( const vpart_reference &vp : v->get_all_parts() ) {
             if( vv.parts.size() >= max_vehicle_parts ) {
                 break;
@@ -789,6 +792,9 @@ void capture_creatures( map &here, const avatar &u, snapshot &s )
             cv.kind = c->is_avatar() ? 0 : 1;
             cv.move_mode = intern_id( id_kind::move_mode, ch->move_mode.str() );
             cv.wielded = wielded_index( *ch );
+            if( !c->is_avatar() ) {
+                cv.name = client_text( ch->get_name(), max_creature_name_columns, 4 * max_creature_name_columns );
+            }
         }
         s.creatures.push_back( cv );
     }
@@ -1356,6 +1362,9 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         jo.member( "hp_frac", static_cast<int>( c.hp_frac ) );
         jo.member( "wielded", static_cast<int64_t>( c.wielded ) );
         jo.member( "attitude", static_cast<int>( c.attitude ) );
+        if( c.kind == 1 ) {
+            jo.member( "name", c.name );
+        }
         jo.end_object();
     }
     jo.end_array();
