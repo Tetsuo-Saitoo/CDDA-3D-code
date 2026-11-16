@@ -141,6 +141,7 @@ const ter_str_id ter_t_stairs_down( "t_stairs_down" );
 const ter_str_id ter_t_stairs_up( "t_stairs_up" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
 const itype_id itype_pot( "pot" );
+const itype_id itype_log( "log" );
 const itype_id itype_meat( "meat" );
 const furn_str_id furn_f_fireplace( "f_fireplace" );
 const furn_str_id furn_f_woodstove( "f_woodstove" );
@@ -227,6 +228,7 @@ std::atomic<uint64_t> cook_gone_uid{ 0 };     // the pot taken away again (a sta
 std::atomic<double> cook_capture_ms{ 0 };     // one full capture of the scene
 std::atomic<double> cook_heat_ms{ 0 };        // the heat and cookware part of it
 std::atomic<size_t> cook_heat_squares{ 0 };   // squares it built a crafting inventory for
+std::atomic<int> cook_full_free_ml{ -1 };     // scene 26: the room left on the avatar's square once filled
 // Gun item checks: the handles scene 16 gave (sim thread writes, driver reads).
 std::atomic<uint64_t> gun_glock_uid{ 0 };      // a carried Glock 19 with a full magazine
 std::atomic<uint64_t> gun_spare_uid{ 0 };      // a carried empty Glock magazine
@@ -681,6 +683,18 @@ void ask_numbers()
     std::lock_guard<std::mutex> lk( number_mutex );
     number_out = res;
     number_done.store( true );
+}
+
+// The cooking scene's pot on the fire holds 4 fresh water again (sim thread).
+static void fresh_cook_water( map &here, const tripoint_bub_ms &fire_at )
+{
+    for( item &it : here.i_at( fire_at ) ) {
+        if( it.typeId() == itype_pot ) {
+            it.clear_items();
+            it.put_in( item( itype_water, calendar::turn, 4 ), pocket_type::CONTAINER );
+            it.on_contents_changed();
+        }
+    }
 }
 
 void observe()
@@ -1249,6 +1263,39 @@ void observe()
             item_location wielded = u.get_wielded_item();
             pk_wielded_uid = wielded ? fp3d::item_handle( *wielded ) : 0;
             here.build_map_cache( p.z() );
+            break;
+        }
+        case 26: {
+            // Cooking: the avatar's square filled (logs, then single rocks) until less room is left than a rock;
+            // 4 fresh water in the pot on the fire (CDDA boils it clean there in time).
+            fresh_cook_water( here, p + tripoint_rel_ms( -1, 1, 0 ) );
+            int n = 0;
+            const item log( itype_log );
+            while( n < 200 && log.volume() > 0_ml && here.free_volume( p ) >= log.volume() ) {
+                here.add_item( p, log );
+                n++;
+            }
+            const item rock( itype_rock, calendar::turn, 1 );
+            while( n < 2000 && rock.volume() > 0_ml && here.free_volume( p ) >= rock.volume() ) {
+                here.add_item( p, rock );
+                n++;
+            }
+            cook_full_free_ml = units::to_milliliter( here.free_volume( p ) );
+            break;
+        }
+        case 27: {
+            // The fillers gone again (anything else on the square stays); 4 fresh water in the pot again.
+            fresh_cook_water( here, p + tripoint_rel_ms( -1, 1, 0 ) );
+            for( bool again = true; again; ) {
+                again = false;
+                for( item &it : here.i_at( p ) ) {
+                    if( it.typeId() == itype_log || it.typeId() == itype_rock ) {
+                        here.i_rem( p, &it );
+                        again = true;
+                        break;
+                    }
+                }
+            }
             break;
         }
         case 24: {
@@ -2965,8 +3012,9 @@ static bool run_cooking_checks()
 
     // Starting the craft (the `cook` item action). Malformed actions are refused when queued. The sim refuses a
     // recipe the contents don't make, an unknown one, too big a batch and a pot two squares away, with nothing used
-    // up. water_clean x2 on the fire takes 2 of the 4 water out of the pot, lays the craft at the avatar's feet (the
-    // pot's cookware entry shows it) and starts CDDA's craft; stopped with CDDA's question, the craft stays.
+    // up, and a full square at the avatar's feet too. water_clean x2 on the fire takes 2 of the 4 water out of the
+    // pot, lays the craft at the avatar's feet (the pot's cookware entry shows it) and starts CDDA's craft; stopped
+    // with CDDA's question, the craft stays.
     uint32_t cook_tag = 500;
     const auto cook_action = [&]( uint64_t uid, const fp3d::ui_point & pos, const std::string & recipe, int batch ) {
         fp3d::item_action ia;
@@ -3117,6 +3165,21 @@ static bool run_cooking_checks()
            !too_far.done && water_before == 4, "cook: refusals, nothing used up",
            cook_text( wrong ) + " | " + cook_text( unknown ) + " | " + cook_text( too_many ) + " | " +
            cook_text( too_far ) + " | water " + std::to_string( water_before ) );
+    // No room for the craft at the avatar's feet: refused before anything is used up.
+    hand_setup = 26;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r ? r->id : 0 );
+    const cook_result full = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), false );
+    const std::optional<fp3d::cookware_view> full_cw = pot_now();
+    hand_setup = 27;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r ? r->id : 0 );
+    const int full_free = cook_full_free_ml.load();
+    check( full.back && full.answers == 1 && !full.done && full.why.find( "room" ) != std::string::npos && full_cw &&
+           water_left( full_cw ) == 4 && full_cw->craft_recipe.empty() && full_free >= 0 && full_free < 500,
+           "cook: no room at the feet, nothing used up",
+           cook_text( full ) + " | free " + std::to_string( full_free ) + " ml, water " +
+           std::to_string( water_left( full_cw ) ) );
     const cook_result boiling = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), true );
     const std::optional<fp3d::cookware_view> after = pot_now();
     check( boiling.back && boiling.done && boiling.answers == 1 && boiling.stopped,

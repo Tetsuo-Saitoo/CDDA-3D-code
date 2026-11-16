@@ -876,45 +876,70 @@ std::string start_cooking( avatar &u, const item_action &a )
         tool_picks.push_back( sel );
     }
     // The components come out of the pot only (CDDA's consume_items would take them from anywhere near).
+    const auto take_components = [&]( item & from, item_components & used, std::vector<item_comp> &comps_used ) {
+        for( const item_comp &ic : picks ) {
+            int qty = ic.count * a.batch;
+            std::list<item> taken;
+            if( item::count_by_charges( ic.type ) ) {
+                from.use_charges( ic.type, qty, taken, p, filter );
+            } else {
+                from.use_amount( ic.type, qty, taken, filter );
+            }
+            for( item &it : taken ) {
+                used.add( it );
+            }
+            item_comp total = ic;
+            total.count *= a.batch;
+            const auto same = std::find_if( comps_used.begin(), comps_used.end(), [&]( const item_comp & c ) {
+                return c.type == total.type;
+            } );
+            if( same != comps_used.end() ) {
+                same->count += total.count;
+            } else {
+                comps_used.push_back( total );
+            }
+        }
+    };
+    // The craft is made from a copy of the pot and laid down first: nothing is used up unless it has its place.
     item_components used;
     std::vector<item_comp> comps_used;
-    for( const item_comp &ic : picks ) {
-        int qty = ic.count * a.batch;
-        std::list<item> taken;
-        if( item::count_by_charges( ic.type ) ) {
-            pot->use_charges( ic.type, qty, taken, p, filter );
-        } else {
-            pot->use_amount( ic.type, qty, taken, filter );
-        }
-        for( item &it : taken ) {
-            used.add( it );
-        }
-        item_comp total = ic;
-        total.count *= a.batch;
-        const auto same = std::find_if( comps_used.begin(), comps_used.end(), [&]( const item_comp & c ) {
-            return c.type == total.type;
-        } );
-        if( same != comps_used.end() ) {
-            same->count += total.count;
-        } else {
-            comps_used.push_back( total );
-        }
+    {
+        item trial = *pot;
+        take_components( trial, used, comps_used );
     }
-    pot->on_contents_changed();
     // As craft_command::create_in_progress_craft and Character::start_craft.
     item craft( &r, a.batch, used, comps_used );
     craft.set_cached_tool_selections( tool_picks );
     craft.set_tools_to_continue( true );
-    u.craft_consume_tools( craft, 1, true );
     craft.set_next_failure_point( u );
     craft.set_owner( u );
     craft.set_var( cook_pot_var, std::to_string( a.item.uid ) );
-    // At the avatar's feet, as CDDA's crafting without a workbench or a free hand: never on the fire (it would burn)
-    // and never into the hands (they stay as they are).
-    item_location craft_loc = here.add_item_or_charges_ret_loc( me, craft );
+    // At the avatar's feet only, as CDDA's crafting without a workbench or a free hand: never into the hands (they
+    // stay as they are) and never spilled over to a square next to it (the fire would burn it).
+    item_location craft_loc = here.add_item_or_charges_ret_loc( me, craft, false );
     if( !craft_loc ) {
         return _( "There's no room for that here." );
     }
+    // Placed: the same out of the pot itself (found again, the craft may share its square), then the tools'
+    // start charges.
+    pot = nullptr;
+    for( item &it : here.i_at( p ) ) {
+        if( matches( it, a.item ) ) {
+            pot = &it;
+            break;
+        }
+    }
+    if( pot == nullptr ) {
+        craft_loc.remove_item();
+        return _( "That isn't there any more." );
+    }
+    {
+        item_components taken;
+        std::vector<item_comp> taken_comps;
+        take_components( *pot, taken, taken_comps );
+    }
+    pot->on_contents_changed();
+    u.craft_consume_tools( *craft_loc, 1, true );
     u.last_batch = a.batch;
     u.lastrecipe = rid;
     u.assign_activity( craft_activity_actor( craft_loc, false ) );
