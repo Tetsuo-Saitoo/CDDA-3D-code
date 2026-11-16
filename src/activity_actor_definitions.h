@@ -1019,6 +1019,11 @@ class consume_activity_actor : public activity_actor
         explicit consume_activity_actor( const item_location &consume_location ) :
             consume_location( consume_location ) {}
 
+        // FP3D: start() found it inedible or the player said no (fp3d/item_hands.cpp reports how a consume went).
+        bool fp3d_canceled() const {
+            return canceled;
+        }
+
         explicit consume_activity_actor( const item &consume_item ) :
             consume_item( consume_item ) {}
 

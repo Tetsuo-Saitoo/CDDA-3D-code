@@ -237,7 +237,9 @@ size_t queued_actions();
 // spot: only how the lying item `item` rests on its square `pos` changes (`spot` required, the pose with it).
 // hold: the carried item `item` goes into the main hand (CDDA's wield and its cost) or the off hand (held.h), `hand`
 // main or off; refused for a worn item or a hand that holds something else: nothing is ever put away to make room.
-enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold };
+// consume: CDDA's eat, drink or first aid for the item `item` (carried, or lying where `take` could get it at `pos`),
+// or for the first thing in it CDDA would consume (a drink in its bottle): CDDA's own prompts, time and messages.
+enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume };
 // take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
 // fit), wielded, the off hand.
 enum class item_hand : uint8_t { pack, main, off };
@@ -257,7 +259,8 @@ struct item_action {
     ui_point pos;
     item_hand hand = item_hand::pack;    // take, unload
     // put: the container. reload: the ammo or magazine to load (required). pour: the container poured into, or
-    // empty (uid 0, type 0) to pour onto `pos`.
+    // empty (uid 0, type 0) to pour onto `pos`. take: the container lying on `pos` that holds `item` (one level,
+    // L8), or empty for an item lying there itself.
     item_ref container;
     int pocket = -1;                     // put, pour: index into the container's pockets; -1 = CDDA's best pocket
     bool has_spot = false;               // drop, place, spot: keep where on the square it was placed
