@@ -186,6 +186,15 @@ void pace_turn( bool fast_forward, bool watched = false );
 // clears the queue, like CDDA's safe mode stopping you. Client side; queue_action returns false when full.
 constexpr size_t max_queued_actions = 32;
 bool queue_action( const std::string &action );
+// Like queue_action, for an action that asks for a square next to the player (open, close, examine...: CDDA's
+// choose_adjacent_highlight): it takes exactly `square` (absolute), with no prompt, and never another square CDDA
+// would pick by itself (its AUTOSELECT_SINGLE_VALID_TARGET). A square CDDA doesn't allow for it there (not next to
+// the player, locked, nothing to open) does nothing, with CDDA's own message for none ("There is nothing that can be
+// opened nearby."). An action that asks for no square ignores it; it never carries over to a later action. False as
+// for queue_action, or for a square out of range.
+bool queue_action_at( const std::string &action, const ui_point &square );
+// Sim side: the square the main-loop action now running was queued with (queue_action_at), once.
+std::optional<ui_point> take_action_square();
 void clear_actions();
 size_t queued_actions();
 
