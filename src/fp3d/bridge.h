@@ -286,8 +286,11 @@ uint64_t post_recipe_query( const item_ref &container, const ui_point &pos );
 std::optional<std::string> take_query_result( uint64_t id );
 size_t pending_queries();
 
-// Client side. Asks the sim to stop the current activity (it confirms with a popup first, like CDDA).
-void interrupt();
+// Client side. Asks the sim to stop the current activity or auto-travel (it confirms with a popup first, like
+// CDDA's key during one). False, and nothing happens, while the main loop waits for input with nothing queued (or
+// paused): nothing runs then. One not taken by the time the main loop next waits for input is dropped, so it never
+// stops something started later.
+bool interrupt();
 // Sim side. True once per interrupt().
 bool take_interrupt();
 
