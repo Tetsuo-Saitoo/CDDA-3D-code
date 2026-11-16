@@ -32,7 +32,8 @@ void reset();
 void finalize();
 void check_consistency();
 
-std::vector<fault_id> all_of_type( const std::string &type );
+// FP3D: the stored list itself, not a copy: random_of_type and random_of_type_item_has return references into it.
+const std::vector<fault_id> &all_of_type( const std::string &type );
 
 const fault_id &random_of_type( const std::string &type );
 const fault_id &random_of_type_item_has( const item &it, const std::string &type );
