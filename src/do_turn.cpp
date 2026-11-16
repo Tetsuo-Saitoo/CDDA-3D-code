@@ -233,10 +233,11 @@ bool cleanup_at_end()
 
 void handle_key_blocking_activity()
 {
-    // FP3D: no keyboard to poll; the client stops an activity with fp3d::interrupt()
+    // FP3D: no keyboard to poll; the client stops an activity or auto-travel with fp3d::interrupt()
     if( fp3d::active() ) {
         const avatar &u = get_avatar();
-        if( fp3d::take_interrupt() && u.activity && u.activity.is_interruptible_with_kb() ) {
+        if( fp3d::take_interrupt() &&
+            ( u.has_destination() || ( u.activity && u.activity.is_interruptible_with_kb() ) ) ) {
             g->cancel_activity_query( _( "Confirm:" ) );
         }
         return;

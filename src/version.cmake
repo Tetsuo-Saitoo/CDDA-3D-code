@@ -12,9 +12,14 @@ git_describe(GIT_VERSION --tags --always --match "[0-9A-Z]*.[0-9A-Z]*")
 # GetGitRevisionDescription can't follow: GIT_VERSION came back HEAD-HASH-NOTFOUND, version.h stayed empty and
 # version.cpp didn't compile. Ask git itself then, and never leave version.h without a VERSION.
 if(NOT GIT_VERSION OR "${GIT_VERSION}" MATCHES "NOTFOUND")
-    set(_fp3d_git "${GIT_BINARY}")
+    # The git FindGit found (GetGitRevisionDescription); find_program finds nothing in script mode (-P).
+    set(_fp3d_git "${GIT_EXECUTABLE}")
     if(NOT _fp3d_git)
-        find_program(_fp3d_git NAMES git)
+        set(_fp3d_git "${GIT_BINARY}")
+    endif()
+    if(NOT _fp3d_git)
+        find_program(_fp3d_git_found NAMES git)
+        set(_fp3d_git "${_fp3d_git_found}")
     endif()
     if(_fp3d_git)
         execute_process(COMMAND "${_fp3d_git}" -c core.safecrlf=false describe --tags --always
@@ -55,8 +60,13 @@ endif()
 
 if(GIT_VERSION)
     string(REPLACE "-NOTFOUND" "" GIT_VERSION ${GIT_VERSION})
-    file(READ  ${CMAKE_SOURCE_DIR}/src/version.h VERSION_H)
-    string(REGEX MATCH "#define VERSION \"(.+)\"" VERSION_H "${VERSION_H}")
+    file(READ  ${CMAKE_SOURCE_DIR}/src/version.h _fp3d_version_h_text)
+    # FP3D: compare with the quoted version itself (the whole match never equals it, so version.h was rewritten,
+    # and version.cpp rebuilt, on every run).
+    set(VERSION_H "")
+    if(_fp3d_version_h_text MATCHES "#define VERSION \"([^\"]+)\"")
+        set(VERSION_H "${CMAKE_MATCH_1}")
+    endif()
 
     if(NOT GIT_VERSION STREQUAL VERSION_H)
         file(WRITE ${CMAKE_SOURCE_DIR}/src/version.h

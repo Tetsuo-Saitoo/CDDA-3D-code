@@ -257,6 +257,10 @@ ui_answer ask( ui_request req )
     c.reply.reset();
     c.item_now.reset();   // only the answer to this request may carry one (a client can't send `fp3d_item` itself)
     c.stairs_now.reset();
+    if( timed ) {
+        // The main loop waits for input again: what an interrupt was meant for has ended.
+        interrupt_requested.store( false );
+    }
     c.pending = std::move( req );
     c.cv.notify_all();
     bool expired = false;
@@ -668,9 +672,17 @@ void pace_turn( bool fast_forward, bool watched )
     }
 }
 
-void interrupt()
+bool interrupt()
 {
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    // Nothing runs while the main loop waits for input (nothing queued to answer it, or paused): an interrupt now
+    // would wait for whatever starts next and stop that.
+    if( c.pending && c.pending->timed && !c.reply && ( c.actions.empty() || c.clock.paused ) ) {
+        return false;
+    }
     interrupt_requested.store( true );
+    return true;
 }
 
 bool take_interrupt()

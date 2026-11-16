@@ -36,6 +36,7 @@
 #include "calendar.h"
 #include "character_martial_arts.h"
 #include "coordinates.h"
+#include "cuboid_rectangle.h"
 #include "debug.h"
 #include "do_turn.h"
 #include "field.h"
@@ -258,7 +259,11 @@ std::atomic<int> physics_setup{ 0 };           // 1: the item physics scene; 2: 
 // Weather and mood checks (run_weather_mood_checks): at the next main-loop request the hook 1 = forces a lightning
 // storm, adds two morale entries and sets off CDDA's lightning effect, 2 = takes them back.
 std::atomic<int> weather_mood_setup{ 0 };
-std::atomic<int> weather_wait{ 0 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
+std::atomic<int> weather_wait{ 0 };
+// The interrupt checks: 1 map travel to the next overmap tile over flat ground; 2 a 5-minute wait; 3 a 6-hour wait;
+// 4 read whether a route is left (interrupt_route: 1 yes, 0 no) and end the travel.
+std::atomic<int> interrupt_setup{ 0 };
+std::atomic<int> interrupt_route{ -1 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
 // normal world's save carries them, and after the reload resumes the range as the bridge does after a load. What it
@@ -524,6 +529,48 @@ void wait_in_weather( bool start )
                                   100 * to_turns<int>( 20_minutes ), 0 ) );
 }
 
+// The interrupt checks' scenes (interrupt_setup).
+void set_up_interrupt( int stage )
+{
+    avatar &u = get_avatar();
+    map &here = get_map();
+    const tripoint_bub_ms p = u.pos_bub();
+    if( stage == 4 ) {
+        interrupt_route.store( u.has_destination() ? 1 : 0 );
+        u.omt_path.clear();
+        return;
+    }
+    g->clear_zombies();
+    if( stage == 1 ) {
+        // Map travel as the overmap's travel starts it: ACT_TRAVELLING with a path of overmap tiles (the last is where
+        // the avatar is). Its first turn routes to the edge of the next tile, half a tile away (activity_handlers.cpp
+        // travel_do_turn), and auto-travel walks it. A route set from here would be dropped by the main loop's next
+        // input; the activity sets it after that. Flat ground from the avatar to there.
+        const tripoint_abs_omt cur = u.pos_abs_omt();
+        const tripoint_abs_ms cur_mid = midpoint( project_bounds<coords::ms>( cur ) );
+        const int dir = u.pos_abs().x() <= cur_mid.x() ? 1 : -1;
+        const tripoint_abs_omt next = cur + tripoint_rel_omt( dir, 0, 0 );
+        const tripoint_bub_ms wp = here.get_bub( clamp( cur_mid, project_bounds<coords::ms>( next ) ) );
+        for( int x = std::min( p.x(), wp.x() ) - 3; x <= std::max( p.x(), wp.x() ) + 3; x++ ) {
+            for( int y = std::min( p.y(), wp.y() ) - 3; y <= std::max( p.y(), wp.y() ) + 3; y++ ) {
+                const tripoint_bub_ms q( x, y, p.z() );
+                if( here.inbounds( q ) ) {
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.ter_set( q, ter_t_dirt );
+                }
+            }
+        }
+        here.invalidate_map_cache( p.z() );
+        here.build_map_cache( p.z() );
+        u.omt_path = { next + tripoint_rel_omt( dir, 0, 0 ), next, cur };
+        u.assign_activity( player_activity( activity_id( "ACT_TRAVELLING" ) ) );
+        return;
+    }
+    const int minutes = stage == 2 ? 5 : 360;
+    u.assign_activity( player_activity( activity_id( "ACT_WAIT" ), 100 * to_turns<int>( time_duration::from_minutes(
+                                            minutes ) ), 0 ) );
+}
+
 void observe()
 {
     // As the client's hook (bridge/src/sim_session.cpp).
@@ -539,6 +586,9 @@ void observe()
     }
     if( const int ww = weather_wait.exchange( 0 ); ww != 0 ) {
         wait_in_weather( ww == 1 );
+    }
+    if( const int stage = interrupt_setup.exchange( 0 ); stage != 0 ) {
+        set_up_interrupt( stage );
     }
     if( const int stage = physics_setup.exchange( 0 ); stage == 1 ) {
         set_up_item_physics();
@@ -5319,6 +5369,107 @@ static bool run_weather_cheat_checks( const std::function<size_t()> &lightning_s
     return failed == 0;
 }
 
+// Interrupting (fp3d::interrupt, 2026-11-15): refused while the main loop waits for input, so a later wait runs to its
+// end; a wait and an auto-travel route are stopped after CDDA's popup, answered yes.
+static bool run_interrupt_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  interrupt: %-39s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    // A scene set up by the hook at the next main-loop request (one turn passes).
+    // stray: an interrupt while the turn that sets it up passes, with nothing running to take it.
+    const auto set_up = [&]( int stage, bool stray = false ) {
+        interrupt_setup.store( stage );
+        fp3d::queue_action( "pause" );
+        if( stray ) {
+            fp3d::interrupt();
+        }
+        const uint64_t before = r->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 20000 && ( interrupt_setup.load() != 0 || r->id == before || !r->timed ) ) {
+            if( std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id ) ) {
+                r = next;
+            }
+        }
+        return interrupt_setup.load() == 0 && r->id != before && r->timed;
+    };
+    // Turns pass from the request set up; popups are answered `yes`. The turns until the main loop asks again, -1
+    // when it doesn't.
+    std::vector<std::string> popups;
+    const auto run_on = [&]( bool interrupt, bool yes ) -> int64_t {
+        const int64_t turn0 = r->turn;
+        fp3d::queue_action( "pause" );
+        if( interrupt && !fp3d::interrupt() ) {
+            popups.emplace_back( "(interrupt refused)" );
+        }
+        const uint64_t before = r->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 120000 ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( !r->timed ) {
+                popups.push_back( r->text );
+                fp3d::ui_answer a;
+                a.id = r->id;
+                if( r->kind == fp3d::request_kind::popup && !r->actions.empty() ) {
+                    a.action = yes && std::find( r->actions.begin(), r->actions.end(), "YES" ) != r->actions.end() ?
+                               "YES" : r->actions.front();
+                } else {
+                    a.cancel = true;
+                }
+                fp3d::answer( a );
+                continue;
+            }
+            if( r->id != before ) {
+                return r->turn - turn0;
+            }
+        }
+        return -1;
+    };
+    const auto joined = [&]() {
+        std::string s;
+        for( const std::string &p : popups ) {
+            s += ( s.empty() ? "" : " | " ) + p.substr( 0, 60 );
+        }
+        return s;
+    };
+
+    // While the main loop waits, nothing runs: refused. One that nothing took (no activity that turn) is dropped
+    // when the main loop next waits, so the wait started after it runs to its end.
+    check( !fp3d::interrupt(), "refused while the main loop waits", "" );
+    popups.clear();
+    int64_t turns = set_up( 2, true ) ? run_on( false, true ) : -1;
+    check( turns >= 300 && popups.empty(), "an earlier one never stops a later wait",
+           std::to_string( turns ) + " turns; " + joined() );
+
+    // A long wait, interrupted: CDDA asks, yes stops it.
+    popups.clear();
+    turns = set_up( 3 ) ? run_on( true, true ) : -1;
+    check( turns >= 0 && turns < 21600 && popups.size() == 1 && popups[0].find( "Confirm:" ) != std::string::npos,
+           "a wait stopped after CDDA's popup", std::to_string( turns ) + " turns; " + joined() );
+
+    // Map travel, interrupted the same way on its first step: the route is gone (it is at least 10 steps).
+    popups.clear();
+    turns = set_up( 1 ) ? run_on( true, true ) : -1;
+    interrupt_route.store( -1 );
+    const bool read = set_up( 4 );
+    check( turns >= 0 && turns < 8 && popups.size() == 1 && popups[0].find( "auto move" ) != std::string::npos &&
+           read && interrupt_route.load() == 0, "auto-travel stopped after CDDA's popup",
+           std::to_string( turns ) + " turns, route left " + std::to_string( interrupt_route.load() ) + "; " +
+           joined() );
+    return failed == 0;
+}
+
 // A saved range game resumes only in a range world (fp3d/test_range.h resume_test_range, 2026-11-10): this normal
 // world's save carries the range's avatar values (mark_as_range), and resumed after the reload as the bridge does, it
 // stays a normal game: no range, no zones, AI not frozen.
@@ -5995,6 +6146,7 @@ int main()
         drain();
         return event_counts[static_cast<size_t>( fp3d::event_kind::lightning )];
     } );
+    const bool interrupt_ok = weather_cheat_ok && run_interrupt_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -6046,6 +6198,7 @@ int main()
     std::printf( "throw/pour: %s\n", throw_pour_ok ? "ok" : "BAD" );
     std::printf( "item physics: %s\n", physics_ok ? "ok" : "BAD" );
     std::printf( "weather cheat: %s\n", weather_cheat_ok ? "ok" : "BAD" );
+    std::printf( "interrupt: %s\n", interrupt_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -6056,6 +6209,6 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }
