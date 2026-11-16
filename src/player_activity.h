@@ -97,6 +97,11 @@ class player_activity
         player_activity &operator=( player_activity && ) noexcept( list_is_noexcept ) = default;
         player_activity &operator=( const player_activity & ) = default;
 
+        // FP3D: the actor (null for an old-style activity), read by fp3d/item_hands.cpp.
+        const activity_actor *fp3d_actor() const {
+            return actor.get();
+        }
+
         explicit operator bool() const {
             return !type.is_null();
         }

@@ -11,6 +11,7 @@
 
 #include "activity_actor_definitions.h"
 #include "avatar.h"
+#include "avatar_action.h"
 #include "calendar.h"
 #include "contents_change_handler.h"
 #include "coordinates.h"
@@ -46,6 +47,8 @@
 #include "translation.h"
 #include "translations.h"
 #include "units.h"
+
+static const activity_id ACT_CONSUME( "ACT_CONSUME" );
 
 static const ammotype ammo_plutonium( "plutonium" );
 
@@ -473,7 +476,7 @@ bool drop( avatar &u, const item_action &a )
 }
 
 // Why the carried item `loc` can't be reached into ("" = it can): it's in a sealed or forbidden pocket.
-std::string pocket_block( const item_location &loc )
+std::string pocket_block( const item_location &loc, bool sealed_ok = false )
 {
     for( item_location at = loc; at.has_parent(); at = at.parent_item() ) {
         const item_pocket *pk = at.parent_pocket();
@@ -483,7 +486,7 @@ std::string pocket_block( const item_location &loc )
         if( pk->is_forbidden() ) {
             return string_format( _( "You can't get at the %s in there." ), loc->tname() );
         }
-        if( pk->sealed() ) {
+        if( pk->sealed() && !sealed_ok ) {
             //~ %1$s: an item, %2$s: the sealed container it's in
             return string_format( _( "The %1$s is sealed in the %2$s.  Open it first." ), loc->tname(),
                                   at.parent_item()->type_name() );
@@ -492,13 +495,15 @@ std::string pocket_block( const item_location &loc )
     return {};
 }
 
-// The item `r` names: carried (not in a sealed or forbidden pocket), else lying on `pos` where `take` could get it
-// (in reach, not ridden past, in sight, not someone else's). Empty, with `why` set, otherwise.
-item_location find_reachable( avatar &u, const ui_point &pos, const item_ref &r, std::string &why )
+// The item `r` names: carried (not in a sealed or forbidden pocket; sealed is fine with `sealed_ok`), else lying on
+// `pos` where `take` could get it (in reach, not ridden past, in sight, not someone else's). Empty, with `why` set,
+// otherwise.
+item_location find_reachable( avatar &u, const ui_point &pos, const item_ref &r, std::string &why,
+                              bool sealed_ok = false )
 {
     item_location loc = find_carried( u, r );
     if( loc ) {
-        why = pocket_block( loc );
+        why = pocket_block( loc, sealed_ok );
         return why.empty() ? loc : item_location();
     }
     map &here = get_map();
@@ -1677,11 +1682,96 @@ bool hold_in_hand( avatar &u, const item_action &a )
     u.add_msg_if_player( _( "You take your %s in your other hand." ), name );
     return true;
 }
+// What CDDA's consume menu offers (game_inventory.cpp, comestible_inventory_preset::is_shown).
+bool consume_offered( const avatar &u, const item &it )
+{
+    return ( it.is_comestible() && u.can_consume_as_is( it ) ) || it.is_medical_tool();
+}
+
+// The first thing in `loc` CDDA's consume menu offers: depth first, container pockets only, 3 levels at most, not in
+// a forbidden pocket (a sealed one is fine: CDDA opens it). Empty when there is none.
+item_location offered_inside( const avatar &u, item_location loc, int depth = 0 )
+{
+    if( depth >= 3 ) {
+        return item_location();
+    }
+    for( item *in : loc->all_items_top( pocket_type::CONTAINER ) ) {
+        item_location at( loc, in );
+        if( !pocket_block( at, true ).empty() ) {
+            continue;
+        }
+        if( consume_offered( u, *in ) ) {
+            return at;
+        }
+        if( item_location deeper = offered_inside( u, at, depth + 1 ) ) {
+            return deeper;
+        }
+    }
+    return item_location();
+}
+
+// Why CDDA's consume menu won't take `loc` (comestible_inventory_preset::get_denial), "" when it would.
+std::string consume_denial( const avatar &u, const item_location &loc )
+{
+    map &here = get_map();
+    const item &it = *loc;
+    if( it.made_of_from_type( phase_id::LIQUID ) && loc.where() != item_location::type::container &&
+        !here.has_flag_furn( ter_furn_flag::TFLAG_LIQUIDCONT, loc.pos_bub( here ) ) ) {
+        return _( "Can't drink spilt liquids." );
+    }
+    if( it.made_of_from_type( phase_id::GAS ) && loc.where() != item_location::type::container ) {
+        return _( "Can't consume spilt gasses." );
+    }
+    if( it.is_medication() && !u.can_use_heal_item( it ) && !it.is_craft() ) {
+        return _( "Your biology is not compatible with that item." );
+    }
+    if( !it.is_medical_tool() ) {
+        const ret_val<edible_rating> res = u.can_eat( it );
+        if( !res.success() ) {
+            return res.str();
+        }
+    }
+    return {};
+}
+
+// CDDA's eat (first aid for a medical tool) on one item, without the menu. CDDA's own prompts (rotten, allergy, too
+// full) stay real questions to the player; its time and messages. It took time when the consume activity started and
+// the player didn't say no; when CDDA itself refuses or the player says no, the result has no text (CDDA said why).
+bool consume( avatar &u, const item_action &a )
+{
+    std::string why;
+    item_location loc = find_reachable( u, a.pos, a.item, why, /*sealed_ok=*/true );
+    if( !loc ) {
+        return refuse( u, why );
+    }
+    if( !consume_offered( u, *loc ) ) {
+        item_location inner = offered_inside( u, loc );
+        if( !inner ) {
+            // CDDA's own reason when it has one (not edible, frozen solid), else its menu's.
+            const ret_val<edible_rating> res = u.can_eat( *loc );
+            return refuse( u, res.success() ? std::string( _( "You have nothing to consume." ) ) : res.str() );
+        }
+        loc = inner;
+    }
+    why = consume_denial( u, loc );
+    if( !why.empty() ) {
+        return refuse( u, why );
+    }
+    if( loc->is_medical_tool() ) {
+        const int moves = u.get_moves();
+        avatar_action::use_item( u, loc, "heal" );
+        return !u.activity.is_null() || u.get_moves() < moves;
+    }
+    avatar_action::eat( u, loc, {}, {}, std::string(), activity_id::NULL_ID() );
+    const consume_activity_actor *eating = u.activity.id() == ACT_CONSUME ?
+                                           dynamic_cast<const consume_activity_actor *>( u.activity.fp3d_actor() ) : nullptr;
+    return eating != nullptr && !eating->fp3d_canceled();
+}
 } // namespace
 
 void register_item_actions( input_context &ctxt )
 {
-    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw, pour, place, spot or hold one item" ) );
+    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw, pour, place, spot, hold or consume one item" ) );
 }
 
 bool is_item_action( const std::string &action )
@@ -1693,13 +1783,14 @@ namespace
 {
 bool run_one_item_action( avatar &u, const std::optional<item_action> &a )
 {
-    // As CDDA's do_regular_action for pickup and drop. Place and spot never print a message.
+    // As CDDA's do_regular_action for pickup and drop; its eat has neither check. Place and spot never print a message.
     const bool free_op = a->op == item_op::place || a->op == item_op::spot;
-    if( u.has_active_mutation( trait_SHELL2 ) || u.has_active_mutation( trait_SHELL3 ) ) {
+    if( a->op != item_op::consume && ( u.has_active_mutation( trait_SHELL2 ) ||
+                                       u.has_active_mutation( trait_SHELL3 ) ) ) {
         const std::string why = _( "You can't do that while you're in your shell." );
         return free_op ? refuse_quietly( why ) : refuse( u, why );
     }
-    if( u.has_effect( effect_incorporeal ) && a->op != item_op::drop ) {
+    if( u.has_effect( effect_incorporeal ) && a->op != item_op::drop && a->op != item_op::consume ) {
         const std::string why = _( "You lack the substance to affect anything." );
         return free_op ? refuse_quietly( why ) : refuse( u, why );
     }
@@ -1726,6 +1817,8 @@ bool run_one_item_action( avatar &u, const std::optional<item_action> &a )
             return set_rest( u, *a );
         case item_op::hold:
             return hold_in_hand( u, *a );
+        case item_op::consume:
+            return consume( u, *a );
     }
     return false;
 }

@@ -546,7 +546,15 @@ void publish_held()
     held_view v;
     v.turn = to_turns<int64_t>( calendar::turn - calendar::turn_zero );
     v.main = view_of( u.get_wielded_item() );
-    v.off = view_of( offhand_item( u ) );
+    item_location off = offhand_item( u );
+    // Grown too heavy for one hand (filled up, or the character got weaker): the hand lets go. The item stays where it
+    // is in its pocket; only the mark goes.
+    if( off && off->is_two_handed( u ) ) {
+        u.add_msg_if_player( m_info, _( "Your %s is too heavy to hold in one hand now." ), off->tname() );
+        off->erase_var( offhand_var );
+        off = item_location();
+    }
+    v.off = view_of( off );
     if( u.activity ) {
         v.activity = capped( u.activity.id().str() );
     }
