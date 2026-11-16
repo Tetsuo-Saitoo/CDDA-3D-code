@@ -60,6 +60,8 @@ endif()
 
 if(GIT_VERSION)
     string(REPLACE "-NOTFOUND" "" GIT_VERSION ${GIT_VERSION})
+    # FP3D: only a plain rev string goes into the header (letters, digits and ._+-).
+    string(REGEX REPLACE "[^A-Za-z0-9._+-]" "_" GIT_VERSION "${GIT_VERSION}")
     file(READ  ${CMAKE_SOURCE_DIR}/src/version.h _fp3d_version_h_text)
     # FP3D: compare with the quoted version itself (the whole match never equals it, so version.h was rewritten,
     # and version.cpp rebuilt, on every run).
