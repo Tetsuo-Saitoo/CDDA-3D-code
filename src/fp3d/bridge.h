@@ -259,7 +259,8 @@ struct item_action {
     ui_point pos;
     item_hand hand = item_hand::pack;    // take, unload
     // put: the container. reload: the ammo or magazine to load (required). pour: the container poured into, or
-    // empty (uid 0, type 0) to pour onto `pos`.
+    // empty (uid 0, type 0) to pour onto `pos`. take: the container lying on `pos` that holds `item` (one level,
+    // L8), or empty for an item lying there itself.
     item_ref container;
     int pocket = -1;                     // put, pour: index into the container's pockets; -1 = CDDA's best pocket
     bool has_spot = false;               // drop, place, spot: keep where on the square it was placed

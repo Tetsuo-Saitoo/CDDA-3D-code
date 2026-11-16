@@ -204,7 +204,8 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 // west 1 north, a rock 2 west 1 south, a pot 8 west (out of reach), a pot put 2 west 2 south and taken away again,
 // 16 = gun item checks (run_gun_item_checks; see the case below), 17 = throw and pour checks
 // (run_throw_pour_checks; see the case below), 18 = consume checks, 19 and 20 = off-hand weight checks, 21 = siphon
-// checks: strength 8 for "too heavy: not offered" (stage 3 sets 12, stage 8 puts the random start's back).
+// checks: strength 8 for "too heavy: not offered" (stage 3 sets 12, stage 8 puts the random start's back), 22 =
+// lying-container checks.
 // Done on the sim thread right before its next request.
 std::atomic<int> hand_setup{ 0 };
 // The random start's strength while a scene sets its own (sim thread only; -1 = nothing saved).
@@ -252,6 +253,12 @@ std::atomic<uint64_t> cs_rock_uid{ 0 };         // a carried rock
 std::atomic<uint64_t> cs_west_apple_uid{ 0 };   // an apple west
 std::atomic<uint64_t> cs_far_apple_uid{ 0 };    // an apple 2 squares east
 std::atomic<uint64_t> cs_spilt_uid{ 0 };        // clean water spilt north
+// The lying-container checks' scene (hand_setup 22).
+std::atomic<uint64_t> lc_pack_uid{ 0 };         // a backpack west holding a rock and 2 empty bottles
+std::atomic<uint64_t> lc_rock_uid{ 0 };         // the rock
+std::atomic<uint64_t> lc_sealed_uid{ 0 };       // a sealed bottle of water west
+std::atomic<uint64_t> lc_sealed_water_uid{ 0 };
+std::atomic<uint64_t> lc_far_pack_uid{ 0 };     // a backpack 2 squares west holding a rock
 
 // Range op checks: 32 operations queued from inside the sim's hook (so none run before the queue is full), then one
 // more, which is refused. They run at the next main-loop request.
@@ -1047,6 +1054,68 @@ void observe()
             cs_west_apple_uid = lay( p + tripoint_rel_ms( -1, 0, 0 ), item( itype_apple ) );
             cs_far_apple_uid = lay( p + tripoint_rel_ms( 2, 0, 0 ), item( itype_apple ) );
             cs_spilt_uid = lay( p + tripoint_rel_ms( 0, -1, 0 ), item( itype_water_clean, calendar::turn, 1 ) );
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 22: {
+            // Lying containers (L8 #3, #4): floor 3 squares around, nothing lying there; a backpack worn, nothing
+            // held. West: a backpack holding a rock and 2 empty bottles (rocks are ammo: several merge into one
+            // stack), and a sealed bottle of water. 2 west: a backpack holding a rock.
+            // East: 40 rocks. 2 east: 40 rocks.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -3; dx <= 3; dx++ ) {
+                for( int dy = -3; dy <= 3; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_floor );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            u.clear_worn();
+            u.inv->clear();
+            u.remove_weapon();
+            u.wear_item( item( itype_backpack ), false );
+            const tripoint_bub_ms west = p + tripoint_rel_ms( -1, 0, 0 );
+            item pack( itype_backpack );
+            pack.put_in( item( itype_rock ), pocket_type::CONTAINER );
+            pack.put_in( item( itype_bottle_plastic ), pocket_type::CONTAINER );
+            pack.put_in( item( itype_bottle_plastic ), pocket_type::CONTAINER );
+            item &laid = here.add_item( west, pack );
+            lc_pack_uid = laid.is_null() ? 0 : fp3d::item_handle( laid );
+            lc_rock_uid = 0;
+            if( !laid.is_null() ) {
+                for( item *in : laid.all_items_top( pocket_type::CONTAINER ) ) {
+                    if( in->typeId() == itype_rock ) {
+                        lc_rock_uid = fp3d::item_handle( *in );
+                    }
+                }
+            }
+            item bottle( itype_bottle_plastic );
+            bottle.put_in( item( itype_water_clean, calendar::turn, 2 ), pocket_type::CONTAINER );
+            for( item_pocket *pk : bottle.get_all_contained_pockets() ) {
+                pk->seal();
+            }
+            item &sealed = here.add_item( west, bottle );
+            lc_sealed_uid = sealed.is_null() ? 0 : fp3d::item_handle( sealed );
+            lc_sealed_water_uid = 0;
+            if( !sealed.is_null() ) {
+                for( item *in : sealed.all_items_top( pocket_type::CONTAINER ) ) {
+                    lc_sealed_water_uid = fp3d::item_handle( *in );
+                }
+            }
+            item far_pack( itype_backpack );
+            far_pack.put_in( item( itype_rock ), pocket_type::CONTAINER );
+            item &far_laid = here.add_item( p + tripoint_rel_ms( -2, 0, 0 ), far_pack );
+            lc_far_pack_uid = far_laid.is_null() ? 0 : fp3d::item_handle( far_laid );
+            for( int i = 0; i < 40; i++ ) {
+                here.add_item( p + tripoint_rel_ms( 1, 0, 0 ), item( itype_rock ) );
+                here.add_item( p + tripoint_rel_ms( 2, 0, 0 ), item( itype_rock ) );
+            }
             here.build_map_cache( p.z() );
             break;
         }
@@ -6039,6 +6108,174 @@ static bool run_offhand_weight_checks()
     return failed == 0;
 }
 
+// Lying containers and big piles (L8 #3, #4, 2026-11-16): what lies in a container next to the player is listed one
+// level deep (never in a sealed pocket, never 2 squares away) and can be taken out by hand; piles next to the player
+// list up to 256 handles, others 32 with the rest counted in the JSON's `more`.
+static bool run_lying_container_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  lying containers: %-44s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct result {
+        bool queued = false;
+        bool back = false;
+        int answers = 0;
+        bool done = false;
+        std::string why;
+        int spent = 0;
+    };
+    uint32_t next_tag = 400;
+    const auto run = [&]( fp3d::item_action ia ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        const std::optional<fp3d::ui_request> r0 = fp3d::wait_request( 5000 );
+        if( !r0 || !r0->timed ) {
+            return res;
+        }
+        const observed o0 = snapshot();
+        fp3d::drain_events( evs );
+        evs.clear();
+        ia.tag = ++next_tag;
+        res.queued = fp3d::queue_item_action( ia );
+        if( !res.queued ) {
+            return res;
+        }
+        const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 40000, r0->id );
+        fp3d::drain_events( evs );
+        const observed o1 = snapshot();
+        res.back = r1 && r1->timed;
+        res.spent = static_cast<int>( o1.turn - o0.turn ) * o0.speed + o0.moves - o1.moves;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::item_result && e.detail == ia.tag ) {
+                res.answers++;
+                res.done = e.amount == 1;
+                res.why = e.text;
+            }
+        }
+        return res;
+    };
+    const auto show = []( const result & r ) {
+        return std::string( r.queued ? "" : "not queued " ) + ( r.done ? "done" : "not done" ) + " [" + r.why +
+               "] " + std::to_string( r.spent ) + " moves";
+    };
+    // What the newest snapshot lists inside the container with handle `box`.
+    const auto inside_of = []( uint64_t box ) {
+        std::vector<fp3d::inside_view> out;
+        if( const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot() ) {
+            for( const std::shared_ptr<const fp3d::submap_view> &sm : s->submaps ) {
+                for( const fp3d::inside_view &v : sm->inside ) {
+                    if( v.container == box ) {
+                        out.push_back( v );
+                    }
+                }
+            }
+        }
+        return out;
+    };
+    const auto carried_has = []( uint64_t uid ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.uid == uid ) {
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 22;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 || lc_pack_uid == 0 || lc_rock_uid == 0 || lc_sealed_uid == 0 ||
+        lc_sealed_water_uid == 0 || lc_far_pack_uid == 0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    const fp3d::ui_point west{ here.x - 1, here.y, here.z };
+    const fp3d::ui_point east{ here.x + 1, here.y, here.z };
+    const fp3d::ui_point far_east{ here.x + 2, here.y, here.z };
+    const uint32_t t_rock = fp3d::intern_id( fp3d::id_kind::itype, "rock" );
+    const uint32_t t_pack = fp3d::intern_id( fp3d::id_kind::itype, "backpack" );
+    const uint32_t t_bottle = fp3d::intern_id( fp3d::id_kind::itype, "bottle_plastic" );
+    const uint32_t t_water = fp3d::intern_id( fp3d::id_kind::itype, "water_clean" );
+
+    const std::vector<fp3d::inside_view> in0 = inside_of( lc_pack_uid );
+    size_t rocks = 0;
+    size_t bottles = 0;
+    bool pockets_ok = true;
+    bool has_rock = false;
+    for( const fp3d::inside_view &v : in0 ) {
+        rocks += v.type == t_rock ? 1 : 0;
+        bottles += v.type == t_bottle ? 1 : 0;
+        pockets_ok = pockets_ok && v.pocket >= 0;
+        has_rock = has_rock || ( v.uid == lc_rock_uid && v.type == t_rock );
+    }
+    check( in0.size() == 3 && rocks == 1 && bottles == 2 && pockets_ok && has_rock,
+           "a backpack next to you: its 3 items listed", std::to_string( in0.size() ) + " listed" );
+    check( inside_of( lc_sealed_uid ).empty() && inside_of( lc_far_pack_uid ).empty(),
+           "not in a sealed bottle, not 2 squares away", std::to_string( inside_of( lc_sealed_uid ).size() ) + " / " +
+           std::to_string( inside_of( lc_far_pack_uid ).size() ) );
+    const size_t near_n = handles_at( east ).size();
+    const size_t far_n = handles_at( far_east ).size();
+    check( near_n == 40 && far_n == fp3d::max_handles_per_tile, "40 rocks: all listed next to you, 32 farther",
+           std::to_string( near_n ) + " / " + std::to_string( far_n ) );
+    {
+        std::ostringstream json;
+        fp3d::write_snapshot_json( json, *s0, here.z, here.z );
+        const std::string j = json.str();
+        const auto floor_div = []( int a ) {
+            return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+        };
+        const int far_tile = ( far_east.y - floor_div( far_east.y ) * fp3d::sm_size ) * fp3d::sm_size +
+                             ( far_east.x - floor_div( far_east.x ) * fp3d::sm_size );
+        const bool more = j.find( "[" + std::to_string( far_tile ) + ",8]" ) != std::string::npos &&
+                          j.find( "\"more\":[" ) != std::string::npos;
+        const bool inside = j.find( "[" + std::to_string( lc_pack_uid ) + "," + std::to_string( lc_rock_uid ) + "," +
+                                    std::to_string( t_rock ) + "," ) != std::string::npos;
+        check( more && inside, "JSON: `more` for the far pile, `inside` for the pack", "" );
+    }
+
+    // Take one rock out of the backpack next to you.
+    fp3d::item_action take;
+    take.op = fp3d::item_op::take;
+    take.item = fp3d::item_ref{ lc_rock_uid, t_rock };
+    take.pos = west;
+    take.container = fp3d::item_ref{ lc_pack_uid, t_pack };
+    result res = run( take );
+    bool still_listed = false;
+    for( const fp3d::inside_view &v : inside_of( lc_pack_uid ) ) {
+        still_listed = still_listed || v.uid == lc_rock_uid;
+    }
+    check( res.back && res.answers == 1 && res.done && res.spent > 0 && carried_has( lc_rock_uid ) && !still_listed &&
+           inside_of( lc_pack_uid ).size() == 2, "take a rock out of the backpack", show( res ) );
+    // The sealed bottle's water: refused, still sealed in there.
+    take.item = fp3d::item_ref{ lc_sealed_water_uid, t_water };
+    take.container = fp3d::item_ref{ lc_sealed_uid, t_bottle };
+    res = run( take );
+    check( res.back && res.answers == 1 && !res.done && res.why.find( "sealed" ) != std::string::npos &&
+           res.spent == 0, "out of a sealed bottle: refused", show( res ) );
+    // A rock lying east isn't in the backpack.
+    const std::vector<fp3d::item_handle_view> east_rocks = handles_at( east );
+    take.item = fp3d::item_ref{ east_rocks.empty() ? 1 : east_rocks[0].uid, t_rock };
+    take.container = fp3d::item_ref{ lc_pack_uid, t_pack };
+    take.pos = west;
+    res = run( take );
+    check( res.back && res.answers == 1 && !res.done && res.why.find( "isn't there" ) != std::string::npos &&
+           res.spent == 0, "an item not in that container: refused", show( res ) );
+    // A half-named container never queues.
+    take.container = fp3d::item_ref{ lc_pack_uid, 0 };
+    check( !fp3d::queue_item_action( take ) && fp3d::queued_actions() == 0, "a container without its type: never queued",
+           "" );
+    return failed == 0;
+}
+
 // A saved range game resumes only in a range world (fp3d/test_range.h resume_test_range, 2026-11-10): this normal
 // world's save carries the range's avatar values (mark_as_range), and resumed after the reload as the bridge does, it
 // stays a normal game: no range, no zones, AI not frozen.
@@ -6720,6 +6957,7 @@ int main()
     const bool furniture_ok = interrupt_ok && run_furniture_checks();
     const bool consume_ok = furniture_ok && run_consume_checks();
     const bool offhand_ok = consume_ok && run_offhand_weight_checks();
+    const bool lying_ok = offhand_ok && run_lying_container_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -6775,6 +7013,7 @@ int main()
     std::printf( "furniture: %s\n", furniture_ok ? "ok" : "BAD" );
     std::printf( "consume: %s\n", consume_ok ? "ok" : "BAD" );
     std::printf( "off hand: %s\n", offhand_ok ? "ok" : "BAD" );
+    std::printf( "lying containers: %s\n", lying_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -6785,6 +7024,6 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

@@ -519,6 +519,7 @@ bool queue_item_action( const item_action &a )
     if( !op_ok || !hand_ok || !ref_ok( a.item ) || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
         !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket || !pour_ok ||
         ( ( a.op == item_op::put || a.op == item_op::reload ) && !ref_ok( a.container ) ) ||
+        ( a.op == item_op::take && !no_container && !ref_ok( a.container ) ) ||
         ( a.has_spot && ( a.spot_x >= spot_scale || a.spot_y >= spot_scale ) ) ||
         !coord_ok( a.to.x ) || !coord_ok( a.to.y ) || !coord_ok( a.to.z ) ||
         ( a.has_pose && ( !a.has_spot || a.yaw > max_item_yaw ) ) ||
