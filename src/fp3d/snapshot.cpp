@@ -290,6 +290,10 @@ void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile
                     h.yaw = static_cast<int16_t>( yaw );
                     h.side = side;
                 }
+                uint8_t shelf = 0;
+                if( item_shelf( it, shelf ) ) {
+                    h.shelf = static_cast<int8_t>( shelf );
+                }
             }
             pile.handles.push_back( h );
         }
@@ -772,7 +776,7 @@ bool item_pile_view::operator==( const item_pile_view &o ) const
 bool item_handle_view::operator==( const item_handle_view &o ) const
 {
     return uid == o.uid && type == o.type && spot_x == o.spot_x && spot_y == o.spot_y && yaw == o.yaw &&
-           side == o.side;
+           side == o.side && shelf == o.shelf;
 }
 
 bool light_view::operator==( const light_view &o ) const
@@ -1165,6 +1169,20 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
                     jo.write( static_cast<int64_t>( h.uid ) );
                     jo.write( static_cast<int>( h.yaw ) );
                     jo.write( h.side ? 1 : 0 );
+                    jo.end_array();
+                }
+            }
+        }
+        jo.end_array();
+        // The furniture shelf placed items were put on, only for those with one stored: [uid, shelf].
+        jo.member( "shelves" );
+        jo.start_array();
+        for( const item_pile_view &p : sm.items ) {
+            for( const item_handle_view &h : p.handles ) {
+                if( h.shelf >= 0 ) {
+                    jo.start_array();
+                    jo.write( static_cast<int64_t>( h.uid ) );
+                    jo.write( static_cast<int>( h.shelf ) );
                     jo.end_array();
                 }
             }

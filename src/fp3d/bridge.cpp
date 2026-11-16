@@ -463,9 +463,9 @@ void hostile_spotted()
 
 static bool queue_plain_action( const std::string &action, const std::optional<ui_point> &square )
 {
-    // The bridge's own answers (a save, cheats) only come from the bridge.
-    if( action == save_action || action == job_action || action == item_action_name ||
-        action == stairs_action_name ) {
+    // The bridge's own answers (a save, cheats) only come from the bridge: checked on exactly what is queued.
+    std::string name = sanitize_text( action, 128 );
+    if( name == save_action || name == job_action || name == item_action_name || name == stairs_action_name ) {
         return false;
     }
     channel &c = chan();
@@ -473,7 +473,7 @@ static bool queue_plain_action( const std::string &action, const std::optional<u
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ sanitize_text( action, 128 ), std::nullopt, std::nullopt, square } );
+    c.actions.push_back( queued_action{ std::move( name ), std::nullopt, std::nullopt, square } );
     c.cv.notify_all();
     return true;
 }
@@ -521,7 +521,8 @@ bool queue_item_action( const item_action &a )
         ( ( a.op == item_op::put || a.op == item_op::reload ) && !ref_ok( a.container ) ) ||
         ( a.has_spot && ( a.spot_x >= spot_scale || a.spot_y >= spot_scale ) ) ||
         !coord_ok( a.to.x ) || !coord_ok( a.to.y ) || !coord_ok( a.to.z ) ||
-        ( a.has_pose && ( !a.has_spot || a.yaw > max_item_yaw ) ) || a.tag > max_item_tag ||
+        ( a.has_pose && ( !a.has_spot || a.yaw > max_item_yaw ) ) ||
+        ( a.has_shelf && ( !a.has_spot || a.shelf > max_item_shelf ) ) || a.tag > max_item_tag ||
         ( a.op == item_op::spot && !a.has_spot ) || ( a.op == item_op::hold && a.hand == item_hand::pack ) ) {
         return false;
     }
