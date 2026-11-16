@@ -58,6 +58,8 @@ namespace fp3d
 static bool paths_set = false;
 // CDDA's window, options, fonts and tilesets are made (game thread; see end_game in boot.h).
 static bool interface_up = false;
+// The world the last boot_new_game_data made, for remove_new_world ("" if it made none; game thread).
+static std::string new_world;
 
 void init_paths( const std::string &base_path, const std::string &user_dir )
 {
@@ -206,12 +208,57 @@ bool owned_world( const std::string &world_name )
     return fs::symlink_status( dir / owned_world_marker, ec ).type() == fs::file_type::regular && !ec;
 }
 
+bool remove_new_world()
+{
+    namespace fs = std::filesystem;
+    const std::string name = new_world;
+    if( name.empty() || world_generator == nullptr || !world_generator->has_world( name ) ) {
+        return false;
+    }
+    const WORLD *world = world_generator->get_world( name );
+    if( world == nullptr || !world->world_saves.empty() ) {
+        return false;
+    }
+    std::error_code ec;
+    const fs::path saves = fs::canonical( fs::u8path( PATH_INFO::savedir() ), ec );
+    if( ec ) {
+        return false;
+    }
+    // A plain folder (not a link) right in the save folder: the one boot made, nothing it points elsewhere.
+    const fs::path dir = fs::u8path( PATH_INFO::savedir() ) / fs::u8path( name );
+    if( fs::symlink_status( dir, ec ).type() != fs::file_type::directory || ec ) {
+        return false;
+    }
+    const fs::path real = fs::canonical( dir, ec );
+    if( ec || real.parent_path() != saves || real.filename() != fs::u8path( name ) ) {
+        return false;
+    }
+    // The folder delete_world removes is that one.
+    const fs::path cdda_dir = fs::canonical( world->folder_path().get_unrelative_path(), ec );
+    if( ec || cdda_dir != real ) {
+        return false;
+    }
+    // No character saved in it, as CDDA counts them (a .sav file), whatever world_saves says.
+    for( fs::directory_iterator it( dir, ec ), end; !ec && it != end; it.increment( ec ) ) {
+        if( it->path().extension() == ".sav" ) {
+            return false;
+        }
+    }
+    if( ec ) {
+        return false;
+    }
+    new_world.clear();
+    world_generator->delete_world( name, true );
+    return fs::symlink_status( dir, ec ).type() == fs::file_type::not_found;
+}
+
 void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless, bool world_setup,
                          bool replace )
 {
     boot_common( headless );
     // As CDDA's main menu: core data (option sliders among it) before a world is made or picked.
     g->load_core_data();
+    new_world.clear();
     WORLD *world = nullptr;
     if( fresh_world ) {
         // A new world gets a folder of its own; only FP3D's throwaway worlds are replaced: by exact name, and
@@ -233,7 +280,7 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
         if( world_setup ) {
             world = run_world_setup( name );
             if( world == nullptr ) {
-                throw std::runtime_error( "world creation cancelled" );
+                throw start_cancelled();
             }
         } else {
             world = world_generator->make_new_world( name, { mod_id( "dda" ) } );
@@ -241,6 +288,7 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
                 throw std::runtime_error( "make_new_world failed" );
             }
         }
+        new_world = name;
         if( replacing ) {
             namespace fs = std::filesystem;
             const fs::path dir = fs::u8path( PATH_INFO::savedir() ) / fs::u8path( name );
@@ -374,6 +422,7 @@ void end_game()
 {
     reset_sim_thread_state();
     clear_shot_plan();
+    new_world.clear();
     if( g != nullptr ) {
         zone_manager::get_manager().clear();
         MAPBUFFER.clear();

@@ -438,9 +438,13 @@ const std::string &input_context::handle_input()
 const std::string &input_context::handle_input( const int timeout )
 {
     // FP3D: headless clients answer instead of the keyboard. Polling loops (a timeout is set) must never
-    // block on the client, so they always time out; the main game loop blocks (see get_player_input).
+    // block on the client, so they always time out; the main game loop blocks (see get_player_input). After
+    // fp3d::shutdown() a polling loop ends too, as an ask() would (it may wait for a key that never comes).
     if( fp3d::active() ) {
         if( timeout >= 0 ) {
+            if( fp3d::is_shut_down() ) {
+                throw fp3d::shutdown_signal();
+            }
             fp3d::note_poll( category );
             return TIMEOUT;
         }

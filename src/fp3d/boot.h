@@ -34,6 +34,14 @@ void boot_world( const std::string &world_name, bool headless );
 void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless,
                          bool world_setup = false, bool replace = false );
 
+// Thrown when the client cancels a start (the world setup or the character creation): the game ends, nothing failed.
+struct start_cancelled {};
+
+// After a cancelled start: deletes the world the last boot_new_game_data made (fresh_world), if it is still a plain
+// folder right in the save folder with no character saved in it. Only that world, once; true if it was deleted.
+// Game thread, before end_game() (which forgets it, as the next boot does).
+bool remove_new_world();
+
 // The name of the world already using `world_name`'s folder, ignoring ASCII case (as Windows folders do): one CDDA
 // lists, or any entry of the save directory. nullopt when the name is free. Needs boot's paths and world list.
 std::optional<std::string> world_name_taken( const std::string &world_name );
