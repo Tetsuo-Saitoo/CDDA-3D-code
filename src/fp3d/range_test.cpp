@@ -60,6 +60,7 @@
 #include "fp3d/snapshot.h"
 #include "fp3d/test_range.h"
 #include "game.h"
+#include "input_context.h"
 #include "item.h"
 #include "itype.h"
 #include "map.h"
@@ -93,6 +94,11 @@ int passed = 0;
 // said after that load (1 resumed, 0 not, -1 not called).
 std::string reload_save;
 std::atomic<int> resumed{ -1 };
+// check_death: the game loop ended with the character dead, the sim then sits in a polling loop, and the sim thread
+// has left its game (sim_main past its catch).
+std::atomic<bool> died{ false };
+std::atomic<bool> polling{ false };
+std::atomic<bool> sim_left{ false };
 
 void check( bool ok, const std::string &what, const std::string &detail = "" )
 {
@@ -121,6 +127,24 @@ void before_ask()
     snapshot_ms.push_back( ms );
 }
 
+// After a game loop: a death (check_death) puts the sim in a polling loop, as CDDA's end screens wait for a key; only
+// fp3d::shutdown() may end it.
+void after_game_loop()
+{
+    if( g->uquit != QUIT_DIED ) {
+        return;
+    }
+    died.store( true );
+    input_context ctxt( "FP3D_TEST_POLL" );
+    ctxt.register_action( "QUIT" );
+    ctxt.set_timeout( 50 );
+    polling.store( true );
+    for( ;; ) {
+        ctxt.handle_input();
+        std::this_thread::sleep_for( std::chrono::milliseconds( 10 ) );
+    }
+}
+
 void sim_main()
 {
     try {
@@ -130,6 +154,7 @@ void sim_main()
         fp3d::set_before_ask_hook( before_ask );
         while( !do_turn() ) {
         }
+        after_game_loop();
         // check_reload saved and quit: load that save the way the main menu does (as boot_saved_game: the range
         // forgotten, g->setup(), game::load), then resume the range as the bridge does.
         if( g->uquit == QUIT_SAVED && !reload_save.empty() ) {
@@ -143,6 +168,7 @@ void sim_main()
             fp3d::reset_snapshots();
             while( !do_turn() ) {
             }
+            after_game_loop();
         }
         sim_error = "game ended";
     } catch( const fp3d::shutdown_signal & ) {
@@ -150,6 +176,7 @@ void sim_main()
     } catch( const std::exception &e ) {
         sim_error = e.what();
     }
+    sim_left.store( true );
     fp3d::shutdown();
     fp3d::shutdown_world();
 }
@@ -2489,6 +2516,61 @@ void check_resume_refusals( size_t pick )
     }
     check( freezes_ok, "resume: the saved AI freeze is off only for 0", freeze_text );
 }
+
+// Death, last (the game is over after it): the character's torso at 0 hit points. The game ends without asking the
+// client anything (no end screen, deathcam, diary, scores or epilogue question; CDDA's own end-of-game cleanup runs),
+// and a polling loop after it (as CDDA's end screens wait for a key) ends once fp3d::shutdown() is called.
+void check_death()
+{
+    std::printf( "death:\n" );
+    bool hurt = false;
+    const bool ran = on_sim( [&] {
+        avatar &u = get_avatar();
+        u.set_part_hp_cur( bodypart_id( "torso" ), 0 );
+        hurt = u.is_dead_state();
+    } );
+    const std::optional<fp3d::ui_request> r0 = ran ? main_loop( 0, 20000 ) : std::nullopt;
+    check( ran && hurt && r0, "death: torso at 0 hit points, back at the main loop" );
+    if( !r0 ) {
+        return;
+    }
+    fp3d::queue_action( "pause" );
+    std::string asked;
+    uint64_t newer_than = r0->id;
+    const auto t0 = std::chrono::steady_clock::now();
+    while( !polling.load() && ms_since( t0 ) < 120000.0 ) {
+        const std::optional<fp3d::ui_request> r = fp3d::wait_request( 200, newer_than );
+        if( !r ) {
+            continue;
+        }
+        // Anything asked now is a failure; answered so the sim can go on.
+        asked += std::string( "[" ) + fp3d::kind_name( r->kind ) + " " + r->context + " " + r->title.substr( 0, 60 ) +
+                 "]";
+        fp3d::ui_answer a;
+        a.id = r->id;
+        a.cancel = true;
+        if( r->kind == fp3d::request_kind::popup && !r->actions.empty() ) {
+            a.action = r->actions.back();
+        }
+        fp3d::answer( a );
+        newer_than = r->id;
+    }
+    check( died.load() && polling.load() && asked.empty(), "death: the game ends, the client is asked nothing",
+           asked.substr( 0, 160 ) + " " + std::to_string( ms_since( t0 ) / 1000.0 ) + " s" );
+    // The polling loop never sees a key: only the shutdown ends it.
+    fp3d::shutdown();
+    const auto t1 = std::chrono::steady_clock::now();
+    while( !sim_left.load() && ms_since( t1 ) < 10000.0 ) {
+        std::this_thread::sleep_for( std::chrono::milliseconds( 20 ) );
+    }
+    const bool left = sim_left.load();
+    check( left && sim_error.empty(), "death: a polling loop ends on fp3d::shutdown()", sim_error );
+    if( !left ) {
+        // join() would hang
+        std::printf( "FAIL: the sim thread is still in a polling loop 10 s after shutdown\n" );
+        std::_Exit( 2 );
+    }
+}
 } // namespace
 
 int main( int argc, char **argv )
@@ -2540,6 +2622,7 @@ int main( int argc, char **argv )
     }
     check_weather_cheat();
     check_resume_refusals( check_reload() );
+    check_death();
 
     fp3d::shutdown();
     sim.join();

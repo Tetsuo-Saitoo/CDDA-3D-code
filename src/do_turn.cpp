@@ -156,7 +156,8 @@ bool cleanup_at_end()
             bool queryDelete = false;
             bool queryReset = false;
 
-            if( get_option<std::string>( "WORLD_END" ) == "query" ) {
+            // FP3D: no menu or note at the game's end (it asks the client nothing); a world set to ask is kept.
+            if( get_option<std::string>( "WORLD_END" ) == "query" && !fp3d::active() ) {
                 bool decided = false;
                 std::string buffer = _( "Warning: NPC interactions and some other global flags "
                                         "will not all reset when starting a new character in an "
@@ -195,7 +196,7 @@ bool cleanup_at_end()
             } else if( queryReset || get_option<std::string>( "WORLD_END" ) == "reset" ) {
                 world_generator->delete_world( world_generator->active_world->world_name, false );
             }
-        } else if( get_option<std::string>( "WORLD_END" ) != "keep" ) {
+        } else if( get_option<std::string>( "WORLD_END" ) != "keep" && !fp3d::active() ) {
             std::string tmpmessage;
             for( auto &character : characters ) {
                 tmpmessage += "\n  ";

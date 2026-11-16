@@ -448,6 +448,23 @@ int main()
             check( w.empty() && mods_ordered( mods ) && mods.size() >= 3 && mods[1].str() == nodeps_mod &&
                    mods.back().str() == dep_mod, "core mod first, before mods picked ahead of it", w );
         }
+
+        // A cancelled start deletes the world it made (fp3d::remove_new_world; the one this test booted): never while
+        // a character is saved in it, then once.
+        {
+            const std::string made = world_generator->active_world != nullptr ?
+                                     world_generator->active_world->world_name : "";
+            const fs::path dir = fs::u8path( PATH_INFO::savedir() ) / fs::u8path( made );
+            std::error_code ec;
+            write_file( dir / "someone.sav", "{}" );
+            const bool kept = !made.empty() && !fp3d::remove_new_world() && fs::is_directory( dir, ec );
+            fs::remove( dir / "someone.sav", ec );
+            const bool removed = fp3d::remove_new_world() && !fs::exists( dir, ec ) &&
+                                 !world_generator->has_world( made );
+            const bool once = !fp3d::remove_new_world();
+            check( kept && removed && once, "a cancelled start's world: kept with a save in it, else deleted, once",
+                   made );
+        }
     } catch( const std::exception &e ) {
         std::printf( "error: %s\n", e.what() );
         fs::remove_all( mod_dir, mec );
