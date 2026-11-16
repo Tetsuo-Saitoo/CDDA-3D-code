@@ -78,6 +78,7 @@
 #include "monster.h"
 #include "npc.h"
 #include "options.h"
+#include "output.h"
 #include "overmap.h"
 #include "overmapbuffer.h"
 #include "path_info.h"
@@ -86,6 +87,7 @@
 #include "rng.h"
 #include "scenario.h"
 #include "start_location.h"
+#include "string_input_popup.h"
 #include "talker.h"
 #include "translation.h"
 #include "type_id.h"
@@ -300,6 +302,19 @@ std::atomic<int> weather_wait{ 0 };
 // 4 read whether a route is left (interrupt_route: 1 yes, 0 no) and end the travel.
 std::atomic<int> interrupt_setup{ 0 };
 std::atomic<int> furniture_setup{ 0 };         // the furniture checks' scene (set_up_furniture)
+// Number checks (run_number_checks): 1 = ask CDDA's numeric prompts from the hook (ask_numbers); what they returned.
+std::atomic<int> number_setup{ 0 };
+std::atomic<bool> number_done{ false };
+struct number_results {
+    bool got_int = false;        // query_int "How many?" (shown default 7)
+    int int_value = 0;
+    bool big_cancelled = false;  // query_int64_t, cancelled
+    int edited = 0;              // edit( int ) from 5
+    bool got_stubborn = true;    // query_int "Again?" (from 9), answered out of range every time
+    int stubborn_value = 0;
+};
+std::mutex number_mutex;
+number_results number_out;
 std::atomic<int> interrupt_route{ -1 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
@@ -645,10 +660,36 @@ void set_up_interrupt( int stage )
                                             minutes ) ), 0 ) );
 }
 
+// CDDA's own numeric prompts, asked on the sim thread inside the hook; run_number_checks answers them.
+void ask_numbers()
+{
+    number_results res;
+    int v = 7;
+    res.got_int = query_int( v, true, std::string( "How many?" ) );
+    res.int_value = v;
+    string_input_popup big;
+    big.title( "How far?" );
+    const std::optional<int64_t> how_far = big.query_int64_t();
+    res.big_cancelled = !how_far && big.canceled();
+    int e = 5;
+    string_input_popup edit;
+    edit.title( "Edit" ).edit( e );
+    res.edited = e;
+    int stubborn = 9;
+    res.got_stubborn = query_int( stubborn, true, std::string( "Again?" ) );
+    res.stubborn_value = stubborn;
+    std::lock_guard<std::mutex> lk( number_mutex );
+    number_out = res;
+    number_done.store( true );
+}
+
 void observe()
 {
     // As the client's hook (bridge/src/sim_session.cpp).
     fp3d::run_range_requests();
+    if( number_setup.exchange( 0 ) != 0 ) {
+        ask_numbers();
+    }
     if( range_fill.exchange( false ) ) {
         fill_range_ops();
     }
@@ -1825,6 +1866,7 @@ fp3d::ui_answer answer_for( const fp3d::ui_request &req, const goal &cur, driver
             note = a.cancel ? "cancel" : "entry " + std::to_string( a.entry );
             break;
         case fp3d::request_kind::string:
+        case fp3d::request_kind::number:
             a.cancel = true;
             note = "cancel";
             break;
@@ -6534,6 +6576,89 @@ static bool run_peek_checks()
     return failed == 0;
 }
 
+// The number request (E3): CDDA's query_int, query_int64_t and edit( int ) ask the client for a whole number with
+// the type's range and the shown default; out of range or no number asks again with a status (a few times, then
+// cancel); cancel cancels and edit keeps the value.
+static bool run_number_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  number: %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    // How each number request is answered, in order; the hook asks them at the next main-loop request.
+    std::vector<std::function<void( fp3d::ui_answer & )>> answers = {
+        []( fp3d::ui_answer & a ) { a.number = int64_t( INT_MAX ) + 1; },
+        []( fp3d::ui_answer & ) {},
+        []( fp3d::ui_answer & a ) { a.number = 42; },
+        []( fp3d::ui_answer & a ) { a.cancel = true; },
+        []( fp3d::ui_answer & a ) { a.number = -3; },
+    };
+    for( int i = 0; i < fp3d::max_number_asks; i++ ) {
+        answers.emplace_back( []( fp3d::ui_answer & a ) { a.number = int64_t( INT_MIN ) - 1; } );
+    }
+    number_done.store( false );
+    number_setup.store( 1 );
+    fp3d::queue_action( "pause" );
+    const uint64_t before = r->id;
+    std::vector<fp3d::ui_request> asked;
+    size_t other = 0;
+    const auto t = std::chrono::steady_clock::now();
+    while( ms_since( t ) < 30000 * fp3d::slow_build && !( number_done.load() && r->timed && r->id != before ) ) {
+        std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+        if( !next ) {
+            continue;
+        }
+        r = next;
+        if( r->timed ) {
+            continue;
+        }
+        fp3d::ui_answer a;
+        a.id = r->id;
+        if( r->kind == fp3d::request_kind::number && asked.size() < answers.size() ) {
+            answers[asked.size()]( a );
+            asked.push_back( *r );
+        } else {
+            other++;
+            a.cancel = true;
+        }
+        fp3d::answer( a );
+    }
+    number_results res;
+    {
+        std::lock_guard<std::mutex> lk( number_mutex );
+        res = number_out;
+    }
+    check( number_done.load() && asked.size() == answers.size() && other == 0, "asked as number requests",
+           std::to_string( asked.size() ) + " of " + std::to_string( answers.size() ) + ", " +
+           std::to_string( other ) + " others" );
+    if( asked.size() != answers.size() ) {
+        return false;
+    }
+    const std::string range_status = "enter a whole number from " + std::to_string( INT_MIN ) + " to " +
+                                      std::to_string( INT_MAX );
+    check( asked[0].title == "How many?" && asked[0].number_min == INT_MIN && asked[0].number_max == INT_MAX &&
+           asked[0].number_default == 7 && asked[0].status.empty(), "query_int: title, int range, shown default",
+           std::to_string( asked[0].number_min ) + ".." + std::to_string( asked[0].number_max ) + " default " +
+           std::to_string( asked[0].number_default ) );
+    check( asked[1].status == range_status && asked[2].status == range_status && asked[1].number_default == 7,
+           "out of range, then no number: asked again", asked[1].status + " | " + asked[2].status );
+    check( res.got_int && res.int_value == 42, "the third answer taken", std::to_string( res.int_value ) );
+    check( asked[3].number_min == -fp3d::max_number_answer && asked[3].number_max == fp3d::max_number_answer &&
+           asked[3].number_default == 0 && res.big_cancelled, "query_int64_t: float-exact range, cancelled",
+           std::to_string( asked[3].number_max ) );
+    check( asked[4].number_default == 5 && asked[4].title == "Edit" && res.edited == -3, "edit( int ): from 5 to -3",
+           std::to_string( res.edited ) );
+    check( !res.got_stubborn && res.stubborn_value == 9 && asked.back().title == "Again?",
+           "always out of range: cancelled after the last ask", std::to_string( res.stubborn_value ) );
+    return failed == 0;
+}
+
 static bool run_character_query_checks()
 {
     int failed = 0;
@@ -7462,6 +7587,7 @@ int main()
     const bool lying_ok = offhand_ok && run_lying_container_checks();
     const bool character_ok = lying_ok && run_character_query_checks();
     const bool peek_ok = character_ok && run_peek_checks();
+    const bool number_ok = peek_ok && run_number_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -7520,6 +7646,7 @@ int main()
     std::printf( "lying containers: %s\n", lying_ok ? "ok" : "BAD" );
     std::printf( "character query: %s\n", character_ok ? "ok" : "BAD" );
     std::printf( "peek: %s\n", peek_ok ? "ok" : "BAD" );
+    std::printf( "number requests: %s\n", number_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -7531,6 +7658,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok ?
+           peek_ok && number_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

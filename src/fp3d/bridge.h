@@ -31,6 +31,7 @@ enum class request_kind : int {
     chargen,      // create a character: `text` is the catalog JSON, the answer's `text` the choices JSON (chargen.h)
     shot,         // one projectile of a client-flown trigger pull: CDDA's rolled error; answered with `shot` (shot.h)
     swing,        // an aimed melee strike (origin: attacker, cursor: the creature struck); answered with `shot` (swing.h)
+    number,       // type a whole number from number_min to number_max (query_int, edit); answered with `number`
 };
 const char *kind_name( request_kind k );
 
@@ -58,6 +59,9 @@ struct ui_request {
     std::vector<std::string> actions;    // key, popup, target
     bool allow_cancel = true;
     int max_len = 0;                     // string
+    int64_t number_min = 0;              // number: the range (never beyond +-max_number_answer) and the default
+    int64_t number_max = 0;
+    int64_t number_default = 0;
     std::string mode;                    // target: look, zone, peek, fire, throw, reach, spell, ...
     std::string status;                  // target: "" = ok, bad_target, out_of_ammo, out_of_range
     ui_point origin;                     // direction, target: where the prompt is centred
@@ -106,6 +110,7 @@ struct ui_answer {
     std::string action;                  // key, popup, target
     int entry = -1;                      // menu, item_select
     std::string text;                    // string
+    std::optional<int64_t> number;       // number (any other kind: dropped); the asker checks the range
     std::vector<std::pair<int, int>> picks;  // item_multi: (entry id, count; 0 = all)
     std::optional<ui_point> pos;         // direction: relative (-1..1); target: absolute square
     std::optional<shot_answer> shot;     // target: where the client's own bullet went
@@ -122,6 +127,10 @@ constexpr size_t max_answer_text = 1024;
 // The chargen answer is JSON (traits, skills, name ...): a larger cap for that kind only.
 constexpr size_t max_answer_json = 16384;
 constexpr size_t max_answer_picks = 4096;
+// A number request's range never goes beyond this (2^53 - 1: exact in a float64, as the client's numbers are); an
+// answer outside the range is asked again with a status, this many times at most, then taken as cancel.
+constexpr int64_t max_number_answer = 9007199254740991;
+constexpr int max_number_asks = 8;
 constexpr size_t max_candidates = 256;
 
 bool active();
