@@ -1860,7 +1860,43 @@ std::string run_character_query( uint64_t query_id, size_t max_bytes )
         ( *it )->clear();
         excess = n >= excess ? 0 : excess - n;
     }
-    return write_sheet( query_id, s, true );
+    out = write_sheet( query_id, s, true );
+    // Still over (a long-modded character): entries go from the ends of the lists, least needed first. Each saves its
+    // strings' raw size plus `keys`: the bytes write_sheet puts around them with empty strings and one-digit numbers
+    // (a lower bound, close to the real size), so one round drops enough and little more; more rounds only guard
+    // against a miscount.
+    for( int round = 0; round < 4 && out.size() > max_bytes; round++ ) {
+        size_t over = out.size() - max_bytes + 16;
+        const auto cut = [&over]( auto & list, size_t keys ) {
+            while( over > 0 && !list.empty() ) {
+                const size_t n = keys + list.back().id.size() + list.back().name.size();
+                list.pop_back();
+                over = n >= over ? 0 : over - n;
+            }
+        };
+        while( over > 0 && !s.effects.empty() ) {
+            const size_t n = 6 + s.effects.back().first.size() + s.effects.back().second.size();
+            s.effects.pop_back();
+            over = n >= over ? 0 : over - n;
+        }
+        // {"id":"","name":"","percent":0,"description":""}, and the same without percent.
+        cut( s.learning, 49 );
+        cut( s.known, 37 );
+        // {"id":"","name":"","rating":0,"mutation":false,"description":""},
+        cut( s.traits, 65 );
+        // {"id":"","name":"","active":false,"description":""},
+        cut( s.bionics, 52 );
+        // {"name":"","value":0,"percent":false,"move_cost":false},
+        while( over > 0 && !s.speed_mods.empty() ) {
+            const size_t n = 56 + s.speed_mods.back().name.size();
+            s.speed_mods.pop_back();
+            over = n >= over ? 0 : over - n;
+        }
+        // {"id":"","name":"","level":0,"knowledge":0,"progress":0,"knowledge_progress":0,"description":""},
+        cut( s.skills, 97 );
+        out = write_sheet( query_id, s, true );
+    }
+    return out;
 }
 
 std::string character_query_error_json( uint64_t query_id, const std::string &error )
