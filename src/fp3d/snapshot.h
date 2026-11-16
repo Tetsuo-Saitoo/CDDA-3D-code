@@ -191,6 +191,7 @@ struct gun_view {
     int16_t dirt = -1;                   // CDDA's fouling 0..10000; -1 for a NON_FOULING gun
     int32_t rounds = -1;                 // loaded rounds; -1 for a gun that takes no ammo
     std::vector<std::string> faults;     // fault ids it has (cap max_gun_faults, ids up to max_fault_id_bytes)
+    bool suppressed = false;             // a gunmod (built-in too) lowers its report, as item::gun_noise counts it
 };
 
 // An effect on the player, for the HUD: what CDDA's @ screen lists (effects with no display name are left out).
