@@ -21,7 +21,8 @@
 // also check the square (or that the avatar carries it) and the itype.
 // Spot: `fp3d_spot` = "x,y" in permille of the square, set when the client places an item; erased when the item
 // is picked up. Pose: `fp3d_pose` = "yaw,side" (whole degrees 0..359, 0 or 1), only next to a spot: how the client's
-// physics left the item lying. Vars come from saves, which are hostile input like the client: all are parsed strictly.
+// physics left the item lying. Shelf: `fp3d_shelf` = 0..15, only next to a spot: the client's number for the
+// furniture shelf it was put on. Vars come from saves, which are hostile input like the client: all are parsed strictly.
 //
 // Three actions are for a client that simulates lying items (VR item physics): `place` moves a lying item one
 // square, `spot` stores how it rests, both without time; `hold` takes a carried item into a hand. Free actions are
@@ -53,6 +54,8 @@ uint64_t read_item_handle( const item &it );
 bool item_spot( const item &it, uint16_t &x, uint16_t &y );
 // How the item lies on its spot (yaw in whole degrees), false if none, malformed or without a spot.
 bool item_pose( const item &it, uint16_t &yaw, bool &side );
+// The shelf the client put the item on, false if none, malformed or without a spot.
+bool item_shelf( const item &it, uint8_t &shelf );
 // place, spot: how far from the avatar's square the item may lie (squares, same level).
 constexpr int physics_reach = 2;
 // place, spot: how many run in one turn (they cost no time); more are refused until the next turn.

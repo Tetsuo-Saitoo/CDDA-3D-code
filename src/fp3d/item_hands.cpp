@@ -61,6 +61,7 @@ namespace
 const std::string uid_var = "fp3d_uid";
 const std::string spot_var = "fp3d_spot";
 const std::string pose_var = "fp3d_pose";
+const std::string shelf_var = "fp3d_shelf";
 
 std::mutex uid_mutex;
 
@@ -178,6 +179,7 @@ void forget_spot( item &it )
 {
     it.erase_var( spot_var );
     it.erase_var( pose_var );
+    it.erase_var( shelf_var );
 }
 
 // Where the client put the item on its square and how it lies there; neither when the action gives no spot.
@@ -188,6 +190,9 @@ void store_spot( item &it, const item_action &a )
         it.set_var( spot_var, std::to_string( a.spot_x ) + "," + std::to_string( a.spot_y ) );
         if( a.has_pose ) {
             it.set_var( pose_var, std::to_string( a.yaw ) + "," + ( a.side ? "1" : "0" ) );
+        }
+        if( a.has_shelf ) {
+            it.set_var( shelf_var, std::to_string( a.shelf ) );
         }
     }
 }
@@ -1408,6 +1413,25 @@ bool item_pose( const item &it, uint16_t &yaw, bool &side )
     }
     yaw = static_cast<uint16_t>( *deg );
     side = *lies == 1;
+    return true;
+}
+
+bool item_shelf( const item &it, uint8_t &shelf )
+{
+    uint16_t x = 0;
+    uint16_t y = 0;
+    if( !it.has_var( shelf_var ) || !item_spot( it, x, y ) ) {
+        return false;
+    }
+    const std::string s = text_var( it, shelf_var );
+    if( s.size() > 2 ) {
+        return false;
+    }
+    const std::optional<uint64_t> n = parse_decimal( s, max_item_shelf );
+    if( !n ) {
+        return false;
+    }
+    shelf = static_cast<uint8_t>( *n );
     return true;
 }
 

@@ -5001,6 +5001,12 @@ static bool run_item_physics_checks()
         pose_alone.to = east2;
         pose_alone.has_pose = true;
         fp3d::item_action yaw_big = with_pose( ok, 360, false );
+        fp3d::item_action shelf_big = ok;
+        shelf_big.has_shelf = true;
+        shelf_big.shelf = fp3d::max_item_shelf + 1;
+        fp3d::item_action shelf_alone = action( fp3d::item_op::place, rock_a, t_rock, east );
+        shelf_alone.to = east2;
+        shelf_alone.has_shelf = true;
         fp3d::item_action tag_big = ok;
         tag_big.tag = fp3d::max_item_tag + 1u;
         fp3d::item_action to_far = place( rock_a, t_rock, east, east2 );
@@ -5010,22 +5016,28 @@ static bool run_item_physics_checks()
         no_op.op = static_cast<fp3d::item_op>( 11 );
         check( !fp3d::queue_item_action( no_spot ) && !fp3d::queue_item_action( pose_alone ) &&
                !fp3d::queue_item_action( yaw_big ) && !fp3d::queue_item_action( tag_big ) &&
+               !fp3d::queue_item_action( shelf_big ) && !fp3d::queue_item_action( shelf_alone ) &&
                !fp3d::queue_item_action( to_far ) && !fp3d::queue_item_action( pack ) &&
                !fp3d::queue_item_action( no_op ), "malformed place, spot and hold never queued", "" );
     }
 
-    // place: one square, no time, the spot and pose stored; once a turn for an item.
-    result res = run( with_pose( with_spot( place( rock_a, t_rock, east, east2 ), 250, 750 ), 90, true ) );
+    // place: one square, no time, the spot, pose and shelf stored; once a turn for an item.
+    fp3d::item_action placed = with_pose( with_spot( place( rock_a, t_rock, east, east2 ), 250, 750 ), 90, true );
+    placed.has_shelf = true;
+    placed.shelf = 3;
+    result res = run( placed );
     fp3d::item_handle_view h = on( east2, rock_a );
     check( went( res, rock_a ) && res.spent == 0 && res.msg.empty() && h.uid == rock_a && h.spot_x == 250 &&
-           h.spot_y == 750 && h.yaw == 90 && h.side && on( east, rock_a ).uid == 0,
-           "place: to the next square, no time, no message", show( res ) + ", yaw " + std::to_string( h.yaw ) );
+           h.spot_y == 750 && h.yaw == 90 && h.side && h.shelf == 3 && on( east, rock_a ).uid == 0,
+           "place: to the next square, no time, no message", show( res ) + ", yaw " + std::to_string( h.yaw ) +
+           ", shelf " + std::to_string( h.shelf ) );
     {
         const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
         std::ostringstream json;
         fp3d::write_snapshot_json( json, *s, here.z, here.z );
-        check( json.str().find( "\"poses\":[[" + std::to_string( rock_a ) + ",90,1]]" ) != std::string::npos,
-               "place: the pose in the snapshot JSON", "" );
+        check( json.str().find( "\"poses\":[[" + std::to_string( rock_a ) + ",90,1]]" ) != std::string::npos &&
+               json.str().find( "\"shelves\":[[" + std::to_string( rock_a ) + ",3]]" ) != std::string::npos,
+               "place: the pose and shelf in the snapshot JSON", "" );
     }
     res = run( place( rock_a, t_rock, east2, east ) );
     check( refused( res, rock_a, "moved a moment ago" ) && res.spent == 0 && res.msg.empty() &&
@@ -5035,7 +5047,7 @@ static bool run_item_physics_checks()
     check( pass_turn(), "a turn passes", "" );
     res = run( place( rock_a, t_rock, east2, east3 ) );
     h = on( east3, rock_a );
-    check( went( res, rock_a ) && h.uid == rock_a && h.spot_x == -1 && h.yaw == -1 && !h.side,
+    check( went( res, rock_a ) && h.uid == rock_a && h.spot_x == -1 && h.yaw == -1 && !h.side && h.shelf == -1,
            "place: on without a spot, the old one forgotten", show( res ) );
     check( pass_turn(), "a turn passes", "" );
     res = run( place( rock_a, t_rock, east3, east2 ) );

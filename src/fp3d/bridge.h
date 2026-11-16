@@ -255,11 +255,16 @@ struct item_action {
     bool has_pose = false;
     uint16_t yaw = 0;                    // whole degrees, 0 .. max_item_yaw
     bool side = false;                   // lies on its side
+    // drop, place, spot, only with a spot: the furniture shelf (tier, drawer, surface) it rests on, in the client's
+    // own numbering 0 .. max_item_shelf. Stored and given back in the snapshot; the sim never reads a meaning into it.
+    bool has_shelf = false;
+    uint8_t shelf = 0;
     // 0 = none. Else the client's own number for this action: an `item_result` event (events.h) says how it went.
     uint32_t tag = 0;
 };
 constexpr int max_item_pocket = 255;
 constexpr uint16_t max_item_yaw = 359;
+constexpr uint8_t max_item_shelf = 15;
 constexpr uint32_t max_item_tag = INT32_MAX;
 // Client side. False if a field is out of range, a pour names no target or two (container and pos), or the queue
 // is full.

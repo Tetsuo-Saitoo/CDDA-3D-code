@@ -50,6 +50,7 @@ struct item_handle_view {
     int16_t spot_y = -1;
     int16_t yaw = -1;                             // how it lies there: whole degrees 0..359; -1 no pose stored
     bool side = false;                            // lies on its side (only with a yaw)
+    int8_t shelf = -1;                            // the furniture shelf it was put on (client's 0..15); -1 none
     bool operator==( const item_handle_view &o ) const;
 };
 
