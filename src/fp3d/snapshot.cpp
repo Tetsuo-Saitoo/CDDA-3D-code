@@ -1468,6 +1468,11 @@ struct sheet {
     std::vector<bionic_view> bionics;
     int power_kj = 0;
     int max_power_kj = 0;
+    // What the character carries and can carry, as CDDA's inventory screen counts it.
+    int weight_g = 0;
+    int weight_max_g = 0;
+    int volume_ml = 0;
+    int volume_max_ml = 0;
     std::vector<std::pair<std::string, std::string>> effects;   // id, description
 };
 
@@ -1676,6 +1681,10 @@ sheet read_sheet( const avatar &u )
     s.profession = u.prof != nullptr ? name_text( u.prof->gender_appropriate_name( u.male ) ) : std::string();
     s.age = clamp_int( u.age(), 0, 100000 );
     s.height_cm = clamp_int( u.height(), 0, 100000 );
+    s.weight_g = clamp_int( static_cast<double>( units::to_gram( u.weight_carried() ) ), 0, INT32_MAX );
+    s.weight_max_g = clamp_int( static_cast<double>( units::to_gram( u.weight_capacity() ) ), 0, INT32_MAX );
+    s.volume_ml = clamp_int( static_cast<double>( units::to_milliliter( u.volume_carried() ) ), 0, INT32_MAX );
+    s.volume_max_ml = clamp_int( static_cast<double>( units::to_milliliter( u.volume_capacity() ) ), 0, INT32_MAX );
     const int stats[4][2] = {
         { u.get_str(), u.get_str_base() }, { u.get_dex(), u.get_dex_base() },
         { u.get_int(), u.get_int_base() }, { u.get_per(), u.get_per_base() }
@@ -1716,6 +1725,10 @@ std::string write_sheet( uint64_t query_id, const sheet &s, bool truncated )
     jo.member( "profession", s.profession );
     jo.member( "age", s.age );
     jo.member( "height_cm", s.height_cm );
+    jo.member( "weight_g", s.weight_g );
+    jo.member( "weight_max_g", s.weight_max_g );
+    jo.member( "volume_ml", s.volume_ml );
+    jo.member( "volume_max_ml", s.volume_max_ml );
     jo.member( "stats" );
     jo.start_array();
     for( int i = 0; i < 4; i++ ) {
