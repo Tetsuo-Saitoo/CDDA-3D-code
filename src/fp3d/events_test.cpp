@@ -35,6 +35,7 @@
 #include "item.h"
 #include "itype.h"
 #include "iuse_actor.h"
+#include "magic.h"
 #include "map.h"
 #include "martialarts.h"
 #include "messages.h"
@@ -573,6 +574,18 @@ int main()
                    name_of( fp3d::id_kind::itype, pulse[0].detail ) == id,
                    ( "explosions: " + id + " sends one " + kind + " event with its radius" ).c_str(),
                    std::to_string( pulse.size() ) + " events" );
+        }
+        // A spell's area (shock_blast: electric, the squares around its target): one event over those squares,
+        // named by the damage type.
+        {
+            const spell shock( spell_id( "shock_blast" ) );
+            spell_effect::attack( shock, u, blast_at );
+            const std::vector<event> cast = drain( event_kind::explosion );
+            check( cast.size() == 1 && name_of( fp3d::id_kind::explosion, cast[0].type ) == "spell:electric" &&
+                   same( cast[0].pos, abs_of( blast_at ) ) && cast[0].path.size() > 1 && cast[0].amount == 1,
+                   "explosions: a spell's area is one event, by damage type", std::to_string( cast.size() ) +
+                   " events" + ( cast.empty() ? "" : ", " + cast[0].text + ", " + std::to_string( cast[0].path.size() ) +
+                                 " squares, radius " + std::to_string( cast[0].amount ) ) );
         }
 
         // Overflow: 10 sounds then a full queue of messages. The sounds go first; every message stays.
