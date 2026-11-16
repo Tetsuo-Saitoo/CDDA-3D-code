@@ -273,6 +273,7 @@ std::string cq_full;   // run_character_query with no byte limit
 std::string cq_cut;    // the same with 300 bytes less room than it needs
 std::string cq_tiny;   // the same in 3000 bytes: lists cut too
 std::string cq_name;   // the avatar's name as the sheet shows it
+int cq_carried[4] = { -1, -1, -1, -1 };   // CDDA's carried weight and its limit (g), volume and its limit (ml)
 
 // Range op checks: 32 operations queued from inside the sim's hook (so none run before the queue is full), then one
 // more, which is refused. They run at the next main-loop request.
@@ -524,8 +525,14 @@ void wield_water_pot()
         u.remove_weapon();
         u.i_add( copy );
     }
+    // A little water (any spills), and strength enough for a pot in one hand: the random character may be weak, and
+    // "too heavy for one hand" comes before "would spill".
     item water_pot( itype_pot );
-    water_pot.put_in( item( itype_water, calendar::turn, 4 ), pocket_type::CONTAINER );
+    water_pot.put_in( item( itype_water, calendar::turn, 1 ), pocket_type::CONTAINER );
+    if( u.str_max < 8 ) {
+        u.str_max = 8;
+        u.reset_stats();
+    }
     u.wield( water_pot );
     u.set_moves( u.get_speed() );
 }
@@ -1169,6 +1176,10 @@ void observe()
             cq_cut = cut;
             cq_tiny = tiny;
             cq_name = fp3d::client_text( u.get_name(), fp3d::max_sheet_name_columns, 4 * fp3d::max_sheet_name_columns );
+            cq_carried[0] = static_cast<int>( units::to_gram( u.weight_carried() ) );
+            cq_carried[1] = static_cast<int>( units::to_gram( u.weight_capacity() ) );
+            cq_carried[2] = units::to_milliliter( u.volume_carried() );
+            cq_carried[3] = units::to_milliliter( u.volume_capacity() );
             break;
         }
         case 25: {
@@ -6554,6 +6565,7 @@ static bool run_character_query_checks()
         size_t learning = 0;
         int power = -1;
         int max_power = -1;
+        int carried[4] = { -1, -1, -1, -1 };   // weight_g, weight_max_g, volume_ml, volume_max_ml
         std::map<std::string, std::string> effects;
         bool truncated = false;
     };
@@ -6609,6 +6621,10 @@ static bool run_character_query_checks()
                 power.allow_omitted_members();
                 out.power = power.get_int( "cur_kj" );
                 out.max_power = power.get_int( "max_kj" );
+                out.carried[0] = jo.get_int( "weight_g" );
+                out.carried[1] = jo.get_int( "weight_max_g" );
+                out.carried[2] = jo.get_int( "volume_ml" );
+                out.carried[3] = jo.get_int( "volume_max_ml" );
                 JsonObject eff = jo.get_object( "effect_descriptions" );
                 eff.allow_omitted_members();
                 for( const JsonMember m : eff ) {
@@ -6654,8 +6670,10 @@ static bool run_character_query_checks()
     std::string cut;
     std::string tiny;
     std::string name;
+    int carried[4] = {};
     {
         std::lock_guard<std::mutex> lk( cq_m );
+        std::copy( cq_carried, cq_carried + 4, carried );
         full = cq_full;
         cut = cq_cut;
         tiny = cq_tiny;
@@ -6687,6 +6705,10 @@ static bool run_character_query_checks()
     check( light && !light->flag && !light->description.empty() && f.power == 50 && f.max_power == 100,
            "a bionic, off, and 50 of 100 kJ", ( light ? light->name : std::string( "missing" ) ) + ", " +
            std::to_string( f.power ) + "/" + std::to_string( f.max_power ) );
+    check( std::equal( carried, carried + 4, f.carried ) && f.carried[0] > 0 && f.carried[1] > 0 &&
+           f.carried[3] >= 0, "carried weight and volume, and the limits",
+           std::to_string( f.carried[0] ) + "/" + std::to_string( f.carried[1] ) + " g, " +
+           std::to_string( f.carried[2] ) + "/" + std::to_string( f.carried[3] ) + " ml" );
     const auto winded = f.effects.find( "winded" );
     check( winded != f.effects.end() && !winded->second.empty() && winded->second.find( '\n' ) == std::string::npos,
            "an effect's description, one line", winded != f.effects.end() ? winded->second : "missing" );
