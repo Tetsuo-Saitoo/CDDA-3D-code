@@ -881,6 +881,9 @@ void emp_blast( const tripoint_bub_ms &p )
 }
 void resonance_cascade( const tripoint_bub_ms &p )
 {
+    if( fp3d::events_enabled() ) { // FP3D: one event; its emp_blast calls send none
+        fp3d::on_explosion( p, 8, {}, "resonance" );
+    }
     Character &player_character = get_player_character();
     const time_duration maxglow = time_duration::from_turns( 100 - 5 * trig_dist( p,
                                   player_character.pos_bub() ) );

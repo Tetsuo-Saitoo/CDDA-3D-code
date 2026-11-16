@@ -33,6 +33,8 @@
 #include "fp3d/swing.h"
 #include "game.h"
 #include "item.h"
+#include "itype.h"
+#include "iuse_actor.h"
 #include "map.h"
 #include "martialarts.h"
 #include "messages.h"
@@ -545,6 +547,33 @@ int main()
                name_of( fp3d::id_kind::itype, boom[0].detail ) == "grenade_act" && boom[1].detail == 0,
                "explosions: blast area and item, flashbang radius", std::to_string( boom.size() ) + " events" +
                ( boom.empty() ? "" : ", blast covers " + std::to_string( boom[0].path.size() ) ) );
+
+        // EMP and scrambler grenades: one event each at the grenade with the blast's radius, not one per square.
+        // The EMP's radius is cut to 1 (and no electric field) so it misses the player's gear 3 squares away.
+        for( const std::string &id : { std::string( "grenade_emp_act" ), std::string( "scrambler_act" ) } ) {
+            item nade( itype_id( id ), calendar::turn );
+            const explosion_iuse *real = nade.type->countdown_action ? dynamic_cast<const explosion_iuse *>
+                                         ( nade.type->countdown_action.get_actor_ptr() ) : nullptr;
+            if( real == nullptr ) {
+                check( false, ( "explosions: " + id + " explodes" ).c_str(), "no explosion countdown action" );
+                continue;
+            }
+            explosion_iuse pulse_use = *real;
+            const bool emp = pulse_use.emp_blast_radius > 0;
+            if( emp ) {
+                pulse_use.emp_blast_radius = 1;
+                pulse_use.fields_radius = -1;
+            }
+            const std::string kind = emp ? "emp" : "scrambler";
+            const int radius = emp ? 1 : pulse_use.scrambler_blast_radius;
+            pulse_use.use( nullptr, nade, &get_map(), blast_at );
+            const std::vector<event> pulse = drain( event_kind::explosion );
+            check( pulse.size() == 1 && name_of( fp3d::id_kind::explosion, pulse[0].type ) == kind &&
+                   pulse[0].amount == radius && radius > 0 && same( pulse[0].pos, abs_of( blast_at ) ) &&
+                   name_of( fp3d::id_kind::itype, pulse[0].detail ) == id,
+                   ( "explosions: " + id + " sends one " + kind + " event with its radius" ).c_str(),
+                   std::to_string( pulse.size() ) + " events" );
+        }
 
         // Overflow: 10 sounds then a full queue of messages. The sounds go first; every message stays.
         fp3d::reset_events();

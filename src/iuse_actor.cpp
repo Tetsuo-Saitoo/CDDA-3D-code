@@ -801,12 +801,18 @@ std::optional<int> explosion_iuse::use( Character *p, item &it, map *here,
         }
     }
     if( scrambler_blast_radius >= 0 ) {
+        if( fp3d::events_enabled() && bubble_map.inbounds( here->get_abs( pos ) ) ) { // FP3D: one event, not per square
+            fp3d::on_explosion( bubble_map.get_bub( here->get_abs( pos ) ), scrambler_blast_radius, {}, "scrambler" );
+        }
         for( const tripoint_bub_ms &dest : here->points_in_radius( pos, scrambler_blast_radius ) ) {
             // TODO: Use map aware 'scrambler_blast' when available.
             explosion_handler::scrambler_blast( dest );
         }
     }
     if( emp_blast_radius >= 0 ) {
+        if( fp3d::events_enabled() && bubble_map.inbounds( here->get_abs( pos ) ) ) { // FP3D: one event, not per square
+            fp3d::on_explosion( bubble_map.get_bub( here->get_abs( pos ) ), emp_blast_radius, {}, "emp" );
+        }
         for( const tripoint_bub_ms &dest : here->points_in_radius( pos, emp_blast_radius ) ) {
             // TODO: Use map aware 'emp_blast' when available.
             explosion_handler::emp_blast( dest );
