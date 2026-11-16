@@ -36,6 +36,7 @@
 #include "item_pocket.h"
 #include "json.h"
 #include "lightmap.h"
+#include "line.h"
 #include "map.h"
 #include "map_memory.h"
 #include "map_scale_constants.h"
@@ -236,8 +237,43 @@ std::optional<light_view> light_source_at( map &here, const tripoint_bub_ms &p, 
     return best;
 }
 
+// L8 #3: what lies in `it` (a container lying next to the player, handle `container`), one level, into sm.inside;
+// sealed and forbidden pockets stay closed. Capped per container and per submap; what's left out is counted.
+void capture_inside( item &it, uint64_t container, submap_view &sm, std::unordered_set<uint64_t> &seen )
+{
+    size_t listed = 0;
+    uint32_t left_out = 0;
+    int index = 0;
+    for( item_pocket *pk : it.get_all_contained_pockets() ) {
+        if( index > max_item_pocket ) {
+            break;
+        }
+        if( !pk->sealed() && !pk->is_forbidden() ) {
+            for( item *child : pk->all_items_top() ) {
+                if( listed >= max_inside_per_container || sm.inside.size() >= max_inside_per_submap ) {
+                    left_out++;
+                    continue;
+                }
+                inside_view v;
+                v.container = container;
+                v.uid = item_handle( *child, &seen );
+                v.type = intern_id( id_kind::itype, child->typeId().str() );
+                v.pocket = static_cast<int16_t>( index );
+                sm.inside.push_back( v );
+                listed++;
+            }
+        }
+        index++;
+    }
+    if( left_out > 0 ) {
+        sm.inside_more.emplace_back( container, left_out );
+    }
+}
+
+// `by_player`: the player's square or one next to it, same level, items reachable there (L8: more handles, and what
+// lies in containers).
 void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile, submap_view &sm,
-                               std::unordered_set<uint64_t> &seen, bool items_seen )
+                               std::unordered_set<uint64_t> &seen, bool items_seen, bool by_player )
 {
     map_stack stack = here.i_at( p );
     if( items_seen && !stack.empty() ) {
@@ -271,8 +307,9 @@ void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile
             }
         }
         // Handles for the client to point at one item (fp3d/item_hands.h).
+        const size_t max_handles = by_player ? max_handles_near_player : max_handles_per_tile;
         for( item &it : stack ) {
-            if( pile.handles.size() >= max_handles_per_tile ) {
+            if( pile.handles.size() >= max_handles ) {
                 break;
             }
             item_handle_view h;
@@ -295,6 +332,9 @@ void capture_items_and_fields( map &here, const tripoint_bub_ms &p, uint8_t tile
                 }
             }
             pile.handles.push_back( h );
+            if( by_player ) {
+                capture_inside( it, h.uid, sm, seen );
+            }
         }
         sm.items.push_back( std::move( pile ) );
     }
@@ -372,8 +412,10 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
 
             // Hidden information stays hidden: piles and fields only where the player looks now.
             if( vis == vis_seen_lit ) {
+                const bool by_player = p.z() == u.posz() && square_dist( u.pos_bub(), p ) <= 1 &&
+                                  here.accessible_items( p );
                 capture_items_and_fields( here, p, static_cast<uint8_t>( i ), *sm, seen,
-                                          here.could_see_items( p, u.pos_bub() ) );
+                                          here.could_see_items( p, u.pos_bub() ), by_player );
                 if( const std::optional<light_view> l = light_source_at( here, p, static_cast<uint8_t>( i ) ) ) {
                     sm->lights.push_back( *l );
                 }
@@ -763,6 +805,11 @@ bool item_pile_view::operator==( const item_pile_view &o ) const
            handles == o.handles;
 }
 
+bool inside_view::operator==( const inside_view &o ) const
+{
+    return container == o.container && uid == o.uid && type == o.type && pocket == o.pocket;
+}
+
 bool item_handle_view::operator==( const item_handle_view &o ) const
 {
     return uid == o.uid && type == o.type && spot_x == o.spot_x && spot_y == o.spot_y && yaw == o.yaw &&
@@ -804,7 +851,7 @@ bool submap_view::same_shape( const submap_view &o ) const
 bool submap_view::same_detail( const submap_view &o ) const
 {
     return light == o.light && vis == o.vis && items == o.items && fields == o.fields && heat == o.heat &&
-           cookware == o.cookware && lights == o.lights;
+           cookware == o.cookware && lights == o.lights && inside == o.inside && inside_more == o.inside_more;
 }
 
 uint32_t intern_id( id_kind kind, const std::string &id )
@@ -1173,6 +1220,40 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
                     jo.end_array();
                 }
             }
+        }
+        jo.end_array();
+        // L8: piles with more items than handles listed: [tile, items not listed].
+        jo.member( "more" );
+        jo.start_array();
+        for( const item_pile_view &p : sm.items ) {
+            if( p.count > p.handles.size() ) {
+                jo.start_array();
+                jo.write( static_cast<int>( p.tile ) );
+                jo.write( static_cast<int64_t>( p.count - p.handles.size() ) );
+                jo.end_array();
+            }
+        }
+        jo.end_array();
+        // L8: what lies in containers next to the player: [container, uid, type, pocket]; containers cut short:
+        // [container, items left out].
+        jo.member( "inside" );
+        jo.start_array();
+        for( const inside_view &v : sm.inside ) {
+            jo.start_array();
+            jo.write( static_cast<int64_t>( v.container ) );
+            jo.write( static_cast<int64_t>( v.uid ) );
+            jo.write( static_cast<int64_t>( v.type ) );
+            jo.write( static_cast<int>( v.pocket ) );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "inside_more" );
+        jo.start_array();
+        for( const std::pair<uint64_t, uint32_t> &m : sm.inside_more ) {
+            jo.start_array();
+            jo.write( static_cast<int64_t>( m.first ) );
+            jo.write( static_cast<int64_t>( m.second ) );
+            jo.end_array();
         }
         jo.end_array();
         jo.member( "fields" );

@@ -41,6 +41,7 @@ class item;
 namespace fp3d
 {
 constexpr size_t max_handles_per_tile = 32;   // items listed per square, in CDDA's stack order
+constexpr size_t max_handles_near_player = 256;   // on the player's square and the 8 around it (L8)
 constexpr size_t max_carried_listed = 256;    // carried items listed, depth first
 constexpr int max_carried_depth = 8;          // levels listed: top level + 7 levels of containers inside
 constexpr size_t max_body_parts_listed = 32;  // player.body_parts, worn covers (client's MAX_BODY_PARTS)

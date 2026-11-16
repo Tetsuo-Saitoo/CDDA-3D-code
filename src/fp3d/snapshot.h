@@ -60,8 +60,21 @@ struct item_pile_view {
     std::array<uint32_t, 4> top{};                // itype indices, largest volume first; 0 = none
     uint32_t corpse = 0;                          // mtype index of the largest corpse here, 0 = none
     uint16_t corpse_state = 0;                    // its butchery state, corpse_* bits below
-    std::vector<item_handle_view> handles;        // the first max_handles_per_tile items, CDDA's stack order
+    // the first max_handles_per_tile items (max_handles_near_player next to the player), CDDA's stack order
+    std::vector<item_handle_view> handles;
     bool operator==( const item_pile_view &o ) const;
+};
+
+// L8: an item in a container lying on the player's square or one next to it, one level deep: container pockets only,
+// not sealed or forbidden ones (take with `container` takes it out).
+constexpr size_t max_inside_per_container = 64;
+constexpr size_t max_inside_per_submap = 256;
+struct inside_view {
+    uint64_t container = 0;                       // the lying container's handle
+    uint64_t uid = 0;
+    uint32_t type = 0;                            // itype index
+    int16_t pocket = 0;                           // index into the container's pockets, as item actions take it
+    bool operator==( const inside_view &o ) const;
 };
 
 // carried_view::flags
@@ -142,6 +155,8 @@ struct submap_view {
     std::vector<heat_view> heat;                  // tiles seen now only (cap 32)
     std::vector<cookware_view> cookware;          // on those heat tiles (cap 16)
     std::vector<light_view> lights;               // tiles seen now only, brightest first (cap 16)
+    std::vector<inside_view> inside;              // L8: next to the player only (caps above)
+    std::vector<std::pair<uint64_t, uint32_t>> inside_more;   // containers cut short: [handle, items left out]
     bool same_shape( const submap_view &o ) const;
     bool same_detail( const submap_view &o ) const;
 };

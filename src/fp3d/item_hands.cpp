@@ -206,6 +206,23 @@ void after_inventory_change( avatar &u )
     u.invalidate_weight_carried_cache();
 }
 
+std::string pocket_block( const item_location &loc, bool sealed_ok = false );
+
+// The one item with this handle directly in `box`'s container pockets; none when two share it (L8).
+item_location find_inside( item_location box, const item_ref &r )
+{
+    item_location found;
+    for( item *child : box->all_items_top( pocket_type::CONTAINER ) ) {
+        if( matches( *child, r ) ) {
+            if( found ) {
+                return item_location();
+            }
+            found = item_location( box, child );
+        }
+    }
+    return found;
+}
+
 bool take( avatar &u, const item_action &a )
 {
     map &here = get_map();
@@ -219,7 +236,27 @@ bool take( avatar &u, const item_action &a )
     if( !here.accessible_items( *p ) ) {
         return refuse( u, _( "You can't get at the items in there." ) );
     }
-    item_location loc = find_on_square( here, *p, a.item );
+    item_location loc;
+    if( a.container.uid != 0 ) {
+        // L8: out of a container lying there, one level (what the snapshot's `inside` lists).
+        const item_location box = find_on_square( here, *p, a.container );
+        if( !box ) {
+            return refuse( u, _( "That isn't there any more." ) );
+        }
+        if( !box->is_owned_by( u, true ) ) {
+            return refuse( u, string_format( _( "The %s isn't yours." ), box->tname() ) );
+        }
+        loc = find_inside( box, a.item );
+        if( !loc ) {
+            return refuse( u, _( "That isn't there any more." ) );
+        }
+        const std::string why = pocket_block( loc );
+        if( !why.empty() ) {
+            return refuse( u, why );
+        }
+    } else {
+        loc = find_on_square( here, *p, a.item );
+    }
     if( !loc ) {
         return refuse( u, _( "That isn't there any more." ) );
     }
@@ -476,7 +513,7 @@ bool drop( avatar &u, const item_action &a )
 }
 
 // Why the carried item `loc` can't be reached into ("" = it can): it's in a sealed or forbidden pocket.
-std::string pocket_block( const item_location &loc, bool sealed_ok = false )
+std::string pocket_block( const item_location &loc, bool sealed_ok )
 {
     for( item_location at = loc; at.has_parent(); at = at.parent_item() ) {
         const item_pocket *pk = at.parent_pocket();
