@@ -87,6 +87,9 @@ void on_projectile( const map &here, const Creature *shooter, const std::vector<
 // Radius 0 = computed from `area`.
 void on_explosion( const tripoint_bub_ms &centre, int radius, const std::vector<tripoint_bub_ms> &area,
                    const std::string &kind );
+// The kind of a spell's area event: "spell:<damage type id>" when the id is 1-32 bytes of printable ASCII (it is
+// JSON data, a mod's may hold anything), else "spell".
+std::string spell_explosion_kind( const std::string &damage_type );
 // The item behind explosions started in this scope (a grenade, C4, a rocket's ammo); explosion events carry
 // its itype index in `detail` (0 = unknown, e.g. a vehicle or a monster).
 class explosion_item_scope

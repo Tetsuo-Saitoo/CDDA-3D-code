@@ -34,6 +34,7 @@
 #include "explosion.h"
 #include "field.h"
 #include "field_type.h"
+#include "fp3d/events.h" // FP3D:
 #include "fungal_effects.h"
 #include "game.h"
 #include "item.h"
@@ -492,6 +493,12 @@ static std::set<tripoint_bub_ms> spell_effect_area( const spell &sp, const tripo
 
         explosion_handler::draw_custom_explosion( explosion_colors,
                 exp_name );
+        // FP3D: the spell's squares, coloured by its damage type in the client. The set is sorted, so past the
+        // event's 1024-square cap only the lowest-coordinate part is sent (real spells stay far below it).
+        if( fp3d::events_enabled() ) {
+            fp3d::on_explosion( target, 0, std::vector<tripoint_bub_ms>( targets.begin(), targets.end() ),
+                                fp3d::spell_explosion_kind( sp.id()->dmg_type.str() ) );
+        }
     }
     return targets;
 }
