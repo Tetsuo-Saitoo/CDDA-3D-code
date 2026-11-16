@@ -36,6 +36,7 @@
 #include "enums.h"
 #include "faction.h"
 #include "flag.h"
+#include "fp3d/cooking.h" // FP3D:
 #include "game.h"
 #include "game_constants.h"
 #include "game_inventory.h"
@@ -1481,7 +1482,7 @@ static void set_temp_rot( item &newit, const double relative_rot, const bool sho
 
 static void spawn_items( Character &guy, std::vector<item> &results,
                          const std::optional<tripoint_bub_ms> &loc, const double relative_rot, const bool should_heat,
-                         bool allow_wield = false )
+                         bool allow_wield = false, const item *craft = nullptr )
 {
     for( item &newit : results ) {
         // todo: set this up recursively, who knows what kinda crafts will need it
@@ -1493,6 +1494,10 @@ static void spawn_items( Character &guy, std::vector<item> &results,
         set_temp_rot( newit, relative_rot, should_heat );
 
         newit.set_owner( guy.get_faction()->id );
+        // FP3D: what was cooked in a pot goes back into it, as much as it holds (fp3d/cooking.h)
+        if( craft != nullptr && fp3d::cooked_into_pot( guy, *craft, newit ) ) {
+            continue;
+        }
         if( newit.made_of( phase_id::LIQUID ) ) {
             if( guy.is_avatar() ) {
                 liquid_handler::handle_all_liquid( newit, PICKUP_RANGE );
@@ -1531,7 +1536,7 @@ void Character::complete_craft( item &craft, const std::optional<tripoint_bub_ms
         newits = making.create_results( batch_size, &used );
         // only wield crafted items if there's only one
         bool allow_wield = newits.size() == 1;
-        spawn_items( *this, newits, loc, relative_rot, should_heat, allow_wield );
+        spawn_items( *this, newits, loc, relative_rot, should_heat, allow_wield, &craft );
     }
 
     // messages, learning of recipe

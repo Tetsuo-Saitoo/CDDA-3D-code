@@ -522,7 +522,11 @@ bool queue_item_action( const item_action &a )
                        a.op == item_op::unload || a.op == item_op::reload || a.op == item_op::clear ||
                        a.op == item_op::throw_ || a.op == item_op::pour || a.op == item_op::place ||
                        a.op == item_op::spot || a.op == item_op::hold || a.op == item_op::consume ||
-                       a.op == item_op::cook;
+                       a.op == item_op::cook || a.op == item_op::light || a.op == item_op::extinguish;
+    // light: the firestarter, or none at all (uid 0, type 0). extinguish: none. Every other op: a whole ref.
+    const bool no_item = a.item.uid == 0 && a.item.type == 0;
+    const bool item_ok = a.op == item_op::extinguish ? no_item :
+                         a.op == item_op::light ? no_item || ref_ok( a.item ) : ref_ok( a.item );
     // cook: a plain recipe id (printable ASCII, no spaces or quotes) and a batch in range; every other op: neither.
     const bool recipe_chars_ok = std::all_of( a.recipe.begin(), a.recipe.end(), []( char ch ) {
         return ch > 0x20 && ch < 0x7f && ch != '"' && ch != '\\';
@@ -538,7 +542,7 @@ bool queue_item_action( const item_action &a )
     const bool no_pos = a.pos.x == 0 && a.pos.y == 0 && a.pos.z == 0;
     const bool pour_ok = a.op != item_op::pour ||
                          ( no_container ? a.pocket == -1 : ref_ok( a.container ) && no_pos );
-    if( !op_ok || !cook_ok || !hand_ok || !ref_ok( a.item ) || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
+    if( !op_ok || !cook_ok || !hand_ok || !item_ok || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
         !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket || !pour_ok ||
         ( ( a.op == item_op::put || a.op == item_op::reload ) && !ref_ok( a.container ) ) ||
         ( a.op == item_op::take && !no_container && !ref_ok( a.container ) ) ||
