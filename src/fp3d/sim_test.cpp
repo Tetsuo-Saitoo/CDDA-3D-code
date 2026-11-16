@@ -4136,7 +4136,8 @@ static bool run_combat_checks()
         // Builds `sc`, starts `action` and answers each swing request with `reply` (nullopt: a cancel) and the
         // call `call` as the answer's action.
         const auto swing_run = [&]( const scene & sc, const std::string & action, const swing_answerer & reply,
-        const std::string & call = std::string() ) {
+                                    const std::string & call = std::string(),
+        const std::optional<std::array<int, 3>> &square = std::nullopt ) {
             swung s;
             // A stray prompt is printed and answered, and the scene built again: the creature may have grabbed
             // the avatar after the last strike, and struggling free on the pause can tear a pocket off (a popup).
@@ -4180,7 +4181,14 @@ static bool run_combat_checks()
                 std::vector<fp3d::event> old;
                 fp3d::drain_events( old );
             }
-            fp3d::queue_action( action );
+            if( square ) {   // queue_action_at: that square, (dx, dy, dz) from the avatar
+                const std::shared_ptr<const fp3d::snapshot> snap = fp3d::latest_snapshot();
+                const fp3d::ui_point me = snap ? snap->player.pos : fp3d::ui_point{};
+                fp3d::queue_action_at( action, fp3d::ui_point{ me.x + ( *square )[0], me.y + ( *square )[1],
+                                       me.z + ( *square )[2] } );
+            } else {
+                fp3d::queue_action( action );
+            }
             std::optional<fp3d::ui_request> c = fp3d::wait_request( 20000, q->id );
             int asked = 0;
             while( c && !c->timed && asked++ < 10 ) {
@@ -4465,6 +4473,50 @@ static bool run_combat_checks()
         check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ) && s.after.moves == s.before.moves &&
                s.after.hp == s.before.hp, "a spear doesn't strike someone unseen behind a wall",
                shown( s ) + ", moves " + std::to_string( s.before.moves ) + " -> " + std::to_string( s.after.moves ) );
+        // A square the client names (queue_action_at): a knight's move off, the main hand only, within reach.
+        const auto spent = []( const swung & s ) {
+            return s.after.moves < s.before.moves;
+        };
+        const auto idle = [&]( const swung & s, const char *text ) {
+            return s.back && s.swings.empty() && s.after.moves == s.before.moves && said( s.after, text );
+        };
+        scene knight = spear;
+        knight.zy = -1;
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
+        check( s.back && at( s, -2, -1 ) && s.swings[0].range == 2 && spent( s ),
+               "a spear strikes a knight's move off at the named square", shown( s ) );
+        s = swing_run( knight, "fp3d_attack_main_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
+        check( s.back && s.swings.empty() && spent( s ), "... unaimed: CDDA's reach attack, no swing request",
+               shown( s ) );
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -1, 0, 0 } );
+        check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ) && s.after.moves == s.before.moves,
+               "... a named square with nobody there strikes nothing", shown( s ) );
+        scene knight_far = knight;
+        knight_far.zx = -3;
+        s = swing_run( knight_far, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -3, -1, 0 } );
+        check( idle( s, "out of reach" ), "... 3 off is out of a spear's reach", shown( s ) );
+        scene knight_bat = knight;
+        knight_bat.melee = "bat";
+        s = swing_run( knight_bat, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
+        check( idle( s, "out of reach" ), "... a bat doesn't reach it", shown( s ) );
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { 0, 0, 0 } );
+        const bool own = idle( s, "out of reach" );
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 1 } );
+        const bool up = idle( s, "out of reach" );
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ) );
+        const bool unnamed = idle( s, "Nothing there to hit" );
+        s = swing_run( knight, "fp3d_attack_off_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
+        const bool off = s.back && s.swings.empty() && s.after.moves == s.before.moves && s.after.hp == s.before.hp;
+        check( own && up && unnamed && off, "... refused: your own square, another level, no square, the off hand",
+               std::string( own ? "" : "own " ) + ( up ? "" : "up " ) + ( unnamed ? "" : "unnamed " ) +
+               ( off ? "" : "off" ) );
+        scene next_to = spear;
+        next_to.zx = -1;
+        s = swing_run( next_to, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -1, -1, 0 } );
+        const bool empty_diag = idle( s, "Nothing there to hit" );
+        s = swing_run( next_to, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -1, 0, 0 } );
+        check( empty_diag && s.back && at( s, -1, 0 ) && s.swings[0].range == 1 && spent( s ),
+               "... next to you: a plain strike at that square", shown( s ) );
     }
     return failed == 0;
 }

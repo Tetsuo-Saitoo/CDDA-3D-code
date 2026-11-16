@@ -10,11 +10,14 @@
 #include "coordinates.h"
 #include "creature.h"
 #include "creature_tracker.h"
+#include "fp3d/bridge.h"
 #include "fp3d/held.h"
+#include "fp3d/points.h"
 #include "fp3d/swing.h"
 #include "input_context.h"
 #include "item.h"
 #include "item_location.h"
+#include "line.h"
 #include "map.h"
 #include "monster.h"
 #include "npc.h"
@@ -75,6 +78,9 @@ void register_hand_actions( input_context &ctxt )
                                   no_translation( std::string( "aimed attack, " ) + hand + " hand" ) );
         }
     }
+    // the main hand at a square the client names (queue_action_at): a reach weapon off the 8 ways
+    ctxt.register_action( attack_prefix + "main_at", no_translation( "attack a square, main hand" ) );
+    ctxt.register_action( attack_prefix + "main_aim_at", no_translation( "aimed attack at a square, main hand" ) );
 }
 
 bool is_hand_action( const std::string &action )
@@ -101,27 +107,56 @@ bool hand_attack( avatar &u, const std::string &action )
     if( aimed ) {
         rest = rest.substr( 4 );
     }
-    const auto d = std::find_if( dirs.begin(), dirs.end(), [&rest]( const dir_step & s ) {
-        return rest == s.name;
-    } );
-    if( d == dirs.end() ) {
-        return false;
-    }
-    const tripoint_bub_ms target = u.pos_bub() + tripoint_rel_ms( d->dx, d->dy, 0 );
-    Creature *c = get_creature_tracker().creature_at<Creature>( target );
-    // Nobody next to you that way: the main hand's weapon may reach further along it (CDDA's reach attack).
-    tripoint_bub_ms reach_target = target;
-    if( ( c == nullptr || c == &u ) && !off ) {
+    tripoint_bub_ms target;
+    tripoint_bub_ms reach_target;
+    Creature *c = nullptr;
+    if( !off && rest == "at" ) {
+        // The square queue_action_at named (absolute, hostile): the main hand's weapon, this level, not your own
+        // square, within its reach as CDDA measures a reach attack (rl_dist, max_reach at most). Two or more off,
+        // only a creature you see (as along the 8 ways); next to you, a plain strike.
+        const std::optional<ui_point> sq = take_action_square();
+        if( !sq ) {
+            u.add_msg_if_player( m_info, _( "Nothing there to hit." ) );
+            return false;
+        }
+        map &here = get_map();
+        const tripoint_bub_ms at = here.get_bub( to_abs_ms( *sq ) );
         const item_location weapon = u.get_wielded_item();
         const int reach = weapon ? std::clamp( weapon->current_reach_range( u ), 1, max_reach ) : 1;
-        for( int r = 2; r <= reach; r++ ) {
-            const tripoint_bub_ms q = u.pos_bub() + tripoint_rel_ms( d->dx * r, d->dy * r, 0 );
-            // only a creature you see: a strike must not find (or give away) someone unseen behind a wall
-            Creature *beyond = get_creature_tracker().creature_at<Creature>( q );
-            if( beyond != nullptr && u.sees( get_map(), *beyond ) ) {
-                c = beyond;
-                reach_target = q;
-                break;
+        if( !here.inbounds( at ) || at.z() != u.posz() || at == u.pos_bub() || rl_dist( u.pos_bub(), at ) > reach ) {
+            u.add_msg_if_player( m_info, _( "That's out of reach." ) );
+            return false;
+        }
+        c = get_creature_tracker().creature_at<Creature>( at );
+        const bool next_to = square_dist( u.pos_bub(), at ) == 1;
+        if( c != nullptr && !next_to && !u.sees( here, *c ) ) {
+            c = nullptr;
+        }
+        reach_target = at;
+        target = next_to ? at : u.pos_bub();   // reach_target != target: CDDA's reach attack
+    } else {
+        const auto d = std::find_if( dirs.begin(), dirs.end(), [&rest]( const dir_step & s ) {
+            return rest == s.name;
+        } );
+        if( d == dirs.end() ) {
+            return false;
+        }
+        target = u.pos_bub() + tripoint_rel_ms( d->dx, d->dy, 0 );
+        c = get_creature_tracker().creature_at<Creature>( target );
+        // Nobody next to you that way: the main hand's weapon may reach further along it (CDDA's reach attack).
+        reach_target = target;
+        if( ( c == nullptr || c == &u ) && !off ) {
+            const item_location weapon = u.get_wielded_item();
+            const int reach = weapon ? std::clamp( weapon->current_reach_range( u ), 1, max_reach ) : 1;
+            for( int r = 2; r <= reach; r++ ) {
+                const tripoint_bub_ms q = u.pos_bub() + tripoint_rel_ms( d->dx * r, d->dy * r, 0 );
+                // only a creature you see: a strike must not find (or give away) someone unseen behind a wall
+                Creature *beyond = get_creature_tracker().creature_at<Creature>( q );
+                if( beyond != nullptr && u.sees( get_map(), *beyond ) ) {
+                    c = beyond;
+                    reach_target = q;
+                    break;
+                }
             }
         }
     }
