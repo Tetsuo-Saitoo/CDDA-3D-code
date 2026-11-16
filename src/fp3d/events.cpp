@@ -10,6 +10,7 @@
 #include "character.h"
 #include "creature.h"
 #include "damage.h"
+#include "fp3d/gun_faults.h"
 #include "fp3d/points.h"
 #include "fp3d/snapshot.h"
 #include "fp3d/swing.h"
@@ -314,6 +315,20 @@ void on_item_result( uint64_t item_uid, uint32_t tag, bool done, const std::stri
     e.amount = done ? 1 : 0;
     // Plain text, as the message event's: item names carry color tags.
     e.text = bounded_text( remove_color_tags( why ) );
+    push( std::move( e ) );
+}
+
+void on_misfire( const Character &shooter, const item &gun )
+{
+    if( !player_sees( shooter ) ) {
+        return;
+    }
+    event e;
+    e.kind = event_kind::misfire;
+    e.uid = creature_uid( shooter );
+    e.pos = to_ui_point( shooter.pos_abs() );
+    e.type = item_index( gun.typeId().str() );
+    e.detail = jam_of( gun ).is_null() ? 1 : 2;
     push( std::move( e ) );
 }
 
