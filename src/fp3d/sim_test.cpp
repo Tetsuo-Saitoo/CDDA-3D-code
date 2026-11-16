@@ -32,6 +32,7 @@
 #endif
 
 #include "achievement.h"
+#include "activity_actor_definitions.h"
 #include "avatar.h"
 #include "cached_options.h"
 #include "calendar.h"
@@ -67,10 +68,12 @@
 #include "game_constants.h"
 #include "inventory.h"
 #include "item.h"
+#include "item_location.h"
 #include "line.h"
 #include "math_parser_diag_value.h"
 #include "json_loader.h"
 #include "map.h"
+#include "map_selector.h"
 #include "map_scale_constants.h"
 #include "mapdata.h"
 #include "martialarts.h"
@@ -78,6 +81,7 @@
 #include "monster.h"
 #include "npc.h"
 #include "options.h"
+#include "output.h"
 #include "overmap.h"
 #include "overmapbuffer.h"
 #include "path_info.h"
@@ -86,6 +90,7 @@
 #include "rng.h"
 #include "scenario.h"
 #include "start_location.h"
+#include "string_input_popup.h"
 #include "talker.h"
 #include "translation.h"
 #include "type_id.h"
@@ -139,6 +144,9 @@ const ter_str_id ter_t_stairs_down( "t_stairs_down" );
 const ter_str_id ter_t_stairs_up( "t_stairs_up" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
 const itype_id itype_pot( "pot" );
+const itype_id itype_log( "log" );
+const itype_id itype_splinter( "splinter" );
+const itype_id itype_lighter( "lighter" );
 const itype_id itype_meat( "meat" );
 const furn_str_id furn_f_fireplace( "f_fireplace" );
 const furn_str_id furn_f_woodstove( "f_woodstove" );
@@ -212,6 +220,9 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 // checks: strength 8 for "too heavy: not offered" (stage 3 sets 12, stage 8 puts the random start's back), 22 =
 // lying-container checks, 23 = character query checks (see the case), 24 = their traits and effect taken away.
 // Done on the sim thread right before its next request.
+// Peek checks (scene 25): the rock carried and the rock wielded.
+uint64_t pk_rock_uid = 0;
+uint64_t pk_wielded_uid = 0;
 std::atomic<int> hand_setup{ 0 };
 // The random start's strength while a scene sets its own (sim thread only; -1 = nothing saved).
 int siphon_str_saved = -1;
@@ -222,6 +233,9 @@ std::atomic<uint64_t> cook_gone_uid{ 0 };     // the pot taken away again (a sta
 std::atomic<double> cook_capture_ms{ 0 };     // one full capture of the scene
 std::atomic<double> cook_heat_ms{ 0 };        // the heat and cookware part of it
 std::atomic<size_t> cook_heat_squares{ 0 };   // squares it built a crafting inventory for
+std::atomic<int> cook_full_free_ml{ -1 };     // scene 26: the room left on the avatar's square once filled
+std::atomic<int> cook_own_resume{ 0 };        // scene 28: CDDA's own way on with the craft: 1 held up, 2 it went on
+std::atomic<uint64_t> cook_fuel_uid{ 0 };     // scene 30: the splinter the avatar carries
 // Gun item checks: the handles scene 16 gave (sim thread writes, driver reads).
 std::atomic<uint64_t> gun_glock_uid{ 0 };      // a carried Glock 19 with a full magazine
 std::atomic<uint64_t> gun_spare_uid{ 0 };      // a carried empty Glock magazine
@@ -268,7 +282,9 @@ std::atomic<uint64_t> lc_far_pack_uid{ 0 };     // a backpack 2 squares west hol
 std::mutex cq_m;
 std::string cq_full;   // run_character_query with no byte limit
 std::string cq_cut;    // the same with 300 bytes less room than it needs
+std::string cq_tiny;   // the same in 3000 bytes: lists cut too
 std::string cq_name;   // the avatar's name as the sheet shows it
+int cq_carried[4] = { -1, -1, -1, -1 };   // CDDA's carried weight and its limit (g), volume and its limit (ml)
 
 // Range op checks: 32 operations queued from inside the sim's hook (so none run before the queue is full), then one
 // more, which is refused. They run at the next main-loop request.
@@ -295,6 +311,19 @@ std::atomic<int> weather_wait{ 0 };
 // 4 read whether a route is left (interrupt_route: 1 yes, 0 no) and end the travel.
 std::atomic<int> interrupt_setup{ 0 };
 std::atomic<int> furniture_setup{ 0 };         // the furniture checks' scene (set_up_furniture)
+// Number checks (run_number_checks): 1 = ask CDDA's numeric prompts from the hook (ask_numbers); what they returned.
+std::atomic<int> number_setup{ 0 };
+std::atomic<bool> number_done{ false };
+struct number_results {
+    bool got_int = false;        // query_int "How many?" (shown default 7)
+    int int_value = 0;
+    bool big_cancelled = false;  // query_int64_t, cancelled
+    int edited = 0;              // edit( int ) from 5
+    bool got_stubborn = true;    // query_int "Again?" (from 9), answered out of range every time
+    int stubborn_value = 0;
+};
+std::mutex number_mutex;
+number_results number_out;
 std::atomic<int> interrupt_route{ -1 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
@@ -520,8 +549,14 @@ void wield_water_pot()
         u.remove_weapon();
         u.i_add( copy );
     }
+    // A little water (any spills), and strength enough for a pot in one hand: the random character may be weak, and
+    // "too heavy for one hand" comes before "would spill".
     item water_pot( itype_pot );
-    water_pot.put_in( item( itype_water, calendar::turn, 4 ), pocket_type::CONTAINER );
+    water_pot.put_in( item( itype_water, calendar::turn, 1 ), pocket_type::CONTAINER );
+    if( u.str_max < 8 ) {
+        u.str_max = 8;
+        u.reset_stats();
+    }
     u.wield( water_pot );
     u.set_moves( u.get_speed() );
 }
@@ -634,10 +669,61 @@ void set_up_interrupt( int stage )
                                             minutes ) ), 0 ) );
 }
 
+// CDDA's own numeric prompts, asked on the sim thread inside the hook; run_number_checks answers them.
+void ask_numbers()
+{
+    number_results res;
+    int v = 7;
+    res.got_int = query_int( v, true, std::string( "How many?" ) );
+    res.int_value = v;
+    string_input_popup big;
+    big.title( "How far?" );
+    const std::optional<int64_t> how_far = big.query_int64_t();
+    res.big_cancelled = !how_far && big.canceled();
+    int e = 5;
+    string_input_popup edit;
+    edit.title( "Edit" ).edit( e );
+    res.edited = e;
+    int stubborn = 9;
+    res.got_stubborn = query_int( stubborn, true, std::string( "Again?" ) );
+    res.stubborn_value = stubborn;
+    std::lock_guard<std::mutex> lk( number_mutex );
+    number_out = res;
+    number_done.store( true );
+}
+
+// The cooking scene's pot goes from one square to another, handle and contents kept (sim thread).
+static void move_cook_pot( map &here, const tripoint_bub_ms &from, const tripoint_bub_ms &to )
+{
+    for( item &it : here.i_at( from ) ) {
+        if( it.typeId() == itype_pot ) {
+            const item copy = it;
+            here.i_rem( from, &it );
+            here.add_item( to, copy );
+            return;
+        }
+    }
+}
+
+// The cooking scene's pot on the fire holds 4 fresh water again (sim thread).
+static void fresh_cook_water( map &here, const tripoint_bub_ms &fire_at )
+{
+    for( item &it : here.i_at( fire_at ) ) {
+        if( it.typeId() == itype_pot ) {
+            it.clear_items();
+            it.put_in( item( itype_water, calendar::turn, 4 ), pocket_type::CONTAINER );
+            it.on_contents_changed();
+        }
+    }
+}
+
 void observe()
 {
     // As the client's hook (bridge/src/sim_session.cpp).
     fp3d::run_range_requests();
+    if( number_setup.exchange( 0 ) != 0 ) {
+        ask_numbers();
+    }
     if( range_fill.exchange( false ) ) {
         fill_range_ops();
     }
@@ -1159,10 +1245,126 @@ void observe()
             u.add_effect( effect_winded, 1_hours );
             const std::string full = fp3d::run_character_query( 901, SIZE_MAX );
             const std::string cut = fp3d::run_character_query( 902, full.size() > 300 ? full.size() - 300 : 0 );
+            const std::string tiny = fp3d::run_character_query( 903, 3000 );
             std::lock_guard<std::mutex> lk( cq_m );
             cq_full = full;
             cq_cut = cut;
+            cq_tiny = tiny;
             cq_name = fp3d::client_text( u.get_name(), fp3d::max_sheet_name_columns, 4 * fp3d::max_sheet_name_columns );
+            cq_carried[0] = static_cast<int>( units::to_gram( u.weight_carried() ) );
+            cq_carried[1] = static_cast<int>( units::to_gram( u.weight_capacity() ) );
+            cq_carried[2] = units::to_milliliter( u.volume_carried() );
+            cq_carried[3] = units::to_milliliter( u.volume_capacity() );
+            break;
+        }
+        case 25: {
+            // Peek (B2): floor 6 squares around, nothing lying there; a backpack worn, a rock carried, a rock wielded.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -6; dx <= 6; dx++ ) {
+                for( int dy = -6; dy <= 6; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_floor );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            u.clear_worn();
+            u.inv->clear();
+            u.remove_weapon();
+            u.wear_item( item( itype_backpack ), false );
+            item_location carried = u.i_add( item( itype_rock ) );
+            pk_rock_uid = carried ? fp3d::item_handle( *carried ) : 0;
+            u.set_wielded_item( item( itype_rock ) );
+            item_location wielded = u.get_wielded_item();
+            pk_wielded_uid = wielded ? fp3d::item_handle( *wielded ) : 0;
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 26: {
+            // Cooking: the avatar's square filled (logs, then single rocks) until less room is left than a rock;
+            // 4 fresh water in the pot on the fire (CDDA boils it clean there in time).
+            fresh_cook_water( here, p + tripoint_rel_ms( -1, 1, 0 ) );
+            int n = 0;
+            const item log( itype_log );
+            while( n < 200 && log.volume() > 0_ml && here.free_volume( p ) >= log.volume() ) {
+                here.add_item( p, log );
+                n++;
+            }
+            const item rock( itype_rock, calendar::turn, 1 );
+            while( n < 2000 && rock.volume() > 0_ml && here.free_volume( p ) >= rock.volume() ) {
+                here.add_item( p, rock );
+                n++;
+            }
+            cook_full_free_ml = units::to_milliliter( here.free_volume( p ) );
+            break;
+        }
+        case 27: {
+            // The fillers gone again (anything else on the square stays); 4 fresh water in the pot again.
+            fresh_cook_water( here, p + tripoint_rel_ms( -1, 1, 0 ) );
+            for( bool again = true; again; ) {
+                again = false;
+                for( item &it : here.i_at( p ) ) {
+                    if( it.typeId() == itype_log || it.typeId() == itype_rock ) {
+                        here.i_rem( p, &it );
+                        again = true;
+                        break;
+                    }
+                }
+            }
+            break;
+        }
+        case 28: {
+            // Cooking: the pot off the fire onto the square north of it. CDDA's own way on with the paused craft at
+            // the avatar's feet (activating it) is tried: its craft activity must not start.
+            move_cook_pot( here, p + tripoint_rel_ms( -1, 1, 0 ), p + tripoint_rel_ms( -1, 0, 0 ) );
+            for( item &it : here.i_at( p ) ) {
+                if( it.is_craft() ) {
+                    item_location loc( map_cursor( p ), &it );
+                    get_avatar().assign_activity( craft_activity_actor( loc, false ) );
+                    cook_own_resume = get_avatar().activity.is_null() ? 1 : 2;
+                    break;
+                }
+            }
+            break;
+        }
+        case 29:
+            // The pot back on the fire.
+            move_cook_pot( here, p + tripoint_rel_ms( -1, 0, 0 ), p + tripoint_rel_ms( -1, 1, 0 ) );
+            break;
+        case 30: {
+            // Fuel and a filled lighter carried.
+            avatar &u = get_avatar();
+            item_location fuel = u.i_add( item( itype_splinter ) );
+            cook_fuel_uid = fuel ? fp3d::item_handle( *fuel ) : 0;
+            item lighter( itype_lighter );
+            lighter.ammo_set( lighter.ammo_default() );
+            u.i_add( lighter );
+            break;
+        }
+        case 31:
+            // A log on the lit fireplace: it burns to the end of the craft.
+            here.add_item( p + tripoint_rel_ms( -1, 1, 0 ), item( itype_log ) );
+            break;
+        case 32: {
+            // The fireplace as scene 14 left it: the pot alone, a fire without fuel.
+            const tripoint_bub_ms fire_at = p + tripoint_rel_ms( -1, 1, 0 );
+            for( bool again = true; again; ) {
+                again = false;
+                for( item &it : here.i_at( fire_at ) ) {
+                    if( it.typeId() != itype_pot ) {
+                        here.i_rem( fire_at, &it );
+                        again = true;
+                        break;
+                    }
+                }
+            }
+            here.remove_field( fire_at, fd_fire );
+            here.add_field( fire_at, fd_fire, 2 );
             break;
         }
         case 24: {
@@ -1780,6 +1982,7 @@ fp3d::ui_answer answer_for( const fp3d::ui_request &req, const goal &cur, driver
             note = a.cancel ? "cancel" : "entry " + std::to_string( a.entry );
             break;
         case fp3d::request_kind::string:
+        case fp3d::request_kind::number:
             a.cancel = true;
             note = "cancel";
             break;
@@ -2875,6 +3078,295 @@ static bool run_cooking_checks()
     check( held && prompt && prompt->timed && taken == static_cast<int>( ids.size() ),
            "held during a prompt, run by the main loop", std::to_string( taken ) + " results" );
     check( again == 0 && !fp3d::take_query_result( 999999 ), "a result is taken once", "" );
+
+    // Starting the craft (the `cook` item action). Malformed actions are refused when queued. The sim refuses a
+    // recipe the contents don't make, an unknown one, too big a batch and a pot two squares away, with nothing used
+    // up, and a full square at the avatar's feet too. water_clean x2 on the fire takes 2 of the 4 water out of the
+    // pot, lays the craft at the avatar's feet (the pot's cookware entry shows it) and starts CDDA's craft; stopped
+    // with CDDA's question, the craft stays.
+    uint32_t cook_tag = 500;
+    const auto cook_action = [&]( uint64_t uid, const fp3d::ui_point & pos, const std::string & recipe, int batch ) {
+        fp3d::item_action ia;
+        ia.op = fp3d::item_op::cook;
+        ia.item = fp3d::item_ref{ uid, t_pot };
+        ia.pos = pos;
+        ia.recipe = recipe;
+        ia.batch = batch;
+        ia.tag = ++cook_tag;
+        return ia;
+    };
+    {
+        fp3d::item_action not_cook = cook_action( pot.uid, fire_at, "water_clean", 1 );
+        not_cook.op = fp3d::item_op::take;
+        fp3d::item_action batch_on_take = cook_action( pot.uid, fire_at, "", 2 );
+        batch_on_take.op = fp3d::item_op::take;
+        const bool refused_all =
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water clean", 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water\"clean", 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water\x01", 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "", 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, std::string( fp3d::max_cook_recipe_bytes + 1,
+                                      'a' ), 1 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water_clean", 0 ) ) &&
+            !fp3d::queue_item_action( cook_action( pot.uid, fire_at, "water_clean", fp3d::max_cook_batch + 1 ) ) &&
+            !fp3d::queue_item_action( not_cook ) && !fp3d::queue_item_action( batch_on_take );
+        check( refused_all, "cook: malformed actions refused when queued", "" );
+    }
+    struct cook_result {
+        bool queued = false;
+        bool back = false;        // in the main loop again
+        int answers = 0;          // item_result events for the tag
+        bool done = false;
+        std::string why;
+        int prompts = 0;
+        bool stopped = false;     // interrupt() taken
+        std::string texts;        // the prompts' and messages' texts
+    };
+    // Queues `ia` and waits for the main loop to ask again; with `stop`, interrupts the craft once it started and
+    // answers CDDA's question yes. Other prompts are cancelled.
+    const auto run_cook = [&]( const fp3d::item_action & ia, bool stop ) {
+        cook_result res;
+        std::vector<fp3d::event> evs;
+        r = fp3d::wait_request( 5000 );
+        if( !r || !r->timed ) {
+            return res;
+        }
+        fp3d::drain_events( evs );
+        evs.clear();
+        res.queued = fp3d::queue_item_action( ia );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = r->id;
+        const auto read_events = [&]() {
+            fp3d::drain_events( evs );
+            for( const fp3d::event &e : evs ) {
+                if( e.kind == fp3d::event_kind::item_result && e.detail == ia.tag ) {
+                    res.answers++;
+                    res.done = e.amount == 1;
+                    res.why = e.text;
+                } else if( e.kind == fp3d::event_kind::message ) {
+                    res.texts += " | msg: " + e.text.substr( 0, 80 );
+                }
+            }
+            evs.clear();
+        };
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 120000 * fp3d::slow_build ) {
+            read_events();
+            if( stop && res.done && !res.stopped ) {
+                res.stopped = fp3d::interrupt();
+            }
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 100, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( r->timed ) {
+                if( r->id != before ) {
+                    res.back = true;
+                    break;
+                }
+                continue;
+            }
+            res.prompts++;
+            res.texts += " | asked: " + r->text.substr( 0, 80 );
+            fp3d::ui_answer a;
+            a.id = r->id;
+            if( stop && std::find( r->actions.begin(), r->actions.end(), "YES" ) != r->actions.end() ) {
+                a.action = "YES";
+            } else {
+                a.cancel = true;
+            }
+            fp3d::answer( a );
+        }
+        read_events();
+        return res;
+    };
+    // The pot's cookware entry on the fire in the newest snapshot.
+    const auto pot_now = [&]() {
+        std::optional<fp3d::cookware_view> out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        const auto floor_div = []( int a ) {
+            return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+        };
+        const int sx = floor_div( fire_at.x );
+        const int sy = floor_div( fire_at.y );
+        const int tile = ( fire_at.y - sy * fp3d::sm_size ) * fp3d::sm_size + ( fire_at.x - sx * fp3d::sm_size );
+        for( const std::shared_ptr<const fp3d::submap_view> &sm : s->submaps ) {
+            if( sm->pos.x != sx || sm->pos.y != sy || sm->pos.z != fire_at.z ) {
+                continue;
+            }
+            for( const fp3d::cookware_view &cw : sm->cookware ) {
+                if( cw.tile == tile && cw.uid == pot.uid ) {
+                    out = cw;
+                }
+            }
+        }
+        return out;
+    };
+    // Water left in the pot, clean or not (CDDA boils the water in a pot on a fire clean by itself).
+    const uint32_t t_clean = type_of( "water_clean" );
+    const auto water_left = [&]( const std::optional<fp3d::cookware_view> &cw ) {
+        int n = 0;
+        if( cw ) {
+            for( const fp3d::cookware_item_view &c : cw->contents ) {
+                n += c.type == t_water || c.type == t_clean ? c.count : 0;
+            }
+        }
+        return n;
+    };
+    const auto cook_text = []( const cook_result & c ) {
+        return std::string( c.queued ? "" : "not queued " ) + ( c.done ? "done" : "not done" ) + " [" + c.why + "] " +
+               std::to_string( c.answers ) + " answers, " + std::to_string( c.prompts ) + " prompts" +
+               ( c.back ? "" : ", main loop not back" ) + c.texts;
+    };
+    const cook_result wrong = run_cook( cook_action( pot.uid, fire_at, "meat_cooked", 1 ), false );
+    const cook_result unknown = run_cook( cook_action( pot.uid, fire_at, "no_such_recipe", 1 ), false );
+    const cook_result too_many = run_cook( cook_action( pot.uid, fire_at, "water_clean", 5 ), false );
+    const cook_result too_far = run_cook( cook_action( meat_pot, meat_at, "meat_cooked", 1 ), false );
+    const int water_before = water_left( pot_now() );
+    check( wrong.back && wrong.answers == 1 && !wrong.done && unknown.back && unknown.answers == 1 && !unknown.done &&
+           too_many.back && too_many.answers == 1 && !too_many.done && too_far.back && too_far.answers == 1 &&
+           !too_far.done && water_before == 4, "cook: refusals, nothing used up",
+           cook_text( wrong ) + " | " + cook_text( unknown ) + " | " + cook_text( too_many ) + " | " +
+           cook_text( too_far ) + " | water " + std::to_string( water_before ) );
+    // No room for the craft at the avatar's feet: refused before anything is used up.
+    hand_setup = 26;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r ? r->id : 0 );
+    const cook_result full = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), false );
+    const std::optional<fp3d::cookware_view> full_cw = pot_now();
+    hand_setup = 27;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r ? r->id : 0 );
+    const int full_free = cook_full_free_ml.load();
+    check( full.back && full.answers == 1 && !full.done && full.why.find( "room" ) != std::string::npos && full_cw &&
+           water_left( full_cw ) == 4 && full_cw->craft_recipe.empty() && full_free >= 0 && full_free < 500,
+           "cook: no room at the feet, nothing used up",
+           cook_text( full ) + " | free " + std::to_string( full_free ) + " ml, water " +
+           std::to_string( water_left( full_cw ) ) );
+    const cook_result boiling = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), true );
+    const std::optional<fp3d::cookware_view> after = pot_now();
+    check( boiling.back && boiling.done && boiling.answers == 1 && boiling.stopped,
+           "cook: water_clean x2 started, then stopped", cook_text( boiling ) );
+    check( after && water_left( after ) == 2 && after->craft_recipe == "water_clean" &&
+           after->craft_result == type_of( "water_clean" ) && after->craft_progress <= 1000,
+           "cook: 2 water used, the craft shown with the pot",
+           after ? "water " + std::to_string( water_left( after ) ) + ", craft '" + after->craft_recipe + "' " +
+           std::to_string( after->craft_progress ) + " permille" : "pot not seen" );
+
+    // The rest of L9 on that paused craft (2 of the 4 water still in the pot on the fire): pouring out of the pot
+    // where it stands, the pot off the heat and back, the fire put out, fed and lit again, and the craft to its end.
+    const auto scene = [&]( int n ) {
+        hand_setup = n;
+        fp3d::queue_action( "pause" );
+        r = fp3d::wait_request( 20000, r ? r->id : 0 );
+    };
+    // The fireplace's heat entry in the newest snapshot.
+    const auto fire_now = [&]() {
+        std::optional<fp3d::heat_view> out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        const auto floor_div = []( int a ) {
+            return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+        };
+        const int sx = floor_div( fire_at.x );
+        const int sy = floor_div( fire_at.y );
+        const int tile = ( fire_at.y - sy * fp3d::sm_size ) * fp3d::sm_size + ( fire_at.x - sx * fp3d::sm_size );
+        for( const std::shared_ptr<const fp3d::submap_view> &sm : s->submaps ) {
+            if( sm->pos.x != sx || sm->pos.y != sy || sm->pos.z != fire_at.z ) {
+                continue;
+            }
+            for( const fp3d::heat_view &h : sm->heat ) {
+                if( h.tile == tile ) {
+                    out = h;
+                }
+            }
+        }
+        return out;
+    };
+    const auto fire_action = [&]( fp3d::item_op op, uint64_t uid, uint32_t type, const fp3d::ui_point & pos ) {
+        fp3d::item_action ia;
+        ia.op = op;
+        ia.item = fp3d::item_ref{ uid, type };
+        ia.pos = pos;
+        ia.tag = ++cook_tag;
+        return ia;
+    };
+    const auto has = []( const std::string & text, const char *part ) {
+        return text.find( part ) != std::string::npos;
+    };
+    check( !fp3d::queue_item_action( fire_action( fp3d::item_op::extinguish, pot.uid, t_pot, fire_at ) ) &&
+           !fp3d::queue_item_action( fire_action( fp3d::item_op::light, 5, 0, fire_at ) ) &&
+           !fp3d::queue_item_action( fire_action( fp3d::item_op::light, 0, t_pot, fire_at ) ) &&
+           !fp3d::queue_item_action( fire_action( fp3d::item_op::take, 0, 0, fire_at ) ),
+           "light, extinguish: malformed actions refused when queued", "" );
+
+    // One craft a pot: another recipe is refused while this one is paused. The rest of the water is poured out of the
+    // pot where it stands, onto the square east of the avatar.
+    const cook_result second = run_cook( cook_action( pot.uid, fire_at, "meat_cooked", 1 ), false );
+    const cook_result poured = run_cook( fire_action( fp3d::item_op::pour, pot.uid, t_pot, at( 1, 0 ) ), false );
+    const std::optional<fp3d::cookware_view> emptied = pot_now();
+    check( second.back && second.answers == 1 && !second.done && has( second.why, "already" ) && poured.back &&
+           poured.done && emptied && water_left( emptied ) == 0 && emptied->craft_recipe == "water_clean",
+           "pour: out of the pot on the fire; one craft a pot",
+           cook_text( second ) + " | " + cook_text( poured ) + " | water " + std::to_string( water_left( emptied ) ) );
+
+    // The pot off the heat: CDDA's own way on with the craft is held up, and so is `cook`; nothing moves on.
+    cook_own_resume = 0;
+    scene( 28 );
+    const cook_result off_heat = run_cook( cook_action( pot.uid, at( -1, 0 ), "water_clean", 2 ), false );
+    scene( 29 );
+    const std::optional<fp3d::cookware_view> back_on = pot_now();
+    check( cook_own_resume.load() == 1 && off_heat.back && off_heat.answers == 1 && !off_heat.done &&
+           has( off_heat.why, "heat" ) && back_on && after && back_on->craft_recipe == "water_clean" &&
+           back_on->craft_progress == after->craft_progress, "cook: off the heat the craft stays paused",
+           "CDDA's own way on " + std::to_string( cook_own_resume.load() ) + " | " + cook_text( off_heat ) +
+           ( back_on ? " | " + std::to_string( back_on->craft_progress ) + " permille" : " | pot not seen" ) );
+
+    // The fire beaten out: nothing cooks on it.
+    const cook_result put_out = run_cook( fire_action( fp3d::item_op::extinguish, 0, 0, fire_at ), false );
+    const std::optional<fp3d::heat_view> cold = fire_now();
+    const cook_result on_cold = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), false );
+    const cook_result no_fire = run_cook( fire_action( fp3d::item_op::extinguish, 0, 0, fire_at ), false );
+    check( put_out.back && put_out.done && cold && !cold->lit && cold->fire == 0 && on_cold.back && !on_cold.done &&
+           has( on_cold.why, "heat" ) && no_fire.back && !no_fire.done,
+           "extinguish: the fire out, nothing cooks on it",
+           cook_text( put_out ) + " | " + heat_text( cold ) + " | " + cook_text( on_cold ) + " | " +
+           cook_text( no_fire ) );
+
+    // Fuel dropped on the fireplace (the `drop` action), then lit with the carried lighter (no item named).
+    scene( 30 );
+    const cook_result fed = run_cook( fire_action( fp3d::item_op::drop, cook_fuel_uid.load(),
+                                      type_of( "splinter" ), fire_at ), false );
+    const cook_result lit = run_cook( fire_action( fp3d::item_op::light, 0, 0, fire_at ), false );
+    const cook_result on_self = run_cook( fire_action( fp3d::item_op::light, 0, 0, at( 0, 0 ) ), false );
+    const std::optional<fp3d::heat_view> warm = fire_now();
+    check( fed.back && fed.done && lit.back && lit.done && warm && warm->lit && warm->fire > 0 && on_self.back &&
+           !on_self.done, "light: fuel on the fireplace, lit with the lighter",
+           cook_text( fed ) + " | " + cook_text( lit ) + " | " + heat_text( warm ) + " | " + cook_text( on_self ) );
+
+    // Back on a fire the craft goes on to its end; what it made is in the pot.
+    scene( 31 );
+    const cook_result finished = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), false );
+    const std::optional<fp3d::cookware_view> served = pot_now();
+    int clean = 0;
+    if( served ) {
+        for( const fp3d::cookware_item_view &c : served->contents ) {
+            clean += c.type == t_clean ? c.count : 0;
+        }
+    }
+    check( finished.back && finished.done && served && served->craft_recipe.empty() && clean == 2 &&
+           served->contents.size() == 1, "cook: back on the fire to the end, the result in the pot",
+           cook_text( finished ) + " | clean water " + std::to_string( clean ) +
+           ( served ? ", craft '" + served->craft_recipe + "'" : ", pot not seen" ) );
+    scene( 32 );
     return failed == 0;
 }
 
@@ -5750,7 +6242,7 @@ static bool run_interrupt_checks()
         }
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 20000 && ( interrupt_setup.load() != 0 || r->id == before || !r->timed ) ) {
+        while( ms_since( t ) < 20000 * fp3d::slow_build && ( interrupt_setup.load() != 0 || r->id == before || !r->timed ) ) {
             if( std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id ) ) {
                 r = next;
             }
@@ -5768,7 +6260,7 @@ static bool run_interrupt_checks()
         }
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 120000 ) {
+        while( ms_since( t ) < 120000 * fp3d::slow_build ) {
             std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
             if( !next ) {
                 continue;
@@ -5870,7 +6362,7 @@ static bool run_furniture_checks()
         }
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 20000 ) {
+        while( ms_since( t ) < 20000 * fp3d::slow_build ) {
             std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
             if( !next ) {
                 continue;
@@ -5986,7 +6478,7 @@ static bool run_consume_checks()
         }
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 60000 ) {
+        while( ms_since( t ) < 60000 * fp3d::slow_build ) {
             std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
             if( !next ) {
                 continue;
@@ -6332,6 +6824,246 @@ static bool run_lying_container_checks()
 // Character queries (G4, 2026-11-16): the character screen's data. A starting trait and a mutation told apart, a
 // bionic and power, an effect's description; with less room descriptions go from the end and the lists stay whole;
 // the bridge runs one at a time.
+// Peeking (B2): CDDA's peek asks a `target` request in mode "peek" that offers the blind throws as actions:
+// throw_blind (CDDA asks what to throw) and, while something is wielded, throw_blind_wielded; then CDDA asks where
+// ("throw_blind" target). An action the request didn't offer, or one sent to a plain look, throws nothing.
+static bool run_peek_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  peek: %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 25;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 || pk_rock_uid == 0 || pk_wielded_uid == 0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    struct peeked {
+        bool queued = false;
+        bool back = false;                   // in the main loop again
+        std::vector<std::string> offered;    // the look / peek request's actions
+        std::string modes;                   // target modes asked, in order
+        int item_menus = 0;
+        std::string msgs;
+    };
+    // Queues `start` ("peek" or "look"), peeks east (`dir` 1) or west (-1), answers the look / peek request with
+    // `act` and no square, an item request with a rock, a blind throw's target 3 squares on that way from its
+    // origin. The two rocks go opposite ways: rocks stack, so one landing on the other would merge into it.
+    const auto run = [&]( const char *start, const std::string & act, int dir ) {
+        peeked res;
+        std::vector<fp3d::event> evs;
+        fp3d::drain_events( evs );
+        evs.clear();
+        res.queued = fp3d::queue_action( start );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = r->id;
+        bool first_target = true;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 30000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( r->timed ) {
+                if( r->id != before ) {
+                    res.back = true;
+                    break;
+                }
+                continue;
+            }
+            fp3d::ui_answer a;
+            a.id = r->id;
+            if( r->kind == fp3d::request_kind::direction ) {
+                a.pos = fp3d::ui_point{ dir, 0, 0 };
+            } else if( r->kind == fp3d::request_kind::target && first_target ) {
+                first_target = false;
+                res.modes += r->mode;
+                res.offered = r->actions;
+                a.action = act;
+            } else if( r->kind == fp3d::request_kind::target ) {
+                res.modes += " " + r->mode;
+                a.pos = fp3d::ui_point{ r->origin.x + 3 * dir, r->origin.y, r->origin.z };
+                a.action = "FIRE";
+            } else if( r->kind == fp3d::request_kind::item_select ) {
+                res.item_menus++;
+                std::string label;
+                a.entry = first_entry_with( *r, "rock", label );
+                a.cancel = a.entry < 0;
+            } else {
+                a.cancel = true;
+            }
+            fp3d::answer( a );
+        }
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msgs += ( res.msgs.empty() ? "" : " | " ) + e.text;
+            }
+        }
+        return res;
+    };
+    const auto join = []( const std::vector<std::string> &v ) {
+        std::string out;
+        for( const std::string &x : v ) {
+            out += ( out.empty() ? "" : "," ) + x;
+        }
+        return out;
+    };
+    const auto show = [&]( const peeked & p ) {
+        return std::string( p.queued ? "" : "not queued " ) + ( p.back ? "" : "not back " ) + "offered [" +
+               join( p.offered ) + "] modes [" + p.modes + "] " + std::to_string( p.item_menus ) +
+               " item menus, msgs [" + p.msgs + "]";
+    };
+    const auto carried_has = []( uint64_t uid ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.uid == uid ) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // Where `uid` lies, 1-10 squares east (`dir` 1) or west (-1) and up to 3 off the row; nullopt if not there.
+    const auto lies_on = [&here]( uint64_t uid, int dir ) -> std::optional<fp3d::ui_point> {
+        for( int dx = 1; dx <= 10; dx++ ) {
+            for( int dy = -3; dy <= 3; dy++ ) {
+                const fp3d::ui_point q{ here.x + dx * dir, here.y + dy, here.z };
+                for( const fp3d::item_handle_view &h : handles_at( q ) ) {
+                    if( h.uid == uid ) {
+                        return q;
+                    }
+                }
+            }
+        }
+        return std::nullopt;
+    };
+    const auto at = []( const std::optional<fp3d::ui_point> &q ) {
+        return q ? "(" + std::to_string( q->x ) + "," + std::to_string( q->y ) + ")" : std::string( "nowhere" );
+    };
+    const std::vector<std::string> both{ "throw_blind", "throw_blind_wielded" };
+    const std::vector<std::string> one{ "throw_blind" };
+
+    // A look offers nothing, and a blind throw sent to it throws nothing.
+    peeked p = run( "look", "throw_blind", 1 );
+    check( p.back && p.offered.empty() && p.modes == "look" && p.item_menus == 0 && carried_has( pk_wielded_uid ) &&
+           carried_has( pk_rock_uid ), "look: no blind throw", show( p ) );
+    // The wielded rock, thrown blind from the peek: no item menu.
+    p = run( "peek", "throw_blind_wielded", 1 );
+    std::optional<fp3d::ui_point> landed = lies_on( pk_wielded_uid, 1 );
+    check( p.back && p.offered == both && p.modes == "peek throw_blind" && p.item_menus == 0 &&
+           !carried_has( pk_wielded_uid ) && landed, "throw_blind_wielded throws the wielded rock",
+           show( p ) + " landed " + at( landed ) );
+    // Nothing wielded now: only throw_blind is offered, and throw_blind_wielded is ignored.
+    p = run( "peek", "throw_blind_wielded", -1 );
+    check( p.back && p.offered == one && p.modes == "peek" && p.item_menus == 0 && carried_has( pk_rock_uid ),
+           "not offered: ignored", show( p ) );
+    p = run( "peek", "fire_blind", -1 );
+    check( p.back && p.offered == one && p.modes == "peek" && p.item_menus == 0 && carried_has( pk_rock_uid ),
+           "unknown action: ignored", show( p ) );
+    // The carried rock, west: CDDA asks which item first.
+    p = run( "peek", "throw_blind", -1 );
+    landed = lies_on( pk_rock_uid, -1 );
+    check( p.back && p.offered == one && p.modes == "peek throw_blind" && p.item_menus == 1 &&
+           !carried_has( pk_rock_uid ) && landed, "throw_blind asks what, then throws it",
+           show( p ) + " landed " + at( landed ) );
+    return failed == 0;
+}
+
+// The number request (E3): CDDA's query_int, query_int64_t and edit( int ) ask the client for a whole number with
+// the type's range and the shown default; out of range or no number asks again with a status (a few times, then
+// cancel); cancel cancels and edit keeps the value.
+static bool run_number_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  number: %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    // How each number request is answered, in order; the hook asks them at the next main-loop request.
+    std::vector<std::function<void( fp3d::ui_answer & )>> answers = {
+        []( fp3d::ui_answer & a ) { a.number = int64_t( INT_MAX ) + 1; },
+        []( fp3d::ui_answer & ) {},
+        []( fp3d::ui_answer & a ) { a.number = 42; },
+        []( fp3d::ui_answer & a ) { a.cancel = true; },
+        []( fp3d::ui_answer & a ) { a.number = -3; },
+    };
+    for( int i = 0; i < fp3d::max_number_asks; i++ ) {
+        answers.emplace_back( []( fp3d::ui_answer & a ) { a.number = int64_t( INT_MIN ) - 1; } );
+    }
+    number_done.store( false );
+    number_setup.store( 1 );
+    fp3d::queue_action( "pause" );
+    const uint64_t before = r->id;
+    std::vector<fp3d::ui_request> asked;
+    size_t other = 0;
+    const auto t = std::chrono::steady_clock::now();
+    while( ms_since( t ) < 30000 * fp3d::slow_build && !( number_done.load() && r->timed && r->id != before ) ) {
+        std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+        if( !next ) {
+            continue;
+        }
+        r = next;
+        if( r->timed ) {
+            continue;
+        }
+        fp3d::ui_answer a;
+        a.id = r->id;
+        if( r->kind == fp3d::request_kind::number && asked.size() < answers.size() ) {
+            answers[asked.size()]( a );
+            asked.push_back( *r );
+        } else {
+            other++;
+            a.cancel = true;
+        }
+        fp3d::answer( a );
+    }
+    number_results res;
+    {
+        std::lock_guard<std::mutex> lk( number_mutex );
+        res = number_out;
+    }
+    check( number_done.load() && asked.size() == answers.size() && other == 0, "asked as number requests",
+           std::to_string( asked.size() ) + " of " + std::to_string( answers.size() ) + ", " +
+           std::to_string( other ) + " others" );
+    if( asked.size() != answers.size() ) {
+        return false;
+    }
+    const std::string range_status = "enter a whole number from " + std::to_string( INT_MIN ) + " to " +
+                                      std::to_string( INT_MAX );
+    check( asked[0].title == "How many?" && asked[0].number_min == INT_MIN && asked[0].number_max == INT_MAX &&
+           asked[0].number_default == 7 && asked[0].status.empty(), "query_int: title, int range, shown default",
+           std::to_string( asked[0].number_min ) + ".." + std::to_string( asked[0].number_max ) + " default " +
+           std::to_string( asked[0].number_default ) );
+    check( asked[1].status == range_status && asked[2].status == range_status && asked[1].number_default == 7,
+           "out of range, then no number: asked again", asked[1].status + " | " + asked[2].status );
+    check( res.got_int && res.int_value == 42, "the third answer taken", std::to_string( res.int_value ) );
+    check( asked[3].number_min == -fp3d::max_number_answer && asked[3].number_max == fp3d::max_number_answer &&
+           asked[3].number_default == 0 && res.big_cancelled, "query_int64_t: float-exact range, cancelled",
+           std::to_string( asked[3].number_max ) );
+    check( asked[4].number_default == 5 && asked[4].title == "Edit" && res.edited == -3, "edit( int ): from 5 to -3",
+           std::to_string( res.edited ) );
+    check( !res.got_stubborn && res.stubborn_value == 9 && asked.back().title == "Again?",
+           "always out of range: cancelled after the last ask", std::to_string( res.stubborn_value ) );
+    return failed == 0;
+}
+
 static bool run_character_query_checks()
 {
     int failed = 0;
@@ -6363,6 +7095,7 @@ static bool run_character_query_checks()
         size_t learning = 0;
         int power = -1;
         int max_power = -1;
+        int carried[4] = { -1, -1, -1, -1 };   // weight_g, weight_max_g, volume_ml, volume_max_ml
         std::map<std::string, std::string> effects;
         bool truncated = false;
     };
@@ -6418,6 +7151,10 @@ static bool run_character_query_checks()
                 power.allow_omitted_members();
                 out.power = power.get_int( "cur_kj" );
                 out.max_power = power.get_int( "max_kj" );
+                out.carried[0] = jo.get_int( "weight_g" );
+                out.carried[1] = jo.get_int( "weight_max_g" );
+                out.carried[2] = jo.get_int( "volume_ml" );
+                out.carried[3] = jo.get_int( "volume_max_ml" );
                 JsonObject eff = jo.get_object( "effect_descriptions" );
                 eff.allow_omitted_members();
                 for( const JsonMember m : eff ) {
@@ -6441,7 +7178,7 @@ static bool run_character_query_checks()
     };
     const auto await = []( uint64_t id ) {
         const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-        while( id != 0 && ms_since( t0 ) < 20000 ) {
+        while( id != 0 && ms_since( t0 ) < 20000 * fp3d::slow_build ) {
             if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
                 return *res;
             }
@@ -6461,11 +7198,15 @@ static bool run_character_query_checks()
     const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
     std::string full;
     std::string cut;
+    std::string tiny;
     std::string name;
+    int carried[4] = {};
     {
         std::lock_guard<std::mutex> lk( cq_m );
+        std::copy( cq_carried, cq_carried + 4, carried );
         full = cq_full;
         cut = cq_cut;
+        tiny = cq_tiny;
         name = cq_name;
     }
     if( !r || !r->timed || !s0 || full.empty() ) {
@@ -6494,6 +7235,10 @@ static bool run_character_query_checks()
     check( light && !light->flag && !light->description.empty() && f.power == 50 && f.max_power == 100,
            "a bionic, off, and 50 of 100 kJ", ( light ? light->name : std::string( "missing" ) ) + ", " +
            std::to_string( f.power ) + "/" + std::to_string( f.max_power ) );
+    check( std::equal( carried, carried + 4, f.carried ) && f.carried[0] > 0 && f.carried[1] > 0 &&
+           f.carried[3] >= 0, "carried weight and volume, and the limits",
+           std::to_string( f.carried[0] ) + "/" + std::to_string( f.carried[1] ) + " g, " +
+           std::to_string( f.carried[2] ) + "/" + std::to_string( f.carried[3] ) + " ml" );
     const auto winded = f.effects.find( "winded" );
     check( winded != f.effects.end() && !winded->second.empty() && winded->second.find( '\n' ) == std::string::npos,
            "an effect's description, one line", winded != f.effects.end() ? winded->second : "missing" );
@@ -6505,6 +7250,17 @@ static bool run_character_query_checks()
            cut_winded != c.effects.end() && cut_winded->second.empty(),
            "less room: descriptions go from the end", std::to_string( cut.size() ) + " of " +
            std::to_string( full.size() ) + " bytes" );
+    // Far less room: list tails go too, effects first, skills last.
+    const parsed t = parse( tiny );
+    const size_t full_entries = f.skills.size() + f.traits.size() + f.bionics.size() + f.known + f.learning +
+                                f.effects.size();
+    const size_t tiny_entries = t.skills.size() + t.traits.size() + t.bionics.size() + t.known + t.learning +
+                                t.effects.size();
+    check( t.valid && t.ok && t.truncated && tiny.size() <= 3000 && tiny_entries < full_entries && t.effects.empty() &&
+           !t.skills.empty() && t.stat_ids.size() == 4 && t.encumbrance == f.encumbrance,
+           "in 3000 bytes: list tails go, skills last", std::to_string( tiny.size() ) + " bytes, " +
+           std::to_string( tiny_entries ) + " of " + std::to_string( full_entries ) + " entries, " +
+           std::to_string( t.skills.size() ) + " skills" );
 
     // Through the bridge: run by the main loop.
     r = fp3d::wait_request( 5000 );
@@ -7235,6 +7991,8 @@ int main()
     const bool offhand_ok = consume_ok && run_offhand_weight_checks();
     const bool lying_ok = offhand_ok && run_lying_container_checks();
     const bool character_ok = lying_ok && run_character_query_checks();
+    const bool peek_ok = character_ok && run_peek_checks();
+    const bool number_ok = peek_ok && run_number_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -7292,6 +8050,8 @@ int main()
     std::printf( "off hand: %s\n", offhand_ok ? "ok" : "BAD" );
     std::printf( "lying containers: %s\n", lying_ok ? "ok" : "BAD" );
     std::printf( "character query: %s\n", character_ok ? "ok" : "BAD" );
+    std::printf( "peek: %s\n", peek_ok ? "ok" : "BAD" );
+    std::printf( "number requests: %s\n", number_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -7302,6 +8062,7 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
+           peek_ok && number_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

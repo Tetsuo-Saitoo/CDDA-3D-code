@@ -145,13 +145,14 @@ void template_checks( avatar &u, const std::string &scen, const std::string &pro
     std::string seen;
     for( const std::string &bad : {
              std::string( 300, 'x' ), std::string( "Bad\\u0007Name" ), std::string( "Bad\\u0085Name" ),
-             std::string( "#hash" ), std::string( "a/b" ), std::string( " edge" )
+             std::string( "#hash" ), std::string( "a/b" ), std::string( " edge" ), std::string( "a..b" )
          } ) {
         write_file( names, replace_all( orig, "\"Templ Person\"", "\"" + bad + "\"" ) );
         const std::string listed_name = catalog_name_of( "fp3d names" );
         why = fp3d::apply_chargen( u, "{\"template\":\"fp3d names\"}" );
         const bool ok = listed_name.empty() && why.empty() && !u.name.empty() && u.name.size() <= 64 &&
                         u.name.find_first_of( "\x07/#" ) == std::string::npos &&
+                        u.name.find( ".." ) == std::string::npos &&
                         u.name.find( "\xc2\x85" ) == std::string::npos && u.name.front() != ' ';
         if( !ok ) {
             seen += bad.substr( 0, 16 ) + " -> " + u.name.substr( 0, 16 ) + " (" + why + ") ";
@@ -329,6 +330,29 @@ int main()
         why = fp3d::apply_chargen( u, "{\"template\":\"fp3d test\",\"name\":\"From Template\"}" );
         check( why.empty() && u.name == "From Template" && u.str_max == 11 && u.has_trait( trait_id( lone ) ) &&
                u.prof->ident().str() == prof, "template loads with a new name", why );
+        // Input validation for typed names (choices and template starts alike): '/', '\', ".." and control
+        // characters refused with a reason; one dot is fine.
+        {
+            const std::vector<std::pair<std::string, std::string>> bad_names = {
+                { "a/b", "/ or \\" }, { "a\\\\b", "/ or \\" }, { "..", ".." }, { "a..b", ".." },
+                { "Bad\\u0001Name", "control" }, { "Bad\\u001fName", "control" }, { "Bad\\u007fName", "control" },
+                { "Bad\\nName", "control" }, { "Bad\\tName", "control" }
+            };
+            std::string seen;
+            for( const std::pair<std::string, std::string> &b : bad_names ) {
+                const std::string r1 = fp3d::apply_chargen( u, choices( scen, prof, ",\"name\":\"" + b.first + "\"" ) );
+                const std::string r2 = fp3d::apply_chargen( u, "{\"template\":\"fp3d test\",\"name\":\"" + b.first +
+                                       "\"}" );
+                for( const std::string &r : { r1, r2 } ) {
+                    if( r.rfind( "the name can't contain", 0 ) != 0 || r.find( b.second ) == std::string::npos ) {
+                        seen += "[" + b.first + ": " + r + "]";
+                    }
+                }
+            }
+            check( seen.empty(), "names with /, \\, .. or control characters refused, with the reason", seen );
+            why = fp3d::apply_chargen( u, choices( scen, prof, ",\"name\":\"J. Smith\"" ) );
+            check( why.empty() && u.name == "J. Smith", "a name with one dot accepted", why );
+        }
         check( !fp3d::apply_chargen( u, "{\"template\":\"../fp3d test\"}" ).empty(), "template path refused" );
         check( !fp3d::apply_chargen( u, "{\"template\":\"nope\"}" ).empty(), "unknown template refused" );
         check( !fp3d::apply_chargen( u, choices( scen, prof, ",\"save_template\":\"../evil\"" ) ).empty(),
@@ -447,6 +471,23 @@ int main()
                                          opts, mods );
             check( w.empty() && mods_ordered( mods ) && mods.size() >= 3 && mods[1].str() == nodeps_mod &&
                    mods.back().str() == dep_mod, "core mod first, before mods picked ahead of it", w );
+        }
+
+        // A cancelled start deletes the world it made (fp3d::remove_new_world; the one this test booted): never while
+        // a character is saved in it, then once.
+        {
+            const std::string made = world_generator->active_world != nullptr ?
+                                     world_generator->active_world->world_name : "";
+            const fs::path dir = fs::u8path( PATH_INFO::savedir() ) / fs::u8path( made );
+            std::error_code ec;
+            write_file( dir / "someone.sav", "{}" );
+            const bool kept = !made.empty() && !fp3d::remove_new_world() && fs::is_directory( dir, ec );
+            fs::remove( dir / "someone.sav", ec );
+            const bool removed = fp3d::remove_new_world() && !fs::exists( dir, ec ) &&
+                                 !world_generator->has_world( made );
+            const bool once = !fp3d::remove_new_world();
+            check( kept && removed && once, "a cancelled start's world: kept with a save in it, else deleted, once",
+                   made );
         }
     } catch( const std::exception &e ) {
         std::printf( "error: %s\n", e.what() );

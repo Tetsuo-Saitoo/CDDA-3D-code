@@ -28,7 +28,9 @@
 #include "coords_fwd.h"
 #include "fp3d/bridge.h"
 
+class Character;
 class avatar;
+class item;
 class map;
 
 namespace fp3d
@@ -39,7 +41,7 @@ constexpr size_t max_heat_per_submap = 32;
 constexpr size_t max_cookware_per_submap = 16;
 constexpr size_t max_cookware_contents = 16;
 constexpr size_t max_recipe_matches = 32;
-constexpr int max_recipe_batch = 20;
+constexpr int max_recipe_batch = max_cook_batch;
 constexpr size_t max_match_missing = 8;
 constexpr size_t max_match_name_bytes = 128;
 
@@ -59,6 +61,24 @@ std::string match_recipes_json( avatar &u, uint64_t query_id, const item_ref &c,
 std::string run_recipe_query( uint64_t query_id, const item_ref &c, const ui_point &pos );
 // The refusal JSON with `error` (also used by the bridge for "too large" and "internal").
 std::string recipe_query_error_json( uint64_t query_id, uint64_t container, const std::string &error );
+// Sim side, for the `cook` item action (bridge.h): starts CDDA's craft `a.recipe` x `a.batch` from what the
+// container `a.item` lying on `a.pos` (the avatar's square or next to it) holds. The recipe must be one
+// match_recipes_json lists for it that can start, for this batch. The components are taken out of the container
+// only; the tools are the heat under it if it serves, else CDDA's pick from the crafting inventory (it may ask).
+// The craft lies at the avatar's feet (never on the fire, never in the hands) with item var `fp3d_cook_pot` = the
+// container's handle (the pot's cookware entry shows its progress), and CDDA's craft activity runs. The container
+// must lie on a lit heat source. When a craft it started for this container lies by the avatar (paused), that
+// craft goes on instead (`a.recipe` must name its recipe; `a.batch` isn't used). "" when started, else why not
+// (CDDA's words where it has them); nothing is used up then.
+std::string start_cooking( avatar &u, const item_action &a );
+// Sim side, from CDDA's craft activity (start and every turn): why the avatar's craft `craft` can't go on now,
+// "" when it can. A craft the `cook` action started goes on only while its container lies on a lit heat source,
+// on the avatar's square or one next to it; any other craft is never held up.
+std::string cook_craft_blocked( const Character &who, const item &craft );
+// Sim side, from CDDA's craft completion: the finished `result` of the avatar's craft `craft` goes into the
+// container the craft names, when that lies on the avatar's square or one next to it, as much as CDDA's pocket
+// rules let it hold. True when all of it went in; else `result` holds what is left for CDDA's own placement.
+bool cooked_into_pot( Character &who, const item &craft, item &result );
 // Sim side. How long the last match_recipes_json took (ms) and how many recipes it checked.
 double last_recipe_query_ms( size_t *checked = nullptr );
 } // namespace fp3d

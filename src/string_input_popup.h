@@ -254,6 +254,9 @@ class string_input_popup // NOLINT(cata-xy)
         const std::string &query_string( bool loop = true, bool draw_only = false );
         std::optional<tripoint_abs_omt> query_coordinate_abs_impl( bool loop = true,
                 bool draw_only = false );
+        // FP3D: asks the client for a whole number from lo to hi (a `number` request, text() as the default);
+        // nullopt and canceled() when cancelled. query_int, query_int64_t and edit( int ) use it while FP3D runs.
+        std::optional<int64_t> fp3d_query_number( int64_t lo, int64_t hi );
         /**@}*/
         /**
          * Whether the input box was canceled via the ESCAPE key (or similar)

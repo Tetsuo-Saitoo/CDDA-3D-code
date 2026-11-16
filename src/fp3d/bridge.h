@@ -31,6 +31,7 @@ enum class request_kind : int {
     chargen,      // create a character: `text` is the catalog JSON, the answer's `text` the choices JSON (chargen.h)
     shot,         // one projectile of a client-flown trigger pull: CDDA's rolled error; answered with `shot` (shot.h)
     swing,        // an aimed melee strike (origin: attacker, cursor: the creature struck); answered with `shot` (swing.h)
+    number,       // type a whole number from number_min to number_max (query_int, edit); answered with `number`
 };
 const char *kind_name( request_kind k );
 
@@ -58,6 +59,9 @@ struct ui_request {
     std::vector<std::string> actions;    // key, popup, target
     bool allow_cancel = true;
     int max_len = 0;                     // string
+    int64_t number_min = 0;              // number: the range (never beyond +-max_number_answer) and the default
+    int64_t number_max = 0;
+    int64_t number_default = 0;
     std::string mode;                    // target: look, zone, peek, fire, throw, reach, spell, ...
     std::string status;                  // target: "" = ok, bad_target, out_of_ammo, out_of_range
     ui_point origin;                     // direction, target: where the prompt is centred
@@ -106,6 +110,7 @@ struct ui_answer {
     std::string action;                  // key, popup, target
     int entry = -1;                      // menu, item_select
     std::string text;                    // string
+    std::optional<int64_t> number;       // number (any other kind: dropped); the asker checks the range
     std::vector<std::pair<int, int>> picks;  // item_multi: (entry id, count; 0 = all)
     std::optional<ui_point> pos;         // direction: relative (-1..1); target: absolute square
     std::optional<shot_answer> shot;     // target: where the client's own bullet went
@@ -122,6 +127,10 @@ constexpr size_t max_answer_text = 1024;
 // The chargen answer is JSON (traits, skills, name ...): a larger cap for that kind only.
 constexpr size_t max_answer_json = 16384;
 constexpr size_t max_answer_picks = 4096;
+// A number request's range never goes beyond this (2^53 - 1: exact in a float64, as the client's numbers are); an
+// answer outside the range is asked again with a status, this many times at most, then taken as cancel.
+constexpr int64_t max_number_answer = 9007199254740991;
+constexpr int max_number_asks = 8;
 constexpr size_t max_candidates = 256;
 
 bool active();
@@ -164,6 +173,12 @@ void answer( ui_answer a );
 // Either side. Wakes everyone; the sim thread unwinds with shutdown_signal at its next ask().
 void shutdown();
 bool is_shut_down();
+// Between two games of one process (no game is booting or running), client side: the channel as a fresh process
+// has it (no request, answer, queued action, query or save wanted; the default clock; not shut down), except that
+// request and query ids keep counting, so nothing from the last game is taken for something in the next.
+void reset_channel();
+// Game thread, between two games: its own per-request flags back to a fresh thread's.
+void reset_sim_thread_state();
 
 // Real-time clock (block D3). Turn-based (the default) waits for the player like CDDA. Real time gives each
 // turn 1 s / timescale of wall time: the sim waits out the rest of the turn, and a player who hasn't acted
@@ -225,8 +240,8 @@ size_t queued_actions();
 // unit of a stack counted by charges, CDDA's range, moves and dispersion). The square is one the avatar sees, on its
 // level, within its throw range, not its own. Worn items aren't thrown; one held flies from its hand, anything else
 // carried from an empty main hand or a free off hand. hand, container and pocket aren't used.
-// pour: pour the liquid out of the carried container `item` (or the carried liquid `item` out of its container),
-// with CDDA's liquid rules, to exactly one place: onto the square `pos` (the avatar's or one next to it; all of it)
+// pour: pour the liquid out of the container `item`, carried or lying on the avatar's square or one next to it (a pot
+// on its burner), or the carried liquid `item` out of its container, with CDDA's liquid rules, to exactly one place: onto the square `pos` (the avatar's or one next to it; all of it)
 // or into the container `container` (carried or on the avatar's square or one next to it, found by handle there;
 // `pocket` as for put; as much as fits, the rest stays). With `container` set, `pos` stays at (0, 0, 0) (not sent);
 // without it, `pocket` stays -1. hand isn't used.
@@ -239,7 +254,20 @@ size_t queued_actions();
 // main or off; refused for a worn item or a hand that holds something else: nothing is ever put away to make room.
 // consume: CDDA's eat, drink or first aid for the item `item` (carried, or lying where `take` could get it at `pos`),
 // or for the first thing in it CDDA would consume (a drink in its bottle): CDDA's own prompts, time and messages.
-enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume };
+// cook: start CDDA's craft `recipe` (batch `batch`) from what the container `item` lying on `pos` (the avatar's
+// square or one next to it) holds: the recipe must be one match_recipes lists for it that can start; the components
+// come out of the container only, the tools from CDDA's crafting inventory (the heat under the pot first) plus the
+// emptied container. The craft lies at the avatar's feet, linked to the container (cooking.h), and CDDA's craft
+// activity runs. The container must lie on a lit heat source: the craft stops when it leaves it or the heat goes out,
+// and `cook` with the same recipe makes it go on (one craft a container). What it makes goes into the container.
+// light: CDDA's fire starting on the square `pos` next to the avatar (the firestarter item use: its questions, time
+// and charges) with the carried item `item`, or with no item (uid 0, type 0) the quickest carried one that works now.
+// extinguish: CDDA's "Extinguish fire" of a fireplace: the fire in the fire furniture on `pos` (the avatar's square or
+// one next to it) is beaten out; needs something that bashes, carried or lying near. `item` stays empty (uid 0,
+// type 0). A fire anywhere else isn't put out by hand.
+enum class item_op : uint8_t {
+    take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume, cook, light, extinguish
+};
 // take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
 // fit), wielded, the off hand.
 enum class item_hand : uint8_t { pack, main, off };
@@ -251,7 +279,8 @@ constexpr uint64_t max_item_uid = ( uint64_t{ 1 } << 53 ) - 1;   // exact in a d
 constexpr uint16_t spot_scale = 1000;    // spots are permille of the square, 0 .. spot_scale - 1
 struct item_action {
     item_op op = item_op::take;
-    item_ref item;                       // the item to take, put, drop, unload, reload, clear, throw or pour from
+    item_ref item;                       // the item to take, put, drop, unload, reload, clear, throw or pour from;
+    // light: the firestarter or empty; extinguish: empty
     // take: the square the item lies on. drop: the square to put it on. put: the container's square, used
     // when the container isn't carried. unload: the item's square, used when it isn't carried. reload: the ammo's
     // square, used when the ammo isn't carried. throw: the square thrown at (required). pour: the square poured
@@ -278,13 +307,18 @@ struct item_action {
     uint8_t shelf = 0;
     // 0 = none. Else the client's own number for this action: an `item_result` event (events.h) says how it went.
     uint32_t tag = 0;
+    // cook only (empty and 1 for every other op): the recipe id (plain, 1 .. max_cook_recipe_bytes) and the batch.
+    std::string recipe;
+    int batch = 1;
 };
+constexpr size_t max_cook_recipe_bytes = 128;
+constexpr int max_cook_batch = 20;
 constexpr int max_item_pocket = 255;
 constexpr uint16_t max_item_yaw = 359;
 constexpr uint8_t max_item_shelf = 15;
 constexpr uint32_t max_item_tag = INT32_MAX;
-// Client side. False if a field is out of range, a pour names no target or two (container and pos), or the queue
-// is full.
+// Client side. False if a field is out of range, a pour names no target or two (container and pos), an item is
+// missing (only light may leave it out, extinguish must) or the queue is full.
 bool queue_item_action( const item_action &a );
 constexpr const char *item_action_name = "fp3d_item";
 // Sim side: the item action the bridge just answered `fp3d_item` with (once), nullopt if none.

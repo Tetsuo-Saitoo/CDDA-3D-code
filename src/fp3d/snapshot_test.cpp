@@ -32,10 +32,15 @@
 #include "map_scale_constants.h"
 #include "mapbuffer.h"
 #include "mapdata.h"
+#include "memory_fast.h"
 #include "monster.h"
+#include "npc.h"
+#include "overmapbuffer.h"
 #include "rng.h"
 #include "submap.h"
 #include "type_id.h"
+#include "units.h"
+#include "vehicle.h"
 #include "weather.h"
 #include "weather_type.h"
 
@@ -45,6 +50,8 @@ const mtype_id mon_dog( "mon_dog" );
 const mtype_id mon_zombie( "mon_zombie" );
 const ter_str_id ter_t_floor( "t_floor" );
 const ter_str_id ter_t_wall( "t_wall" );
+const vproto_id vehicle_prototype_none( "none" );
+const vpart_id vpart_frame( "frame" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
 
 int failures = 0;
@@ -465,6 +472,72 @@ int main()
             w.weather_override = WEATHER_NULL;
             w.set_nextweather( calendar::turn );
             w.update_weather();
+        }
+
+        // Names from a save or a mod are untrusted: an NPC's and a vehicle's come cleaned and capped. Last: the
+        // floor squares bump revisions.
+        {
+            const std::string hostile = "<color_red>Ann</color>\x01\x7f\n Lee" + std::string( 300, 'x' );
+            const auto plain = []( const std::string & s, size_t max ) {
+                return s.size() <= max && s.find( '<' ) == std::string::npos &&
+                       std::none_of( s.begin(), s.end(), []( char ch ) {
+                    return static_cast<unsigned char>( ch ) < 0x20 || ch == 0x7f;
+                } );
+            };
+            const tripoint_bub_ms npc_at = u.pos_bub() + tripoint_rel_ms( -2, 0, 0 );
+            here.ter_set( npc_at, ter_t_floor );
+            here.furn_set( npc_at, furn_str_id::NULL_ID() );
+            shared_ptr_fast<npc> guy = make_shared_fast<npc>();
+            guy->normalize();
+            guy->randomize();
+            guy->spawn_at_precise( here.get_abs( npc_at ) );
+            overmap_buffer.insert_npc( guy );
+            g->load_npcs();
+            guy->name = hostile;
+            const tripoint_bub_ms veh_at = u.pos_bub() + tripoint_rel_ms( 0, 3, 0 );
+            here.ter_set( veh_at, ter_t_floor );
+            here.furn_set( veh_at, furn_str_id::NULL_ID() );
+            vehicle *veh = here.add_vehicle( vehicle_prototype_none, veh_at, 0_degrees, 0, 0 );
+            if( veh != nullptr ) {
+                veh->install_part( here, point_rel_ms::zero, vpart_frame );
+                veh->name = hostile;
+                here.add_vehicle_to_cache( veh );
+            }
+            refresh_caches();
+            const std::shared_ptr<const fp3d::snapshot> named = timed_capture( ms );
+            const fp3d::creature_view *who = nullptr;
+            for( const fp3d::creature_view &c : named->creatures ) {
+                if( c.kind == 1 && c.uid == fp3d::creature_uid( *guy ) ) {
+                    who = &c;
+                }
+            }
+            check( who != nullptr && who->name.rfind( "Ann Lee", 0 ) == 0 && plain( who->name, 40 ),
+                   "an NPC's name, cleaned and capped", who ? who->name.substr( 0, 60 ) : "NPC not seen" );
+            bool others_unnamed = true;
+            for( const fp3d::creature_view &c : named->creatures ) {
+                others_unnamed = others_unnamed && ( c.kind == 1 || c.name.empty() );
+            }
+            check( others_unnamed, "no name for the player or monsters" );
+            const fp3d::vehicle_view *car = nullptr;
+            for( const fp3d::vehicle_view &v : named->vehicles ) {
+                if( veh != nullptr && v.pos.x == here.get_abs( veh_at ).x() && v.pos.y == here.get_abs( veh_at ).y() ) {
+                    car = &v;
+                }
+            }
+            check( car != nullptr && car->name.rfind( "Ann Lee", 0 ) == 0 && plain( car->name, 60 ),
+                   "a vehicle's name, cleaned and capped", car ? car->name.substr( 0, 80 ) : "vehicle not seen" );
+            std::ostringstream n_json;
+            fp3d::write_snapshot_json( n_json, *named, u.posz(), u.posz() );
+            const std::string nj = n_json.str();
+            const size_t npc_entry = nj.find( "\"kind\":1," );
+            const size_t name_at = nj.find( "\"name\":\"Ann Lee", npc_entry );
+            check( npc_entry != std::string::npos && name_at != std::string::npos &&
+                   nj.find( '}', npc_entry ) > name_at, "the NPC's name in the JSON" );
+            if( veh != nullptr ) {
+                here.destroy_vehicle( veh );
+            }
+            guy->die( &here, nullptr );
+            g->cleanup_dead();
         }
     } catch( const std::exception &e ) {
         std::printf( "error: %s\n", e.what() );

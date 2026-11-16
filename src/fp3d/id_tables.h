@@ -136,6 +136,8 @@ struct id_tables {
 void build_id_tables();
 // Either side: the newest tables (nullptr before the first build).
 std::shared_ptr<const id_tables> latest_id_tables();
+// Between two games: no tables until the next game's build (the generation keeps counting).
+void clear_id_tables();
 
 // Writes `t` plus every session table's names as JSON.
 void write_id_tables_json( std::ostream &out, const id_tables &t );

@@ -254,10 +254,30 @@ bool plain_text( const std::string &s, size_t max_bytes )
 }
 
 // A character name the game saves under, as the bridge's save_name_ok: plain text of at most max_name_bytes,
-// not starting with '#' (CDDA keeps such a name unencoded as the file name).
+// not starting with '#' (CDDA keeps such a name unencoded as the file name), no '/', '\' or "..".
 bool name_ok( const std::string &n )
 {
-    return plain_text( n, max_name_bytes ) && n.front() != '#';
+    return plain_text( n, max_name_bytes ) && n.front() != '#' && n.find_first_of( "/\\" ) == std::string::npos &&
+           n.find( ".." ) == std::string::npos;
+}
+
+// Input validation for a character name as the client sent it, before checked_name tidies it: why it is refused,
+// "" if it isn't.
+std::string typed_name_refusal( const std::string &raw )
+{
+    for( const char ch : raw ) {
+        const unsigned char c = static_cast<unsigned char>( ch );
+        if( c < 0x20 || c == 0x7f ) {
+            return "the name can't contain control characters";
+        }
+    }
+    if( raw.find_first_of( "/\\" ) != std::string::npos ) {
+        return "the name can't contain / or \\";
+    }
+    if( raw.find( ".." ) != std::string::npos ) {
+        return "the name can't contain ..";
+    }
+    return "";
 }
 
 // A character name read from a template file: name_ok, and no path characters or edge spaces either.
@@ -272,7 +292,7 @@ pool_type chosen_pool()
     return multi_pool() ? pool_type::MULTI_POOL : pool_type::FREEFORM;
 }
 
-// A name typed in the client: control characters dropped, cut to max_name_bytes on a character boundary and
+// A name typed in the client (typed_name_refusal passed): cut to max_name_bytes on a character boundary and
 // trimmed. The result still needs name_ok.
 std::string checked_name( const std::string &raw )
 {
@@ -721,7 +741,11 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
             if( !transfer ) {
                 u.forget_all_recipes();
             }
-            const std::string name = checked_name( jo.get_string( "name", "" ) );
+            const std::string typed = jo.get_string( "name", "" );
+            if( const std::string why = typed_name_refusal( typed ); !why.empty() ) {
+                return why;
+            }
+            const std::string name = checked_name( typed );
             if( !name.empty() ) {
                 u.name = name;
             } else if( !stored_name_ok( u.name ) ) {
@@ -880,7 +904,11 @@ std::string apply_chargen( avatar &u, const std::string &choices_json )
             return "height out of range";
         }
         u.set_base_height( height );
-        std::string name = checked_name( jo.get_string( "name", "" ) );
+        const std::string typed = jo.get_string( "name", "" );
+        if( const std::string why = typed_name_refusal( typed ); !why.empty() ) {
+            return why;
+        }
+        std::string name = checked_name( typed );
         if( name.empty() ) {
             u.pick_name();
             name = u.name;

@@ -34,6 +34,14 @@ void boot_world( const std::string &world_name, bool headless );
 void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless,
                          bool world_setup = false, bool replace = false );
 
+// Thrown when the client cancels a start (the world setup or the character creation): the game ends, nothing failed.
+struct start_cancelled {};
+
+// After a cancelled start: deletes the world the last boot_new_game_data made (fresh_world), if it is still a plain
+// folder right in the save folder with no character saved in it. Only that world, once; true if it was deleted.
+// Game thread, before end_game() (which forgets it, as the next boot does).
+bool remove_new_world();
+
 // The name of the world already using `world_name`'s folder, ignoring ASCII case (as Windows folders do): one CDDA
 // lists, or any entry of the save directory. nullopt when the name is free. Needs boot's paths and world list.
 std::optional<std::string> world_name_taken( const std::string &world_name );
@@ -71,6 +79,17 @@ bool has_start_terrain( const overmap &om, const start_location &loc );
 // caches free their textures (a crash), and inside DllMain it deadlocks on SDL's timer thread. Debug messages
 // afterwards only go to the log.
 void shutdown_world();
+
+// Several games in one process, one after another, as CDDA's own main menu plays them: on one game thread, which
+// keeps CDDA's window, options, fonts and tilesets from the first boot (a later boot skips making them; the folders
+// stay the first boot's). end_game() on the game thread once a game is over (ended, failed or unwound by a
+// shutdown): what CDDA's cleanup_at_end clears before its main menu (zones, the map and overmap buffers), the game
+// object, the state game::setup resets outside it (sounds, missions, messages, combat text) and FP3D's per-game
+// state on that thread. reset_for_next_game() on the client side before the next boot, while no game runs: the
+// bridge channel, events, published snapshot, held state, id tables, cheats and range info, as a fresh process has
+// them (ids and seqs keep counting). shutdown_world() still ends it all.
+void end_game();
+void reset_for_next_game();
 
 // Saves the game the client asked for (fp3d::request_save), on the sim thread at the main loop, and records the
 // result with note_saved(); the message log says how it went. Does nothing if no save was asked for.

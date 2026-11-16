@@ -41,6 +41,9 @@ std::optional<cheat> cheat_from_name( const std::string &name );
 // own debug switch); off at start. Turning it off drops requests not applied yet. Cheats already on stay on.
 void set_cheats_allowed( bool on );
 bool cheats_allowed();
+// Between two games: not allowed, nothing asked, no range operation or result, no kit given, nothing published as
+// on (seq and range operation ids keep counting).
+void reset_cheats();
 // Client side. Ask for a change at the main loop's next request; false when not allowed or after shutdown. The
 // first cheat turned on (or kit given) turns the game's achievements off, as CDDA's debug menu does.
 bool request_cheat( cheat c, bool on );

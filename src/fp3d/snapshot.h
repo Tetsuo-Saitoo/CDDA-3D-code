@@ -171,6 +171,7 @@ struct creature_view {
     uint8_t hp_frac = 0;                          // 0..255
     uint32_t wielded = 0;                         // itype index (characters) or 0
     uint8_t attitude = 1;                         // to the player: 0 hostile, 1 neutral, 2 friendly (player: 1)
+    std::string name;                             // NPCs: their name, cleaned and capped (client_text); else ""
 };
 
 struct vehicle_part_view {
@@ -364,8 +365,9 @@ constexpr size_t max_sheet_description_columns = 400;
 constexpr size_t max_sheet_id_bytes = 64;
 
 // The avatar's character sheet as JSON. Over `max_bytes`, descriptions are emptied from the end (effects first,
-// then bionics, traits, proficiencies, skills) and "truncated" is true; the lists stay whole. The result can still
-// be over `max_bytes` when the rest alone is (the bridge then answers "too large").
+// then bionics, traits, proficiencies, skills) and "truncated" is true. Still over, entries go from the ends of the
+// lists: effects, proficiencies being learned, known ones, traits, bionics, speed modifiers, skills. Only the
+// fixed fields left can still be over `max_bytes` (a few KB; the bridge then answers "too large").
 std::string run_character_query( uint64_t query_id, size_t max_bytes );
 std::string character_query_error_json( uint64_t query_id, const std::string &error );
 

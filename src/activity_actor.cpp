@@ -48,6 +48,7 @@
 #include "field_type.h"
 #include "flag.h"
 #include "flexbuffer_json.h"
+#include "fp3d/cooking.h" // FP3D:
 #include "fp3d/gun_faults.h" // FP3D:
 #include "fp3d/shot.h" // FP3D:
 #include "game.h"
@@ -4149,6 +4150,13 @@ bool craft_activity_actor::check_if_craft_okay( item_location &craft_item, Chara
 
     if( !craft->is_craft() ) {
         debugmsg( "ACT_CRAFT target '%s' is not a craft.  Aborting ACT_CRAFT.", craft->tname() );
+        return false;
+    }
+
+    // FP3D: what cooks in a pot goes on only while the pot is on its heat (fp3d/cooking.h)
+    const std::string off_heat = fp3d::cook_craft_blocked( crafter, *craft );
+    if( !off_heat.empty() ) {
+        crafter.add_msg_if_player( m_info, off_heat );
         return false;
     }
 

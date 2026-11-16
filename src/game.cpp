@@ -3026,7 +3026,10 @@ bool game::is_game_over()
             return false;
         }
         Messages::deactivate();
-        if( get_option<std::string>( "DEATHCAM" ) == "always" ) {
+        // FP3D: no deathcam (the client has none): the game ends.
+        if( fp3d::active() ) {
+            uquit = QUIT_DIED;
+        } else if( get_option<std::string>( "DEATHCAM" ) == "always" ) {
             uquit = QUIT_WATCH;
         } else if( get_option<std::string>( "DEATHCAM" ) == "ask" ) {
             uquit = query_yn( _( "Watch the last moments of your life…?" ) ) ?
@@ -3069,19 +3072,24 @@ void end_screen_data::draw_end_screen_ui()
 #if defined(WIN32) || defined(TILES)
     ctxt.set_timeout( 50 );
 #endif
-    end_screen_ui_impl p_impl;
+    std::string last_words;
+    // FP3D: no end screen (nobody can close it); the client shows the game's end itself.
+    if( !fp3d::active() ) {
+        end_screen_ui_impl p_impl;
 
-    while( true ) {
-        ui_manager::redraw_invalidated();
-        std::string action = ctxt.handle_input();
-        if( action == "TEXT.CONFIRM" || !p_impl.get_is_open() ) {
-            break;
+        while( true ) {
+            ui_manager::redraw_invalidated();
+            std::string action = ctxt.handle_input();
+            if( action == "TEXT.CONFIRM" || !p_impl.get_is_open() ) {
+                break;
+            }
         }
+        last_words = p_impl.text;
     }
     avatar &u = get_avatar();
     const bool is_suicide = g->uquit == QUIT_SUICIDE;
     get_event_bus().send<event_type::game_avatar_death>( u.getID(), u.name, u.male, is_suicide,
-            p_impl.text );
+            last_words );
 }
 
 void end_screen_ui_impl::draw_controls()
@@ -3156,6 +3164,12 @@ void game::bury_screen() const
 void game::death_screen()
 {
     gamemode->game_over();
+    // FP3D: none of the end screens (messages, diary, scores, epilogues): the game ends without asking the client
+    // anything. (The diary's text copy goes with its question: it is named after the character, the client's text.)
+    if( fp3d::active() ) {
+        follower_ids.clear();
+        return;
+    }
     Messages::display_messages();
     u.get_avatar_diary()->death_entry();
     show_scores_ui();
@@ -7945,7 +7959,8 @@ std::optional<std::vector<tripoint_bub_ms>> game::safe_route_to( Character &who,
     return shortest_route;
 }
 
-// FP3D: look_around for the bridge. Peeking's blind throw/fire (peek_action) isn't offered yet.
+// FP3D: look_around for the bridge. A peek offers CDDA's blind throws (peek_action) as the request's actions:
+// `throw_blind` (pick what to throw) and, while something is wielded, `throw_blind_wielded`. CDDA has no blind fire.
 static look_around_result fp3d_look_around( tripoint_bub_ms &center, const tripoint_bub_ms &start_point,
         bool select_zone, bool peeking )
 {
@@ -7961,9 +7976,24 @@ static look_around_result fp3d_look_around( tripoint_bub_ms &center, const tripo
             req.candidates.push_back( fp3d::to_ui_point( critter->pos_abs() ) );
         }
     }
+    if( peeking ) {
+        req.actions.emplace_back( "throw_blind" );
+        if( u.get_wielded_item() ) {
+            req.actions.emplace_back( "throw_blind_wielded" );
+        }
+    }
     look_around_result result;
     const fp3d::ui_answer a = fp3d::ask( req );
-    if( a.cancel || !a.pos ) {
+    if( a.cancel ) {
+        return result;
+    }
+    // Only an action this request offered; anything else is ignored.
+    if( !a.action.empty() &&
+        std::find( req.actions.begin(), req.actions.end(), a.action ) != req.actions.end() ) {
+        result.peek_action = a.action == "throw_blind" ? PA_BLIND_THROW : PA_BLIND_THROW_WIELDED;
+        return result;
+    }
+    if( !a.pos ) {
         return result;
     }
     const tripoint_bub_ms picked = here.get_bub( fp3d::to_abs_ms( *a.pos ) );

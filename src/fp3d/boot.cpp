@@ -11,21 +11,29 @@
 #include "avatar.h"
 #include "cached_options.h"
 #include "calendar.h"
+#include "clzones.h"
 #include "color.h"
 #include "cursesdef.h"
 #include "debug.h"
 #include "enums.h"
 #include "filesystem.h"
 #include "fp3d/bridge.h"
+#include "fp3d/cheats.h"
 #include "fp3d/data_check.h"
+#include "fp3d/events.h"
 #include "fp3d/game_access.h"
+#include "fp3d/held.h"
 #include "fp3d/id_tables.h"
+#include "fp3d/shot.h"
+#include "fp3d/snapshot.h"
 #include "fp3d/test_range.h"
 #include "game.h"
 #include "game_constants.h"
 #include "map.h"
 #include "map_scale_constants.h"
+#include "mapbuffer.h"
 #include "messages.h"
+#include "mission.h"
 #include "options.h"
 #include "output.h"
 #include "overmap.h"
@@ -33,6 +41,7 @@
 #include "path_info.h"
 #include "rng.h"
 #include "scenario.h"
+#include "sounds.h"
 #include "start_location.h"
 #include "type_id.h"
 #include "weather.h"
@@ -47,6 +56,10 @@ namespace fp3d
 {
 
 static bool paths_set = false;
+// CDDA's window, options, fonts and tilesets are made (game thread; see end_game in boot.h).
+static bool interface_up = false;
+// The world the last boot_new_game_data made, for remove_new_world ("" if it made none; game thread).
+static std::string new_world;
 
 void init_paths( const std::string &base_path, const std::string &user_dir )
 {
@@ -77,8 +90,11 @@ void boot_common( bool headless )
         // and then initialises and loads the options itself.
         FULL_SCREEN_WIDTH = EVEN_MINIMUM_TERM_WIDTH;
         FULL_SCREEN_HEIGHT = EVEN_MINIMUM_TERM_HEIGHT;
-        note_boot_step( "Starting SDL, options and tilesets" );
-        catacurses::init_interface();
+        if( !interface_up ) {
+            note_boot_step( "Starting SDL, options and tilesets" );
+            catacurses::init_interface();
+            interface_up = true;
+        }
         // With animations on, the main input loop polls on a 125 ms timer instead of blocking.
         for( const char *opt : { "ANIMATIONS", "ANIMATION_RAIN", "ANIMATION_SCT", "AUTOSAVE" } ) {
             if( get_options().has_option( opt ) ) {
@@ -106,6 +122,10 @@ void boot_common( bool headless )
     // A range (and its AI freeze) belongs to the game booted with it, not to the next one.
     reset_test_range();
 
+    // A game left from an earlier boot goes first: never two at once (its destructor may reach `g`).
+    if( g != nullptr ) {
+        end_game();
+    }
     g = std::make_unique<game>();
     g->new_game = true;
     g->load_static_data();
@@ -188,12 +208,57 @@ bool owned_world( const std::string &world_name )
     return fs::symlink_status( dir / owned_world_marker, ec ).type() == fs::file_type::regular && !ec;
 }
 
+bool remove_new_world()
+{
+    namespace fs = std::filesystem;
+    const std::string name = new_world;
+    if( name.empty() || world_generator == nullptr || !world_generator->has_world( name ) ) {
+        return false;
+    }
+    const WORLD *world = world_generator->get_world( name );
+    if( world == nullptr || !world->world_saves.empty() ) {
+        return false;
+    }
+    std::error_code ec;
+    const fs::path saves = fs::canonical( fs::u8path( PATH_INFO::savedir() ), ec );
+    if( ec ) {
+        return false;
+    }
+    // A plain folder (not a link) right in the save folder: the one boot made, nothing it points elsewhere.
+    const fs::path dir = fs::u8path( PATH_INFO::savedir() ) / fs::u8path( name );
+    if( fs::symlink_status( dir, ec ).type() != fs::file_type::directory || ec ) {
+        return false;
+    }
+    const fs::path real = fs::canonical( dir, ec );
+    if( ec || real.parent_path() != saves || real.filename() != fs::u8path( name ) ) {
+        return false;
+    }
+    // The folder delete_world removes is that one.
+    const fs::path cdda_dir = fs::canonical( world->folder_path().get_unrelative_path(), ec );
+    if( ec || cdda_dir != real ) {
+        return false;
+    }
+    // No character saved in it, as CDDA counts them (a .sav file), whatever world_saves says.
+    for( fs::directory_iterator it( dir, ec ), end; !ec && it != end; it.increment( ec ) ) {
+        if( it->path().extension() == ".sav" ) {
+            return false;
+        }
+    }
+    if( ec ) {
+        return false;
+    }
+    new_world.clear();
+    world_generator->delete_world( name, true );
+    return fs::symlink_status( dir, ec ).type() == fs::file_type::not_found;
+}
+
 void boot_new_game_data( const std::string &world_name, bool fresh_world, bool headless, bool world_setup,
                          bool replace )
 {
     boot_common( headless );
     // As CDDA's main menu: core data (option sliders among it) before a world is made or picked.
     g->load_core_data();
+    new_world.clear();
     WORLD *world = nullptr;
     if( fresh_world ) {
         // A new world gets a folder of its own; only FP3D's throwaway worlds are replaced: by exact name, and
@@ -215,7 +280,7 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
         if( world_setup ) {
             world = run_world_setup( name );
             if( world == nullptr ) {
-                throw std::runtime_error( "world creation cancelled" );
+                throw start_cancelled();
             }
         } else {
             world = world_generator->make_new_world( name, { mod_id( "dda" ) } );
@@ -223,6 +288,7 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
                 throw std::runtime_error( "make_new_world failed" );
             }
         }
+        new_world = name;
         if( replacing ) {
             namespace fs = std::filesystem;
             const fs::path dir = fs::u8path( PATH_INFO::savedir() ) / fs::u8path( name );
@@ -245,8 +311,12 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
         }
     }
     world_generator->set_active_world( world );
+    // The world's calendar settings, as game::setup sets them (a world played before in this process may differ).
     calendar::set_eternal_season( get_option<bool>( "ETERNAL_SEASON" ) );
     calendar::set_season_length( get_option<int>( "SEASON_LENGTH" ) );
+    calendar::set_eternal_night( get_option<std::string>( "ETERNAL_TIME_OF_DAY" ) == "night" );
+    calendar::set_eternal_day( get_option<std::string>( "ETERNAL_TIME_OF_DAY" ) == "day" );
+    calendar::set_location( get_option<float>( "LATITUDE" ), get_option<float>( "LONGITUDE" ) );
 
     prepare_data_check( world->active_mod_order );
     g->load_world_modfiles();
@@ -346,6 +416,35 @@ start_location_id nearest_random_start( const scenario &scen, const std::optiona
         }
     }
     return scen.random_start_location();
+}
+
+void end_game()
+{
+    reset_sim_thread_state();
+    clear_shot_plan();
+    new_world.clear();
+    if( g != nullptr ) {
+        zone_manager::get_manager().clear();
+        MAPBUFFER.clear();
+        overmap_buffer.clear();
+        g.reset();
+    }
+    sounds::reset_sounds();
+    mission::clear_all();
+    Messages::clear_messages();
+    SCT.vSCT.clear();
+    reset_snapshots();
+}
+
+void reset_for_next_game()
+{
+    reset_channel();
+    reset_events();
+    publish_snapshot( nullptr );
+    clear_held();
+    clear_id_tables();
+    reset_cheats();
+    clear_range_info();
 }
 
 void shutdown_world()
