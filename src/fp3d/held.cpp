@@ -569,4 +569,11 @@ held_view latest_held()
     std::lock_guard<std::mutex> lk( held_mutex );
     return held_latest;
 }
+
+void clear_held()
+{
+    std::lock_guard<std::mutex> lk( held_mutex );
+    held_latest = held_view();
+    held_latest.seq = ++held_seq;
+}
 } // namespace fp3d

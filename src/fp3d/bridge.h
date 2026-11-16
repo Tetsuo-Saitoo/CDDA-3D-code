@@ -164,6 +164,12 @@ void answer( ui_answer a );
 // Either side. Wakes everyone; the sim thread unwinds with shutdown_signal at its next ask().
 void shutdown();
 bool is_shut_down();
+// Between two games of one process (no game is booting or running), client side: the channel as a fresh process
+// has it (no request, answer, queued action, query or save wanted; the default clock; not shut down), except that
+// request and query ids keep counting, so nothing from the last game is taken for something in the next.
+void reset_channel();
+// Game thread, between two games: its own per-request flags back to a fresh thread's.
+void reset_sim_thread_state();
 
 // Real-time clock (block D3). Turn-based (the default) waits for the player like CDDA. Real time gives each
 // turn 1 s / timescale of wall time: the sim waits out the rest of the turn, and a player who hasn't acted

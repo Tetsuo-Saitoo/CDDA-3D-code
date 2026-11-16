@@ -11,21 +11,29 @@
 #include "avatar.h"
 #include "cached_options.h"
 #include "calendar.h"
+#include "clzones.h"
 #include "color.h"
 #include "cursesdef.h"
 #include "debug.h"
 #include "enums.h"
 #include "filesystem.h"
 #include "fp3d/bridge.h"
+#include "fp3d/cheats.h"
 #include "fp3d/data_check.h"
+#include "fp3d/events.h"
 #include "fp3d/game_access.h"
+#include "fp3d/held.h"
 #include "fp3d/id_tables.h"
+#include "fp3d/shot.h"
+#include "fp3d/snapshot.h"
 #include "fp3d/test_range.h"
 #include "game.h"
 #include "game_constants.h"
 #include "map.h"
 #include "map_scale_constants.h"
+#include "mapbuffer.h"
 #include "messages.h"
+#include "mission.h"
 #include "options.h"
 #include "output.h"
 #include "overmap.h"
@@ -33,6 +41,7 @@
 #include "path_info.h"
 #include "rng.h"
 #include "scenario.h"
+#include "sounds.h"
 #include "start_location.h"
 #include "type_id.h"
 #include "weather.h"
@@ -47,6 +56,8 @@ namespace fp3d
 {
 
 static bool paths_set = false;
+// CDDA's window, options, fonts and tilesets are made (game thread; see end_game in boot.h).
+static bool interface_up = false;
 
 void init_paths( const std::string &base_path, const std::string &user_dir )
 {
@@ -77,8 +88,11 @@ void boot_common( bool headless )
         // and then initialises and loads the options itself.
         FULL_SCREEN_WIDTH = EVEN_MINIMUM_TERM_WIDTH;
         FULL_SCREEN_HEIGHT = EVEN_MINIMUM_TERM_HEIGHT;
-        note_boot_step( "Starting SDL, options and tilesets" );
-        catacurses::init_interface();
+        if( !interface_up ) {
+            note_boot_step( "Starting SDL, options and tilesets" );
+            catacurses::init_interface();
+            interface_up = true;
+        }
         // With animations on, the main input loop polls on a 125 ms timer instead of blocking.
         for( const char *opt : { "ANIMATIONS", "ANIMATION_RAIN", "ANIMATION_SCT", "AUTOSAVE" } ) {
             if( get_options().has_option( opt ) ) {
@@ -106,6 +120,10 @@ void boot_common( bool headless )
     // A range (and its AI freeze) belongs to the game booted with it, not to the next one.
     reset_test_range();
 
+    // A game left from an earlier boot goes first: never two at once (its destructor may reach `g`).
+    if( g != nullptr ) {
+        end_game();
+    }
     g = std::make_unique<game>();
     g->new_game = true;
     g->load_static_data();
@@ -245,8 +263,12 @@ void boot_new_game_data( const std::string &world_name, bool fresh_world, bool h
         }
     }
     world_generator->set_active_world( world );
+    // The world's calendar settings, as game::setup sets them (a world played before in this process may differ).
     calendar::set_eternal_season( get_option<bool>( "ETERNAL_SEASON" ) );
     calendar::set_season_length( get_option<int>( "SEASON_LENGTH" ) );
+    calendar::set_eternal_night( get_option<std::string>( "ETERNAL_TIME_OF_DAY" ) == "night" );
+    calendar::set_eternal_day( get_option<std::string>( "ETERNAL_TIME_OF_DAY" ) == "day" );
+    calendar::set_location( get_option<float>( "LATITUDE" ), get_option<float>( "LONGITUDE" ) );
 
     prepare_data_check( world->active_mod_order );
     g->load_world_modfiles();
@@ -346,6 +368,34 @@ start_location_id nearest_random_start( const scenario &scen, const std::optiona
         }
     }
     return scen.random_start_location();
+}
+
+void end_game()
+{
+    reset_sim_thread_state();
+    clear_shot_plan();
+    if( g != nullptr ) {
+        zone_manager::get_manager().clear();
+        MAPBUFFER.clear();
+        overmap_buffer.clear();
+        g.reset();
+    }
+    sounds::reset_sounds();
+    mission::clear_all();
+    Messages::clear_messages();
+    SCT.vSCT.clear();
+    reset_snapshots();
+}
+
+void reset_for_next_game()
+{
+    reset_channel();
+    reset_events();
+    publish_snapshot( nullptr );
+    clear_held();
+    clear_id_tables();
+    reset_cheats();
+    clear_range_info();
 }
 
 void shutdown_world()
