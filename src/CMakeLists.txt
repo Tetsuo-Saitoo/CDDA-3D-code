@@ -20,14 +20,12 @@ list(REMOVE_ITEM CATACLYSM_DDA_SOURCES ${MAIN_CPP} ${MESSAGES_CPP})
 file(GLOB CATACLYSM_DDA_HEADERS ${CMAKE_CURRENT_SOURCE_DIR}/*.h)
 
 # Get GIT version strings
+# FP3D: on every build, not only when version.h is missing (an incremental build reported an old rev).
+# version.cmake rewrites version.h only when the version changed, so an unchanged rev rebuilds nothing.
 add_custom_target(
         get_version
-        DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/version.h
-        WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-
-add_custom_command(
-        OUTPUT ${CMAKE_CURRENT_SOURCE_DIR}/version.h
         COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/version.cmake
+        BYPRODUCTS ${CMAKE_CURRENT_SOURCE_DIR}/version.h
         WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 # Build tiles version if requested
