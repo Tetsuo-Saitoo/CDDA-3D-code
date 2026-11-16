@@ -237,7 +237,9 @@ size_t queued_actions();
 // spot: only how the lying item `item` rests on its square `pos` changes (`spot` required, the pose with it).
 // hold: the carried item `item` goes into the main hand (CDDA's wield and its cost) or the off hand (held.h), `hand`
 // main or off; refused for a worn item or a hand that holds something else: nothing is ever put away to make room.
-enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold };
+// consume: CDDA's eat, drink or first aid for the item `item` (carried, or lying where `take` could get it at `pos`),
+// or for the first thing in it CDDA would consume (a drink in its bottle): CDDA's own prompts, time and messages.
+enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume };
 // take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
 // fit), wielded, the off hand.
 enum class item_hand : uint8_t { pack, main, off };

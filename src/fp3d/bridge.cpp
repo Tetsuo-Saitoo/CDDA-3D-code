@@ -508,7 +508,7 @@ bool queue_item_action( const item_action &a )
     const bool op_ok = a.op == item_op::take || a.op == item_op::put || a.op == item_op::drop ||
                        a.op == item_op::unload || a.op == item_op::reload || a.op == item_op::clear ||
                        a.op == item_op::throw_ || a.op == item_op::pour || a.op == item_op::place ||
-                       a.op == item_op::spot || a.op == item_op::hold;
+                       a.op == item_op::spot || a.op == item_op::hold || a.op == item_op::consume;
     const bool hand_ok = a.hand == item_hand::pack || a.hand == item_hand::main || a.hand == item_hand::off;
     // pour: exactly one target. Into a container: a whole ref, and no square (pos left at 0, 0, 0). Onto a square:
     // no container at all (uid 0, type 0) and no pocket.
