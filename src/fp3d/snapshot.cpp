@@ -44,6 +44,7 @@
 #include "item.h"
 #include "item_location.h"
 #include "item_pocket.h"
+#include "itype.h"
 #include "json.h"
 #include "lightmap.h"
 #include "line.h"
@@ -561,6 +562,15 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
                 g.faults.push_back( f.str() );
             }
         }
+        // item::gun_noise's own test: a mod that takes noise off (loudness_modifier < 0) or scales it down
+        // (loudness_multiplier < 1). gunmods() lists built-in mods too (an integral suppressor, hk_mp5sd).
+        for( const item *mod : w->gunmods() ) {
+            if( mod != nullptr && mod->type->gunmod &&
+                ( mod->type->gunmod->loudness < 0 || mod->type->gunmod->loudness_multiplier < 1.0f ) ) {
+                g.suppressed = true;
+                break;
+            }
+        }
         pv.wielded_gun = std::move( g );
     }
     for( const effect &e : u.get_effects() ) {
@@ -1058,6 +1068,9 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
             jo.write( f );
         }
         jo.end_array();
+        if( g.suppressed ) {
+            jo.member( "suppressed", true );
+        }
         jo.end_object();
     }
     jo.member( "mood" );

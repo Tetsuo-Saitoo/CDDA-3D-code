@@ -54,6 +54,8 @@
 #include "field_type.h"
 #include "fp3d/boot.h"
 #include "fp3d/bridge.h"
+#include "fp3d/cheats.h"
+#include "fp3d/events.h"
 #include "fp3d/game_access.h"
 #include "fp3d/snapshot.h"
 #include "fp3d/test_range.h"
@@ -67,6 +69,7 @@
 #include "mtype.h"
 #include "npc.h"
 #include "path_info.h"
+#include "player_activity.h"
 #include "point.h"
 #include "string_formatter.h"
 #include "trap.h"
@@ -107,6 +110,8 @@ void before_ask()
     if( j ) {
         j();
     }
+    // As the client's hook (bridge/src/sim_session.cpp): range ops a check asked for (the weather cheat).
+    fp3d::run_range_requests();
     fp3d::capture_range_info();
     // As the client's hook: the turn times below include a snapshot per request.
     const auto t = std::chrono::steady_clock::now();
@@ -2154,6 +2159,112 @@ size_t check_reload()
     return pick;
 }
 
+// The weather cheat in a range game (fp3d/cheats.h range_op_kind::weather, run by the hook as the bridge runs it): a
+// lightning storm and a wind replace the range's clear sky and stay over turns, still at 20 C; the flash comes as a
+// lightning event within a bounded wait (CDDA's 1 in 600 a turn while it storms: waits of 20 minutes, at most 12, so
+// about 1 in 3e10 to see none if every wait runs its full 20 minutes); wind -1 keeps the range's still air; and ""
+// gives back the range's own weather (weather_wrong: 20 C, a clear sky, no wind).
+void check_weather_cheat()
+{
+    std::printf( "weather cheat:\n" );
+    const auto weather_op = []( const std::string & id, int wind ) {
+        fp3d::range_op op;
+        op.kind = fp3d::range_op_kind::weather;
+        op.weather = id;
+        op.wind = wind;
+        return op;
+    };
+    // The op's result once the hook ran it (a turn of waiting gets it there).
+    const auto run_op = []( const fp3d::range_op & op ) {
+        const uint64_t id = fp3d::request_range_op( op );
+        std::string result = id == 0 ? "(not queued)" : "(no result)";
+        if( id != 0 && !act( "pause" ) ) {
+            result = "(no main-loop request)";
+        }
+        for( const fp3d::range_op_result &r : fp3d::latest_range_results() ) {
+            if( id != 0 && r.id == id ) {
+                result = r.error;
+            }
+        }
+        return result;
+    };
+    // What isn't the storm and wind asked for, at 20 C ("" when all hold; sim thread).
+    const auto storm_wrong = []( int wind ) {
+        const weather_manager &w = get_weather_const();
+        std::string why;
+        if( w.weather_override.str() != "lightning" || w.weather_id.str() != "lightning" ) {
+            why += "weather " + w.weather_id.str() + ", override " + w.weather_override.str() + "; ";
+        }
+        if( !w.windspeed_override || *w.windspeed_override != wind || w.windspeed != wind ) {
+            why += "wind " + std::to_string( w.windspeed ) + ( w.windspeed_override ? "" : ", no override" ) + "; ";
+        }
+        if( !w.forced_temperature ||
+            std::fabs( units::to_kelvin( *w.forced_temperature ) - units::to_kelvin( fp3d::range_temperature ) ) > 0.01f ) {
+            why += "temperature not fixed at 20 C";
+        }
+        return why;
+    };
+    std::vector<fp3d::event> evs;
+    fp3d::set_cheats_allowed( true );
+    fp3d::set_events_enabled( true );
+    fp3d::drain_events( evs );
+    evs.clear();
+
+    const std::string set = run_op( weather_op( "lightning", 10 ) );
+    check( set.empty(), "weather cheat: a lightning storm and 10 mph wind in a range game", ok_or( set ) );
+    const bool turns = act( "pause" ) && act( "pause" ) && act( "pause" );
+    std::string storm = "not run";
+    on_sim( [&] {
+        storm = storm_wrong( 10 );
+    } );
+    check( turns && storm.empty(), "weather cheat: the storm and wind stay over turns, still 20 C", ok_or( storm ) );
+
+    size_t flashes = 0;
+    int waits = 0;
+    int64_t waited_turns = 0;
+    int z = INT_MIN;
+    bool waited = true;
+    while( flashes == 0 && waits < 12 && waited ) {
+        waits++;
+        time_point start = calendar::turn_zero;
+        waited = on_sim( [&] {
+            start = calendar::turn;
+            z = get_avatar().posz();
+            get_avatar().assign_activity( player_activity( activity_id( "ACT_WAIT" ),
+                                          100 * to_turns<int>( 20_minutes ), 0 ) );
+        } ) && act( "pause", 180000 ).has_value();
+        on_sim( [&] {
+            waited_turns += to_turns<int64_t>( calendar::turn - start );
+        } );
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            flashes += e.kind == fp3d::event_kind::lightning ? 1 : 0;
+        }
+        evs.clear();
+    }
+    check( flashes > 0, "weather cheat: a flash comes as a lightning event", std::to_string( flashes ) +
+           " flashes in " + std::to_string( waits ) + " waits, " + std::to_string( waited_turns ) + " turns, z " +
+           std::to_string( z ) );
+
+    const std::string still = run_op( weather_op( "lightning", -1 ) );
+    storm = "not run";
+    on_sim( [&] {
+        storm = storm_wrong( 0 );
+    } );
+    check( still.empty() && storm.empty(), "weather cheat: wind -1 keeps the range's still air",
+           ok_or( still + storm ) );
+    const std::string back = run_op( weather_op( "", -1 ) );
+    std::string wrong = "not run";
+    on_sim( [&] {
+        wrong = weather_wrong();
+    } );
+    check( back.empty() && wrong.empty(), "weather cheat: \"\" gives back 20 C, a clear sky and no wind",
+           ok_or( back + wrong ) );
+    fp3d::set_events_enabled( false );
+    fp3d::drain_events( evs );
+    fp3d::set_cheats_allowed( false );
+}
+
 namespace fs = std::filesystem;
 
 // The marker file boot puts in the worlds it makes (fp3d/boot.h), here or a folder named like it.
@@ -2427,6 +2538,7 @@ int main( int argc, char **argv )
     if( all_zones ) {
         check_all_zones();
     }
+    check_weather_cheat();
     check_resume_refusals( check_reload() );
 
     fp3d::shutdown();

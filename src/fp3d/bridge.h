@@ -142,8 +142,22 @@ bool next_is_timed();
 // A request asked from inside the hook (a popup) is never the timed one.
 bool in_timed_hook();
 
-// Client side. Returns the pending request with an id above `newer_than`, waiting up to timeout_ms;
-// nullopt on timeout or shutdown.
+// How many times longer this build runs: ThreadSanitizer slows the sim 5 to 15 times (B5's TSan run of the fork
+// tests), so wait_request and the tests' wall-clock limits stretch by this much there; 1 in every other build.
+#if defined( __SANITIZE_THREAD__ )
+constexpr int slow_build = 15;
+#elif defined( __has_feature )
+#if __has_feature( thread_sanitizer )
+constexpr int slow_build = 15;
+#else
+constexpr int slow_build = 1;
+#endif
+#else
+constexpr int slow_build = 1;
+#endif
+
+// Client side. Returns the pending request with an id above `newer_than`, waiting up to timeout_ms (times
+// slow_build); nullopt on timeout or shutdown.
 std::optional<ui_request> wait_request( int timeout_ms, uint64_t newer_than = 0 );
 // Client side. Answers the pending request; ignored if `a.id` doesn't match it.
 void answer( ui_answer a );

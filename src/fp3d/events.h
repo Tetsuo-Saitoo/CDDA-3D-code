@@ -18,6 +18,7 @@
 
 class Character;
 class Creature;
+class item;
 class map;
 struct dealt_damage_instance;
 struct weakpoint;
@@ -26,10 +27,10 @@ namespace fp3d
 {
 
 enum class event_kind : uint8_t {
-    sound, message, attack, damage, projectile, explosion, death, anim, turn_end, lightning, item_result
+    sound, message, attack, damage, projectile, explosion, death, anim, turn_end, lightning, item_result, misfire
 };
 // How many kinds there are (tables indexed by kind).
-constexpr size_t event_kind_count = static_cast<size_t>( event_kind::item_result ) + 1;
+constexpr size_t event_kind_count = static_cast<size_t>( event_kind::misfire ) + 1;
 
 struct event {
     event_kind kind = event_kind::turn_end;
@@ -86,6 +87,9 @@ void on_projectile( const map &here, const Creature *shooter, const std::vector<
 // Radius 0 = computed from `area`.
 void on_explosion( const tripoint_bub_ms &centre, int radius, const std::vector<tripoint_bub_ms> &area,
                    const std::string &kind );
+// The kind of a spell's area event: "spell:<damage type id>" when the id is 1-32 bytes of printable ASCII (it is
+// JSON data, a mod's may hold anything), else "spell".
+std::string spell_explosion_kind( const std::string &damage_type );
 // The item behind explosions started in this scope (a grenade, C4, a rocket's ammo); explosion events carry
 // its itype index in `detail` (0 = unknown, e.g. a vehicle or a monster).
 class explosion_item_scope
@@ -109,6 +113,10 @@ void on_lightning();
 // An item action that carried a tag (bridge.h item_action) has run: `uid` is the item's handle (not a creature),
 // `detail` the tag, `amount` 1 done or 0 refused, `text` why it was refused ("" when done or when nothing said why).
 void on_item_result( uint64_t item_uid, uint32_t tag, bool done, const std::string &why );
+// A trigger pull at which no round went off: CDDA's handle_gun_damage refused the shot (ranged.cpp fire_gun: a
+// misfire from dirt or water, a malfunction, or a jam it set). `uid` the shooter, `pos` its square, `type` the
+// gun's itype, `detail` 1 a misfire or malfunction, 2 the gun is jammed now. Sent when the player sees the shooter.
+void on_misfire( const Character &shooter, const item &gun );
 
 } // namespace fp3d
 

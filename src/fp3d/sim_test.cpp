@@ -1659,7 +1659,7 @@ double ms_since( std::chrono::steady_clock::time_point t )
 bool realtime_checks( fp3d::ui_request &req )
 {
     bool ok = true;
-    fp3d::set_timescale( 4.0 );
+    fp3d::set_timescale( 4.0 / fp3d::slow_build );   // 250 ms turns, times slow_build
     fp3d::set_clock_mode( fp3d::clock_mode::real_time );
     std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
     for( int i = 0; i < 3; i++ ) {
@@ -1671,10 +1671,12 @@ bool realtime_checks( fp3d::ui_request &req )
             return false;
         }
         // A turn is 250 ms at this timescale: never faster (paced), but a loaded machine (parallel builds) may be
-        // slower, so the upper bound is loose and a slow step may have let a turn or two more pass.
+        // slower, so the upper bound is loose and a slow step may have let a turn or two more pass. A slow build
+        // (TSan) has turns longer than their slot, so it checks no lower bound.
         const int64_t turns = next->turn - req.turn;
-        const bool step_ok = turns >= 1 && ms >= 150 && turns <= 2 + static_cast<int64_t>( ms / 250 ) &&
-                             ms <= 10000;
+        const double turn_ms = 250.0 * fp3d::slow_build;
+        const bool step_ok = turns >= 1 && ( fp3d::slow_build > 1 || ms >= 150 ) &&
+                             turns <= 2 + static_cast<int64_t>( ms / turn_ms ) && ms <= 10000.0 * fp3d::slow_build;
         std::printf( "    real time: turn %lld -> %lld after %.0f ms %s\n", static_cast<long long>( req.turn ),
                      static_cast<long long>( next->turn ), ms, step_ok ? "ok" : "BAD" );
         ok = ok && step_ok;
@@ -1684,7 +1686,7 @@ bool realtime_checks( fp3d::ui_request &req )
     spawn_zombie = true; // placed by the sim right before its next request
     t = std::chrono::steady_clock::now();
     // Up to 10 s: on a loaded machine the game thread may be busy for seconds (an overmap loading, say).
-    while( !fp3d::get_clock().paused && ms_since( t ) < 10000 ) {
+    while( !fp3d::get_clock().paused && ms_since( t ) < 10000 * fp3d::slow_build ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, req.id ) ) {
             req = *next;
         }
@@ -1700,7 +1702,7 @@ bool realtime_checks( fp3d::ui_request &req )
     const int64_t turn_at_pause = req.turn;
     int while_paused = 0;
     t = std::chrono::steady_clock::now();
-    while( ms_since( t ) < 750 ) {
+    while( ms_since( t ) < 750 * fp3d::slow_build ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, req.id ) ) {
             while_paused++;
             ok = ok && next->paused && next->turn <= turn_at_pause + 1;
@@ -1905,7 +1907,7 @@ static bool run_siphon_checks()
     fp3d::queue_action( "fp3d_use_UP" );
     std::vector<int64_t> levels;
     std::optional<fp3d::ui_request> done;
-    while( !done && std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 40 ) ) {
+    while( !done && std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 40 * fp3d::slow_build ) ) {
         done = fp3d::wait_request( 200, r->id );
         h = fp3d::latest_held();
         if( h.activity == "ACT_FILL_LIQUID" && ( levels.empty() || levels.back() != h.off.ml ) ) {
@@ -2096,7 +2098,7 @@ static bool run_shoot_checks()
     const auto t0 = std::chrono::steady_clock::now();
     std::optional<fp3d::ui_request> cur = fp3d::wait_request( 20000, r->id );
     while( cur && !cur->timed && targets < 20 && others < 20 &&
-           std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 60 ) ) {
+           std::chrono::steady_clock::now() - t0 < std::chrono::seconds( 60 * fp3d::slow_build ) ) {
         fp3d::ui_answer a;
         a.id = cur->id;
         std::string note;
@@ -2639,7 +2641,7 @@ static bool run_cooking_checks()
             return std::string( "refused" );
         }
         const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
-        while( ms_since( t0 ) < 20000 ) {
+        while( ms_since( t0 ) < 20000 * fp3d::slow_build ) {
             if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
                 return *res;
             }
@@ -2976,6 +2978,7 @@ static bool run_combat_checks()
         std::string gun = "glock_19";
         std::string mode;           // gun mode, "" = its default
         std::string fault;          // a fault set on the gun ("" = none)
+        int dirt = -1;              // the gun's fouling (item var dirt, -1 = none); 10000 always misfires
         std::string ammo;           // the gun's ammo, "" = 9mm
         bool spare_gun = false;     // also a jammed loaded `gun` in the pack
         bool ground_gun = false;    // and one lying a square west
@@ -3105,7 +3108,12 @@ static bool run_combat_checks()
                 }
                 // No random malfunction (CDDA's roll, about 1 in 300 shots even for a new gun and a skilled
                 // shooter: the shot silently doesn't happen): the checks are about the hooks. Jams are set above.
-                gun.set_flag( flag_NEVER_JAMS );
+                // A fouled gun keeps CDDA's misfire roll (NEVER_JAMS turns it off): at 10000 it always misfires.
+                if( sc->dirt >= 0 ) {
+                    gun.set_var( "dirt", sc->dirt );
+                } else {
+                    gun.set_flag( flag_NEVER_JAMS );
+                }
                 u.set_wielded_item( gun );
             } else {
                 u.remove_weapon();
@@ -3275,6 +3283,7 @@ static bool run_combat_checks()
         std::vector<fp3d::ui_request> shots;        // the shot requests
         std::vector<fp3d::event> projectiles;       // projectile events from the action on
         std::vector<fp3d::event> damages;           // damage events from the action on
+        std::vector<fp3d::event> misfires;          // misfire events from the action on
         bool back = false;                          // back in the main loop afterwards
     };
     // How the target request is answered: FIRE, an aim-and-shoot action, a cancel (all with the shot), or FIRE
@@ -3398,6 +3407,8 @@ static bool run_combat_checks()
                 r.projectiles.push_back( std::move( e ) );
             } else if( e.kind == fp3d::event_kind::damage ) {
                 r.damages.push_back( std::move( e ) );
+            } else if( e.kind == fp3d::event_kind::misfire ) {
+                r.misfires.push_back( std::move( e ) );
             }
         }
         return r;
@@ -3451,6 +3462,21 @@ static bool run_combat_checks()
         check( r.damages.size() == 1 && ( landed ? wp == "head" : wp == fp3d::weakpoint_text( wp ) ),
                "the damage event names the weak point hit", std::string( landed ? "landed" : "not landed" ) +
                ", damage " + ( named.empty() ? "none" : named ) );
+        check( r.misfires.empty(), "a round that fires sends no misfire event",
+               std::to_string( r.misfires.size() ) + " misfire events" );
+    }
+    // A gun fouled to CDDA's most (dirt 10000) misfires: the trigger is pulled, no round goes off (no shot request,
+    // no projectile, the round stays), and the player's misfire event says so with the gun.
+    {
+        scene fouled = point_blank;
+        fouled.dirt = 10000;
+        const result r = run( fouled, "fire", answer_with::fire, head, true, head );
+        const fp3d::event m = r.misfires.empty() ? fp3d::event() : r.misfires.front();
+        check( fired( r, 0 ) && r.shots.empty() && r.projectiles.empty() && r.misfires.size() == 1 && m.uid == 1 &&
+               m.detail == 1 && m.type != 0,
+               "a fouled gun misfires: a misfire event, nothing fired", counts( r ) + ", " +
+               std::to_string( r.misfires.size() ) + " misfire events, detail " + std::to_string( m.detail ) +
+               ", " + std::to_string( r.shots.size() ) + " shot requests" );
     }
     // Refused shot answers leave the projectile to CDDA's own path, not the FIRE answer's outcome (CDDA's own roll
     // hits the adjacent zombie).
@@ -4348,7 +4374,8 @@ static bool run_combat_checks()
         // Builds `sc`, starts `action` and answers each swing request with `reply` (nullopt: a cancel) and the
         // call `call` as the answer's action.
         const auto swing_run = [&]( const scene & sc, const std::string & action, const swing_answerer & reply,
-        const std::string & call = std::string() ) {
+                                    const std::string & call = std::string(),
+        const std::optional<std::array<int, 3>> &square = std::nullopt ) {
             swung s;
             // A stray prompt is printed and answered, and the scene built again: the creature may have grabbed
             // the avatar after the last strike, and struggling free on the pause can tear a pocket off (a popup).
@@ -4392,7 +4419,14 @@ static bool run_combat_checks()
                 std::vector<fp3d::event> old;
                 fp3d::drain_events( old );
             }
-            fp3d::queue_action( action );
+            if( square ) {   // queue_action_at: that square, (dx, dy, dz) from the avatar
+                const std::shared_ptr<const fp3d::snapshot> snap = fp3d::latest_snapshot();
+                const fp3d::ui_point me = snap ? snap->player.pos : fp3d::ui_point{};
+                fp3d::queue_action_at( action, fp3d::ui_point{ me.x + ( *square )[0], me.y + ( *square )[1],
+                                       me.z + ( *square )[2] } );
+            } else {
+                fp3d::queue_action( action );
+            }
             std::optional<fp3d::ui_request> c = fp3d::wait_request( 20000, q->id );
             int asked = 0;
             while( c && !c->timed && asked++ < 10 ) {
@@ -4677,6 +4711,50 @@ static bool run_combat_checks()
         check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ) && s.after.moves == s.before.moves &&
                s.after.hp == s.before.hp, "a spear doesn't strike someone unseen behind a wall",
                shown( s ) + ", moves " + std::to_string( s.before.moves ) + " -> " + std::to_string( s.after.moves ) );
+        // A square the client names (queue_action_at): a knight's move off, the main hand only, within reach.
+        const auto spent = []( const swung & s ) {
+            return s.after.moves < s.before.moves;
+        };
+        const auto idle = [&]( const swung & s, const char *text ) {
+            return s.back && s.swings.empty() && s.after.moves == s.before.moves && said( s.after, text );
+        };
+        scene knight = spear;
+        knight.zy = -1;
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
+        check( s.back && at( s, -2, -1 ) && s.swings[0].range == 2 && spent( s ),
+               "a spear strikes a knight's move off at the named square", shown( s ) );
+        s = swing_run( knight, "fp3d_attack_main_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
+        check( s.back && s.swings.empty() && spent( s ), "... unaimed: CDDA's reach attack, no swing request",
+               shown( s ) );
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -1, 0, 0 } );
+        check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ) && s.after.moves == s.before.moves,
+               "... a named square with nobody there strikes nothing", shown( s ) );
+        scene knight_far = knight;
+        knight_far.zx = -3;
+        s = swing_run( knight_far, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -3, -1, 0 } );
+        check( idle( s, "out of reach" ), "... 3 off is out of a spear's reach", shown( s ) );
+        scene knight_bat = knight;
+        knight_bat.melee = "bat";
+        s = swing_run( knight_bat, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
+        check( idle( s, "out of reach" ), "... a bat doesn't reach it", shown( s ) );
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { 0, 0, 0 } );
+        const bool own = idle( s, "out of reach" );
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 1 } );
+        const bool up = idle( s, "out of reach" );
+        s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ) );
+        const bool unnamed = idle( s, "Nothing there to hit" );
+        s = swing_run( knight, "fp3d_attack_off_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
+        const bool off = s.back && s.swings.empty() && s.after.moves == s.before.moves && s.after.hp == s.before.hp;
+        check( own && up && unnamed && off, "... refused: your own square, another level, no square, the off hand",
+               std::string( own ? "" : "own " ) + ( up ? "" : "up " ) + ( unnamed ? "" : "unnamed " ) +
+               ( off ? "" : "off" ) );
+        scene next_to = spear;
+        next_to.zx = -1;
+        s = swing_run( next_to, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -1, -1, 0 } );
+        const bool empty_diag = idle( s, "Nothing there to hit" );
+        s = swing_run( next_to, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -1, 0, 0 } );
+        check( empty_diag && s.back && at( s, -1, 0 ) && s.swings[0].range == 1 && spent( s ),
+               "... next to you: a plain strike at that square", shown( s ) );
     }
     return failed == 0;
 }
@@ -4726,7 +4804,7 @@ static bool run_safemode_checks()
     }
     const int placed_before = snapshot().zombies_placed;
     fp3d::set_auto_pause_hostiles( false );
-    fp3d::set_timescale( 4.0 );
+    fp3d::set_timescale( 4.0 / fp3d::slow_build );   // 250 ms turns, times slow_build
     fp3d::set_clock_mode( fp3d::clock_mode::real_time );
     spawn_zombie = true;
     const int64_t turn0 = r->turn;
@@ -4735,7 +4813,8 @@ static bool run_safemode_checks()
     // 10 s with parallel builds running). A prompt (a request that doesn't expire) would stop the clock: noted,
     // cancelled so the game goes on.
     std::string prompts;
-    while( ms_since( t ) < 2000 || ( r->turn < turn0 + 3 && ms_since( t ) < 30000 ) ) {
+    while( ms_since( t ) < 2000 * fp3d::slow_build ||
+           ( r->turn < turn0 + 3 && ms_since( t ) < 30000 * fp3d::slow_build ) ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, r->id ) ) {
             r = next;
             if( !next->timed ) {
@@ -5024,7 +5103,7 @@ static bool run_point_teleport_checks()
         fp3d::request_range_op( heal );
         std::vector<std::string> got;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 20000 ) {
+        while( ms_since( t ) < 20000 * fp3d::slow_build ) {
             got.clear();
             const std::vector<fp3d::range_op_result> res = fp3d::latest_range_results();
             for( size_t i = 0; i < count; i++ ) {
@@ -5469,7 +5548,8 @@ static bool run_weather_mood_checks()
         fp3d::queue_action( "pause" );
         const uint64_t before = r->id;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 30000 && ( weather_mood_setup.load() != 0 || r->id == before || !r->timed ) ) {
+        while( ms_since( t ) < 30000 * fp3d::slow_build &&
+               ( weather_mood_setup.load() != 0 || r->id == before || !r->timed ) ) {
             if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id ) ) {
                 r = next;
             }
@@ -5562,7 +5642,7 @@ static bool run_weather_cheat_checks( const std::function<size_t()> &lightning_s
         }
         std::vector<std::string> got;
         const auto t = std::chrono::steady_clock::now();
-        while( ms_since( t ) < 20000 ) {
+        while( ms_since( t ) < 20000 * fp3d::slow_build ) {
             got.clear();
             const std::vector<fp3d::range_op_result> res = fp3d::latest_range_results();
             for( const uint64_t id : ids ) {
@@ -7094,7 +7174,8 @@ int main()
         std::optional<fp3d::ui_request> req = fp3d::wait_request( 180000 );
         if( !req && !fp3d::is_shut_down() ) {
             // The sim is stuck outside ask() (a loop that never asks); join() would hang.
-            std::printf( "FAIL: no request within 180 s; timed-out polls: %s\n", fp3d::poll_report().c_str() );
+            std::printf( "FAIL: no request within %d s; timed-out polls: %s\n", 180 * fp3d::slow_build,
+                         fp3d::poll_report().c_str() );
             std::_Exit( 2 );
         }
         if( !req ) {

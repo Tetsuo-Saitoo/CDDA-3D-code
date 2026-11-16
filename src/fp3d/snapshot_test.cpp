@@ -203,6 +203,8 @@ int main()
             check( gun_json.str().find( "\"wielded_gun\":{\"type\":" ) != std::string::npos &&
                    gun_json.str().find( "\"dirt\":1234,\"rounds\":7,\"faults\":[\"" + fault + "\"]" ) !=
                    std::string::npos, "wielded_gun in the JSON" );
+            check( g && !g->suppressed && gun_json.str().find( "\"suppressed\"" ) == std::string::npos,
+                   "a plain gun isn't suppressed (no suppressed in the JSON)" );
             // A fault the gun type can't get (a save or a mod can add one) is listed too.
             u.get_wielded_item()->set_fault( fault_id( "fault_engine_starter" ), true, false );
             const std::shared_ptr<const fp3d::snapshot> odd = timed_capture( gun_ms );
@@ -212,6 +214,14 @@ int main()
             };
             check( g2 && g2->faults.size() == 2 && lists( fault ) && lists( "fault_engine_starter" ),
                    "wielded_gun lists every fault it has", g2 ? std::to_string( g2->faults.size() ) : "none" );
+            // An integral suppressor (a built-in gunmod) counts like one screwed on.
+            u.set_wielded_item( item( itype_id( "hk_mp5sd" ) ) );
+            const std::shared_ptr<const fp3d::snapshot> quiet = timed_capture( gun_ms );
+            const std::optional<fp3d::gun_view> &g3 = quiet->player.wielded_gun;
+            std::ostringstream quiet_json;
+            fp3d::write_snapshot_json( quiet_json, *quiet, u.posz(), u.posz() );
+            check( g3 && g3->suppressed && quiet_json.str().find( "],\"suppressed\":true}" ) != std::string::npos,
+                   "an integral suppressor: suppressed, and in the JSON" );
             u.remove_weapon();
         }
         {

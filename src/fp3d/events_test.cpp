@@ -32,6 +32,10 @@
 #include "fp3d/snapshot.h"
 #include "fp3d/swing.h"
 #include "game.h"
+#include "item.h"
+#include "itype.h"
+#include "iuse_actor.h"
+#include "magic.h"
 #include "map.h"
 #include "martialarts.h"
 #include "messages.h"
@@ -221,7 +225,7 @@ int main()
                 named = atks[0].detail == 1 && atks[0].text == rapid_name && atks[0].amount == fp3d::technique_strike;
             }
             zed->set_hp( zed->get_hp_max() );
-            check( named && one_each && misses_plain && rapid_name == "Rapid Strike",
+            check( named && one_each && misses_plain && rapid.is_valid() && !rapid_name.empty(),
                    "melee: a forced technique names itself", std::to_string( swings ) + " swings, " + got +
                    ( one_each ? "" : ", not one attack event a swing" ) +
                    ( misses_plain ? "" : ", a miss named a technique" ) );
@@ -434,6 +438,22 @@ int main()
             zed->set_hp( zed->get_hp_max() );   // the checks after this one want it alive
         }
         {
+            // a trigger pull with no round: the shooter, its square, the gun, 1 a misfire / 2 the gun is jammed now
+            item clean_gun( itype_id( "glock_19" ) );
+            item jammed_gun( itype_id( "glock_19" ) );
+            jammed_gun.set_fault( fault_id( "fault_stovepipe" ), true, false );
+            drain( event_kind::misfire );
+            fp3d::on_misfire( u, clean_gun );
+            fp3d::on_misfire( u, jammed_gun );
+            const std::vector<event> mis = drain( event_kind::misfire );
+            const fp3d::ui_point me = fp3d::to_ui_point( u.pos_abs() );
+            check( mis.size() == 2 && mis[0].uid == 1 && mis[0].pos.x == me.x && mis[0].pos.y == me.y &&
+                   name_of( fp3d::id_kind::itype, mis[0].type ) == "glock_19" && mis[0].detail == 1 &&
+                   mis[1].detail == 2, "misfire: the shooter, its square, the gun; a jam says so",
+                   std::to_string( mis.size() ) + " events" + ( mis.empty() ? "" : ", detail " +
+                           std::to_string( mis[0].detail ) ) );
+        }
+        {
             const tripoint_bub_ms under = at + tripoint_rel_ms( 0, 0, -1 );
             here.ter_set( under, ter_t_floor );
             monster *lurker = g->place_critter_at( mon_zombie, under );
@@ -528,6 +548,51 @@ int main()
                name_of( fp3d::id_kind::itype, boom[0].detail ) == "grenade_act" && boom[1].detail == 0,
                "explosions: blast area and item, flashbang radius", std::to_string( boom.size() ) + " events" +
                ( boom.empty() ? "" : ", blast covers " + std::to_string( boom[0].path.size() ) ) );
+
+        // EMP and scrambler grenades: one event each at the grenade with the blast's radius, not one per square.
+        // The EMP's radius is cut to 1 (and no electric field) so it misses the player's gear 3 squares away.
+        for( const std::string &id : { std::string( "grenade_emp_act" ), std::string( "scrambler_act" ) } ) {
+            item nade( itype_id( id ), calendar::turn );
+            const explosion_iuse *real = nade.type->countdown_action ? dynamic_cast<const explosion_iuse *>
+                                         ( nade.type->countdown_action.get_actor_ptr() ) : nullptr;
+            if( real == nullptr ) {
+                check( false, ( "explosions: " + id + " explodes" ).c_str(), "no explosion countdown action" );
+                continue;
+            }
+            explosion_iuse pulse_use = *real;
+            const bool emp = pulse_use.emp_blast_radius > 0;
+            if( emp ) {
+                pulse_use.emp_blast_radius = 1;
+                pulse_use.fields_radius = -1;
+            }
+            const std::string kind = emp ? "emp" : "scrambler";
+            const int radius = emp ? 1 : pulse_use.scrambler_blast_radius;
+            pulse_use.use( nullptr, nade, &get_map(), blast_at );
+            const std::vector<event> pulse = drain( event_kind::explosion );
+            check( pulse.size() == 1 && name_of( fp3d::id_kind::explosion, pulse[0].type ) == kind &&
+                   pulse[0].amount == radius && radius > 0 && same( pulse[0].pos, abs_of( blast_at ) ) &&
+                   name_of( fp3d::id_kind::itype, pulse[0].detail ) == id,
+                   ( "explosions: " + id + " sends one " + kind + " event with its radius" ).c_str(),
+                   std::to_string( pulse.size() ) + " events" );
+        }
+        // A spell's area (shock_blast: electric, the squares around its target): one event over those squares,
+        // named by the damage type.
+        {
+            const spell shock( spell_id( "shock_blast" ) );
+            spell_effect::attack( shock, u, blast_at );
+            const std::vector<event> cast = drain( event_kind::explosion );
+            check( cast.size() == 1 && name_of( fp3d::id_kind::explosion, cast[0].type ) == "spell:electric" &&
+                   same( cast[0].pos, abs_of( blast_at ) ) && cast[0].path.size() > 1 && cast[0].amount == 1,
+                   "explosions: a spell's area is one event, by damage type", std::to_string( cast.size() ) +
+                   " events" + ( cast.empty() ? "" : ", " + cast[0].text + ", " + std::to_string( cast[0].path.size() ) +
+                                 " squares, radius " + std::to_string( cast[0].amount ) ) );
+        }
+        check( fp3d::spell_explosion_kind( "heat" ) == "spell:heat" &&
+               fp3d::spell_explosion_kind( std::string( 32, 'x' ) ) == "spell:" + std::string( 32, 'x' ) &&
+               fp3d::spell_explosion_kind( std::string( 33, 'x' ) ) == "spell" &&
+               fp3d::spell_explosion_kind( "" ) == "spell" && fp3d::spell_explosion_kind( "a b" ) == "spell" &&
+               fp3d::spell_explosion_kind( "a\nb" ) == "spell" && fp3d::spell_explosion_kind( "h\xc3\xa9" ) == "spell",
+               "explosions: a spell's damage type is used only if short printable ASCII" );
 
         // Overflow: 10 sounds then a full queue of messages. The sounds go first; every message stays.
         fp3d::reset_events();

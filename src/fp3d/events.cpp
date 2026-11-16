@@ -10,6 +10,7 @@
 #include "character.h"
 #include "creature.h"
 #include "damage.h"
+#include "fp3d/gun_faults.h"
 #include "fp3d/points.h"
 #include "fp3d/snapshot.h"
 #include "fp3d/swing.h"
@@ -262,12 +263,26 @@ void on_explosion( const tripoint_bub_ms &centre, int radius, const std::vector<
     }
     e.pos = abs_of( centre );
     e.amount = radius;
-    e.type = intern_id( id_kind::explosion, kind );
-    e.text = kind;
+    const std::string name = bounded_text( kind );
+    e.type = intern_id( id_kind::explosion, name );
+    e.text = name;
     if( !explosion_item.empty() ) {
         e.detail = intern_id( id_kind::itype, explosion_item );
     }
     push( std::move( e ) );
+}
+
+std::string spell_explosion_kind( const std::string &damage_type )
+{
+    if( damage_type.empty() || damage_type.size() > 32 ) {
+        return "spell";
+    }
+    for( const char c : damage_type ) {
+        if( c < 0x21 || c > 0x7e ) { // a high byte is negative or above 0x7e, whatever char's sign
+            return "spell";
+        }
+    }
+    return "spell:" + damage_type;
 }
 
 void on_death( const Creature &c )
@@ -314,6 +329,20 @@ void on_item_result( uint64_t item_uid, uint32_t tag, bool done, const std::stri
     e.amount = done ? 1 : 0;
     // Plain text, as the message event's: item names carry color tags.
     e.text = bounded_text( remove_color_tags( why ) );
+    push( std::move( e ) );
+}
+
+void on_misfire( const Character &shooter, const item &gun )
+{
+    if( !player_sees( shooter ) ) {
+        return;
+    }
+    event e;
+    e.kind = event_kind::misfire;
+    e.uid = creature_uid( shooter );
+    e.pos = to_ui_point( shooter.pos_abs() );
+    e.type = item_index( gun.typeId().str() );
+    e.detail = jam_of( gun ).is_null() ? 1 : 2;
     push( std::move( e ) );
 }
 
