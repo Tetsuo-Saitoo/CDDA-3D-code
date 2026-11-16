@@ -254,7 +254,12 @@ size_t queued_actions();
 // main or off; refused for a worn item or a hand that holds something else: nothing is ever put away to make room.
 // consume: CDDA's eat, drink or first aid for the item `item` (carried, or lying where `take` could get it at `pos`),
 // or for the first thing in it CDDA would consume (a drink in its bottle): CDDA's own prompts, time and messages.
-enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume };
+// cook: start CDDA's craft `recipe` (batch `batch`) from what the container `item` lying on `pos` (the avatar's
+// square or one next to it) holds: the recipe must be one match_recipes lists for it that can start; the components
+// come out of the container only, the tools from CDDA's crafting inventory (the heat under the pot first) plus the
+// emptied container. The craft lies at the avatar's feet, linked to the container (cooking.h), and CDDA's craft
+// activity runs.
+enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume, cook };
 // take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
 // fit), wielded, the off hand.
 enum class item_hand : uint8_t { pack, main, off };
@@ -293,7 +298,12 @@ struct item_action {
     uint8_t shelf = 0;
     // 0 = none. Else the client's own number for this action: an `item_result` event (events.h) says how it went.
     uint32_t tag = 0;
+    // cook only (empty and 1 for every other op): the recipe id (plain, 1 .. max_cook_recipe_bytes) and the batch.
+    std::string recipe;
+    int batch = 1;
 };
+constexpr size_t max_cook_recipe_bytes = 128;
+constexpr int max_cook_batch = 20;
 constexpr int max_item_pocket = 255;
 constexpr uint16_t max_item_yaw = 359;
 constexpr uint8_t max_item_shelf = 15;
