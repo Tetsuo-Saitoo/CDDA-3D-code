@@ -46,6 +46,7 @@
 #include "field_type.h"
 #include "flag.h"
 #include "flexbuffer_json.h"
+#include "fp3d/events.h" // FP3D:
 #include "game.h"
 #include "generic_factory.h"
 #include "handle_liquid.h"
@@ -953,6 +954,9 @@ bool Character::activate_bionic( bionic &bio, bool eff_only, bool *close_bionics
         if( const std::optional<tripoint_bub_ms> pnt = choose_adjacent(
                     _( "Create an EMP where?" ) ) ) {
             add_msg_activate();
+            if( fp3d::events_enabled() ) { // FP3D:
+                fp3d::on_explosion( *pnt, 0, {}, "emp" );
+            }
             explosion_handler::emp_blast( *pnt );
             mod_moves( -100 );
         } else {

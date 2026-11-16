@@ -4559,9 +4559,15 @@ talk_effect_fun_t::func f_explosion( const JsonObject &jo, std::string_view memb
         explosion_handler::explosion( &guy, target_pos, expl_data );
 
         if( emp_blast ) {
+            if( fp3d::events_enabled() && here.inbounds( target_pos ) ) { // FP3D:
+                fp3d::on_explosion( target_pos, 0, {}, "emp" );
+            }
             explosion_handler::emp_blast( target_pos );
         }
         if( scrambler_blast ) {
+            if( fp3d::events_enabled() && here.inbounds( target_pos ) ) { // FP3D:
+                fp3d::on_explosion( target_pos, 0, {}, "scrambler" );
+            }
             explosion_handler::scrambler_blast( target_pos );
         }
     };

@@ -20,6 +20,7 @@
 #include "explosion.h"
 #include "field.h"
 #include "field_type.h"
+#include "fp3d/events.h" // FP3D:
 #include "item.h"
 #include "magic.h"
 #include "map.h"
@@ -193,6 +194,9 @@ void apply_ammo_effects( Creature *source, const tripoint_bub_ms &p,
                 explosion_handler::flashbang( p );
             }
             if( ae.do_emp_blast ) {
+                if( fp3d::events_enabled() ) { // FP3D:
+                    fp3d::on_explosion( p, 0, {}, "emp" );
+                }
                 explosion_handler::emp_blast( p );
             }
             if( ae.foamcrete_build ) {
