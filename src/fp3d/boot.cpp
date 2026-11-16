@@ -18,6 +18,7 @@
 #include "enums.h"
 #include "filesystem.h"
 #include "fp3d/bridge.h"
+#include "fp3d/chargen.h"
 #include "fp3d/cheats.h"
 #include "fp3d/data_check.h"
 #include "fp3d/events.h"
@@ -332,6 +333,7 @@ void boot_world( const std::string &world_name, bool headless )
 {
     boot_new_game_data( world_name, true, headless, false, /*replace=*/true );
     get_avatar().create( character_type::NOW );
+    settle_new_character( get_avatar() );
     get_map() = map();
 }
 

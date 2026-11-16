@@ -39,6 +39,7 @@
 #include "achievement.h"
 #include "fp3d/boot.h" // FP3D:
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/chargen.h" // FP3D:
 #include "fp3d/points.h" // FP3D:
 #include "action.h"
 #include "activity_actor_definitions.h"
@@ -3681,6 +3682,11 @@ spell_events &game::spell_events_subscriber()
 
 bool game::save()
 {
+    // FP3D: input validation of the save id (fp3d/chargen.h)
+    if( fp3d::active() && !fp3d::save_id_ok( u.get_save_id() ) ) {
+        add_msg( m_bad, _( "The game can't be saved under this character's name." ) );
+        return false;
+    }
     std::chrono::seconds time_since_load =
         std::chrono::duration_cast<std::chrono::seconds>(
             std::chrono::steady_clock::now() - time_of_last_load );
