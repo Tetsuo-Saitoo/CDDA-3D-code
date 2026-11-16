@@ -240,8 +240,8 @@ size_t queued_actions();
 // unit of a stack counted by charges, CDDA's range, moves and dispersion). The square is one the avatar sees, on its
 // level, within its throw range, not its own. Worn items aren't thrown; one held flies from its hand, anything else
 // carried from an empty main hand or a free off hand. hand, container and pocket aren't used.
-// pour: pour the liquid out of the carried container `item` (or the carried liquid `item` out of its container),
-// with CDDA's liquid rules, to exactly one place: onto the square `pos` (the avatar's or one next to it; all of it)
+// pour: pour the liquid out of the container `item`, carried or lying on the avatar's square or one next to it (a pot
+// on its burner), or the carried liquid `item` out of its container, with CDDA's liquid rules, to exactly one place: onto the square `pos` (the avatar's or one next to it; all of it)
 // or into the container `container` (carried or on the avatar's square or one next to it, found by handle there;
 // `pocket` as for put; as much as fits, the rest stays). With `container` set, `pos` stays at (0, 0, 0) (not sent);
 // without it, `pocket` stays -1. hand isn't used.
@@ -258,8 +258,16 @@ size_t queued_actions();
 // square or one next to it) holds: the recipe must be one match_recipes lists for it that can start; the components
 // come out of the container only, the tools from CDDA's crafting inventory (the heat under the pot first) plus the
 // emptied container. The craft lies at the avatar's feet, linked to the container (cooking.h), and CDDA's craft
-// activity runs.
-enum class item_op : uint8_t { take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume, cook };
+// activity runs. The container must lie on a lit heat source: the craft stops when it leaves it or the heat goes out,
+// and `cook` with the same recipe makes it go on (one craft a container). What it makes goes into the container.
+// light: CDDA's fire starting on the square `pos` next to the avatar (the firestarter item use: its questions, time
+// and charges) with the carried item `item`, or with no item (uid 0, type 0) the quickest carried one that works now.
+// extinguish: CDDA's "Extinguish fire" of a fireplace: the fire in the fire furniture on `pos` (the avatar's square or
+// one next to it) is beaten out; needs something that bashes, carried or lying near. `item` stays empty (uid 0,
+// type 0). A fire anywhere else isn't put out by hand.
+enum class item_op : uint8_t {
+    take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume, cook, light, extinguish
+};
 // take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
 // fit), wielded, the off hand.
 enum class item_hand : uint8_t { pack, main, off };
@@ -271,7 +279,8 @@ constexpr uint64_t max_item_uid = ( uint64_t{ 1 } << 53 ) - 1;   // exact in a d
 constexpr uint16_t spot_scale = 1000;    // spots are permille of the square, 0 .. spot_scale - 1
 struct item_action {
     item_op op = item_op::take;
-    item_ref item;                       // the item to take, put, drop, unload, reload, clear, throw or pour from
+    item_ref item;                       // the item to take, put, drop, unload, reload, clear, throw or pour from;
+    // light: the firestarter or empty; extinguish: empty
     // take: the square the item lies on. drop: the square to put it on. put: the container's square, used
     // when the container isn't carried. unload: the item's square, used when it isn't carried. reload: the ammo's
     // square, used when the ammo isn't carried. throw: the square thrown at (required). pour: the square poured
@@ -308,8 +317,8 @@ constexpr int max_item_pocket = 255;
 constexpr uint16_t max_item_yaw = 359;
 constexpr uint8_t max_item_shelf = 15;
 constexpr uint32_t max_item_tag = INT32_MAX;
-// Client side. False if a field is out of range, a pour names no target or two (container and pos), or the queue
-// is full.
+// Client side. False if a field is out of range, a pour names no target or two (container and pos), an item is
+// missing (only light may leave it out, extinguish must) or the queue is full.
 bool queue_item_action( const item_action &a );
 constexpr const char *item_action_name = "fp3d_item";
 // Sim side: the item action the bridge just answered `fp3d_item` with (once), nullopt if none.

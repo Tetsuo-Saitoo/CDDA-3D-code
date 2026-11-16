@@ -32,6 +32,7 @@
 #endif
 
 #include "achievement.h"
+#include "activity_actor_definitions.h"
 #include "avatar.h"
 #include "cached_options.h"
 #include "calendar.h"
@@ -67,10 +68,12 @@
 #include "game_constants.h"
 #include "inventory.h"
 #include "item.h"
+#include "item_location.h"
 #include "line.h"
 #include "math_parser_diag_value.h"
 #include "json_loader.h"
 #include "map.h"
+#include "map_selector.h"
 #include "map_scale_constants.h"
 #include "mapdata.h"
 #include "martialarts.h"
@@ -142,6 +145,8 @@ const ter_str_id ter_t_stairs_up( "t_stairs_up" );
 const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
 const itype_id itype_pot( "pot" );
 const itype_id itype_log( "log" );
+const itype_id itype_splinter( "splinter" );
+const itype_id itype_lighter( "lighter" );
 const itype_id itype_meat( "meat" );
 const furn_str_id furn_f_fireplace( "f_fireplace" );
 const furn_str_id furn_f_woodstove( "f_woodstove" );
@@ -229,6 +234,8 @@ std::atomic<double> cook_capture_ms{ 0 };     // one full capture of the scene
 std::atomic<double> cook_heat_ms{ 0 };        // the heat and cookware part of it
 std::atomic<size_t> cook_heat_squares{ 0 };   // squares it built a crafting inventory for
 std::atomic<int> cook_full_free_ml{ -1 };     // scene 26: the room left on the avatar's square once filled
+std::atomic<int> cook_own_resume{ 0 };        // scene 28: CDDA's own way on with the craft: 1 held up, 2 it went on
+std::atomic<uint64_t> cook_fuel_uid{ 0 };     // scene 30: the splinter the avatar carries
 // Gun item checks: the handles scene 16 gave (sim thread writes, driver reads).
 std::atomic<uint64_t> gun_glock_uid{ 0 };      // a carried Glock 19 with a full magazine
 std::atomic<uint64_t> gun_spare_uid{ 0 };      // a carried empty Glock magazine
@@ -683,6 +690,19 @@ void ask_numbers()
     std::lock_guard<std::mutex> lk( number_mutex );
     number_out = res;
     number_done.store( true );
+}
+
+// The cooking scene's pot goes from one square to another, handle and contents kept (sim thread).
+static void move_cook_pot( map &here, const tripoint_bub_ms &from, const tripoint_bub_ms &to )
+{
+    for( item &it : here.i_at( from ) ) {
+        if( it.typeId() == itype_pot ) {
+            const item copy = it;
+            here.i_rem( from, &it );
+            here.add_item( to, copy );
+            return;
+        }
+    }
 }
 
 // The cooking scene's pot on the fire holds 4 fresh water again (sim thread).
@@ -1296,6 +1316,55 @@ void observe()
                     }
                 }
             }
+            break;
+        }
+        case 28: {
+            // Cooking: the pot off the fire onto the square north of it. CDDA's own way on with the paused craft at
+            // the avatar's feet (activating it) is tried: its craft activity must not start.
+            move_cook_pot( here, p + tripoint_rel_ms( -1, 1, 0 ), p + tripoint_rel_ms( -1, 0, 0 ) );
+            for( item &it : here.i_at( p ) ) {
+                if( it.is_craft() ) {
+                    item_location loc( map_cursor( p ), &it );
+                    get_avatar().assign_activity( craft_activity_actor( loc, false ) );
+                    cook_own_resume = get_avatar().activity.is_null() ? 1 : 2;
+                    break;
+                }
+            }
+            break;
+        }
+        case 29:
+            // The pot back on the fire.
+            move_cook_pot( here, p + tripoint_rel_ms( -1, 0, 0 ), p + tripoint_rel_ms( -1, 1, 0 ) );
+            break;
+        case 30: {
+            // Fuel and a filled lighter carried.
+            avatar &u = get_avatar();
+            item_location fuel = u.i_add( item( itype_splinter ) );
+            cook_fuel_uid = fuel ? fp3d::item_handle( *fuel ) : 0;
+            item lighter( itype_lighter );
+            lighter.ammo_set( lighter.ammo_default() );
+            u.i_add( lighter );
+            break;
+        }
+        case 31:
+            // A log on the lit fireplace: it burns to the end of the craft.
+            here.add_item( p + tripoint_rel_ms( -1, 1, 0 ), item( itype_log ) );
+            break;
+        case 32: {
+            // The fireplace as scene 14 left it: the pot alone, a fire without fuel.
+            const tripoint_bub_ms fire_at = p + tripoint_rel_ms( -1, 1, 0 );
+            for( bool again = true; again; ) {
+                again = false;
+                for( item &it : here.i_at( fire_at ) ) {
+                    if( it.typeId() != itype_pot ) {
+                        here.i_rem( fire_at, &it );
+                        again = true;
+                        break;
+                    }
+                }
+            }
+            here.remove_field( fire_at, fd_fire );
+            here.add_field( fire_at, fd_fire, 2 );
             break;
         }
         case 24: {
@@ -3189,6 +3258,115 @@ static bool run_cooking_checks()
            "cook: 2 water used, the craft shown with the pot",
            after ? "water " + std::to_string( water_left( after ) ) + ", craft '" + after->craft_recipe + "' " +
            std::to_string( after->craft_progress ) + " permille" : "pot not seen" );
+
+    // The rest of L9 on that paused craft (2 of the 4 water still in the pot on the fire): pouring out of the pot
+    // where it stands, the pot off the heat and back, the fire put out, fed and lit again, and the craft to its end.
+    const auto scene = [&]( int n ) {
+        hand_setup = n;
+        fp3d::queue_action( "pause" );
+        r = fp3d::wait_request( 20000, r ? r->id : 0 );
+    };
+    // The fireplace's heat entry in the newest snapshot.
+    const auto fire_now = [&]() {
+        std::optional<fp3d::heat_view> out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        const auto floor_div = []( int a ) {
+            return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+        };
+        const int sx = floor_div( fire_at.x );
+        const int sy = floor_div( fire_at.y );
+        const int tile = ( fire_at.y - sy * fp3d::sm_size ) * fp3d::sm_size + ( fire_at.x - sx * fp3d::sm_size );
+        for( const std::shared_ptr<const fp3d::submap_view> &sm : s->submaps ) {
+            if( sm->pos.x != sx || sm->pos.y != sy || sm->pos.z != fire_at.z ) {
+                continue;
+            }
+            for( const fp3d::heat_view &h : sm->heat ) {
+                if( h.tile == tile ) {
+                    out = h;
+                }
+            }
+        }
+        return out;
+    };
+    const auto fire_action = [&]( fp3d::item_op op, uint64_t uid, uint32_t type, const fp3d::ui_point & pos ) {
+        fp3d::item_action ia;
+        ia.op = op;
+        ia.item = fp3d::item_ref{ uid, type };
+        ia.pos = pos;
+        ia.tag = ++cook_tag;
+        return ia;
+    };
+    const auto has = []( const std::string & text, const char *part ) {
+        return text.find( part ) != std::string::npos;
+    };
+    check( !fp3d::queue_item_action( fire_action( fp3d::item_op::extinguish, pot.uid, t_pot, fire_at ) ) &&
+           !fp3d::queue_item_action( fire_action( fp3d::item_op::light, 5, 0, fire_at ) ) &&
+           !fp3d::queue_item_action( fire_action( fp3d::item_op::light, 0, t_pot, fire_at ) ) &&
+           !fp3d::queue_item_action( fire_action( fp3d::item_op::take, 0, 0, fire_at ) ),
+           "light, extinguish: malformed actions refused when queued", "" );
+
+    // One craft a pot: another recipe is refused while this one is paused. The rest of the water is poured out of the
+    // pot where it stands, onto the square east of the avatar.
+    const cook_result second = run_cook( cook_action( pot.uid, fire_at, "meat_cooked", 1 ), false );
+    const cook_result poured = run_cook( fire_action( fp3d::item_op::pour, pot.uid, t_pot, at( 1, 0 ) ), false );
+    const std::optional<fp3d::cookware_view> emptied = pot_now();
+    check( second.back && second.answers == 1 && !second.done && has( second.why, "already" ) && poured.back &&
+           poured.done && emptied && water_left( emptied ) == 0 && emptied->craft_recipe == "water_clean",
+           "pour: out of the pot on the fire; one craft a pot",
+           cook_text( second ) + " | " + cook_text( poured ) + " | water " + std::to_string( water_left( emptied ) ) );
+
+    // The pot off the heat: CDDA's own way on with the craft is held up, and so is `cook`; nothing moves on.
+    cook_own_resume = 0;
+    scene( 28 );
+    const cook_result off_heat = run_cook( cook_action( pot.uid, at( -1, 0 ), "water_clean", 2 ), false );
+    scene( 29 );
+    const std::optional<fp3d::cookware_view> back_on = pot_now();
+    check( cook_own_resume.load() == 1 && off_heat.back && off_heat.answers == 1 && !off_heat.done &&
+           has( off_heat.why, "heat" ) && back_on && after && back_on->craft_recipe == "water_clean" &&
+           back_on->craft_progress == after->craft_progress, "cook: off the heat the craft stays paused",
+           "CDDA's own way on " + std::to_string( cook_own_resume.load() ) + " | " + cook_text( off_heat ) +
+           ( back_on ? " | " + std::to_string( back_on->craft_progress ) + " permille" : " | pot not seen" ) );
+
+    // The fire beaten out: nothing cooks on it.
+    const cook_result put_out = run_cook( fire_action( fp3d::item_op::extinguish, 0, 0, fire_at ), false );
+    const std::optional<fp3d::heat_view> cold = fire_now();
+    const cook_result on_cold = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), false );
+    const cook_result no_fire = run_cook( fire_action( fp3d::item_op::extinguish, 0, 0, fire_at ), false );
+    check( put_out.back && put_out.done && cold && !cold->lit && cold->fire == 0 && on_cold.back && !on_cold.done &&
+           has( on_cold.why, "heat" ) && no_fire.back && !no_fire.done,
+           "extinguish: the fire out, nothing cooks on it",
+           cook_text( put_out ) + " | " + heat_text( cold ) + " | " + cook_text( on_cold ) + " | " +
+           cook_text( no_fire ) );
+
+    // Fuel dropped on the fireplace (the `drop` action), then lit with the carried lighter (no item named).
+    scene( 30 );
+    const cook_result fed = run_cook( fire_action( fp3d::item_op::drop, cook_fuel_uid.load(),
+                                      type_of( "splinter" ), fire_at ), false );
+    const cook_result lit = run_cook( fire_action( fp3d::item_op::light, 0, 0, fire_at ), false );
+    const cook_result on_self = run_cook( fire_action( fp3d::item_op::light, 0, 0, at( 0, 0 ) ), false );
+    const std::optional<fp3d::heat_view> warm = fire_now();
+    check( fed.back && fed.done && lit.back && lit.done && warm && warm->lit && warm->fire > 0 && on_self.back &&
+           !on_self.done, "light: fuel on the fireplace, lit with the lighter",
+           cook_text( fed ) + " | " + cook_text( lit ) + " | " + heat_text( warm ) + " | " + cook_text( on_self ) );
+
+    // Back on a fire the craft goes on to its end; what it made is in the pot.
+    scene( 31 );
+    const cook_result finished = run_cook( cook_action( pot.uid, fire_at, "water_clean", 2 ), false );
+    const std::optional<fp3d::cookware_view> served = pot_now();
+    int clean = 0;
+    if( served ) {
+        for( const fp3d::cookware_item_view &c : served->contents ) {
+            clean += c.type == t_clean ? c.count : 0;
+        }
+    }
+    check( finished.back && finished.done && served && served->craft_recipe.empty() && clean == 2 &&
+           served->contents.size() == 1, "cook: back on the fire to the end, the result in the pot",
+           cook_text( finished ) + " | clean water " + std::to_string( clean ) +
+           ( served ? ", craft '" + served->craft_recipe + "'" : ", pot not seen" ) );
+    scene( 32 );
     return failed == 0;
 }
 

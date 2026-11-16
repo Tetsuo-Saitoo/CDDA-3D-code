@@ -22,6 +22,7 @@
 #include "coordinates.h"
 #include "craft_command.h"
 #include "crafting.h"
+#include "enums.h"
 #include "field.h"
 #include "field_type.h"
 #include "fp3d/id_tables.h"
@@ -36,6 +37,7 @@
 #include "itype.h"
 #include "json.h"
 #include "map.h"
+#include "map_selector.h"
 #include "mapdata.h"
 #include "math_parser_diag_value.h"
 #include "output.h"
@@ -271,9 +273,73 @@ uint64_t read_cook_pot( const item &it )
     return r.ec == std::errc() && r.ptr == s.data() + s.size() && n <= max_item_uid ? n : 0;
 }
 
-void capture_cookware( map &here, const tripoint_bub_ms &p, uint8_t tile, submap_view &sm,
-                       std::unordered_set<uint64_t> &seen, const tripoint_bub_ms &me )
+// Whether bubble square `p` gives CDDA's crafting a heat that works now (a fire burns, or the heat tool there has
+// charges): the snapshot's `lit`, for one square.
+bool heat_lit_at( map &here, const Character &who, const tripoint_bub_ms &p )
 {
+    const heat_tables &h = heat_now();
+    const bool fire_here = here.get_field_intensity( p, fd_fire ) > 0 ||
+                           here.has_flag_ter_or_furn( ter_furn_flag::TFLAG_USABLE_FIRE, p );
+    const size_t furn = static_cast<size_t>( here.furn( p ).to_i() );
+    const itype_id tool = furn < h.furn_tool.size() && !h.furn_tool[furn].is_null() ? h.furn_tool[furn] :
+                          vehicle_heat_tool( here, p, h );
+    if( tool.is_null() && !fire_here ) {
+        return false;
+    }
+    inventory there;
+    there.form_from_map( &here, p, 0, &who, false, false );
+    if( there.has_tools( itype_fire, 1 ) ) {
+        return true;
+    }
+    if( tool.is_null() || !there.has_tools( tool, 1 ) ) {
+        return false;
+    }
+    const auto presence = h.tools.find( tool );
+    return there.charges_of( tool ) > 0 || ( presence != h.tools.end() && presence->second );
+}
+
+// Items looked at on one square for a pot or its craft.
+constexpr size_t max_cook_scan = 256;
+
+// The item with handle `uid` lying on `me` or a square next to it (top level), and where; null if none.
+item *find_cook_pot( map &here, const tripoint_bub_ms &me, uint64_t uid, tripoint_bub_ms &at )
+{
+    for( const tripoint_bub_ms &q : here.points_in_radius( me, 1 ) ) {
+        size_t looked = 0;
+        for( item &it : here.i_at( q ) ) {
+            if( looked++ >= max_cook_scan ) {
+                break;
+            }
+            if( read_item_handle( it ) == uid ) {
+                at = q;
+                return &it;
+            }
+        }
+    }
+    return nullptr;
+}
+
+// The craft the `cook` action started for the pot `uid`, lying on `me` or a square next to it.
+item_location find_cook_craft( map &here, const tripoint_bub_ms &me, uint64_t uid )
+{
+    for( const tripoint_bub_ms &q : here.points_in_radius( me, 1 ) ) {
+        size_t looked = 0;
+        for( item &it : here.i_at( q ) ) {
+            if( looked++ >= max_cook_scan ) {
+                break;
+            }
+            if( it.is_craft() && read_cook_pot( it ) == uid ) {
+                return item_location( map_cursor( q ), &it );
+            }
+        }
+    }
+    return item_location();
+}
+
+void capture_cookware( map &here, const tripoint_bub_ms &p, uint8_t tile, submap_view &sm,
+                       std::unordered_set<uint64_t> &seen, const avatar &u )
+{
+    const tripoint_bub_ms me = u.pos_bub();
     size_t index = 0;
     for( item &it : here.i_at( p ) ) {
         const size_t at = index++;
@@ -315,17 +381,11 @@ void capture_cookware( map &here, const tripoint_bub_ms &p, uint8_t tile, submap
                 take_craft( *in );
             }
         }
-        // A craft the `cook` action started lies at the avatar's feet, next to its pot, naming it.
+        // A craft the `cook` action started lies by the avatar (its square or one next to it), next to its pot,
+        // naming it.
         if( cw.craft_recipe.empty() && cw.uid != 0 && square_dist( me, p ) <= 1 ) {
-            size_t looked = 0;
-            for( const item &other : here.i_at( me ) ) {
-                if( looked++ >= 256 ) {
-                    break;
-                }
-                if( other.is_craft() && read_cook_pot( other ) == cw.uid ) {
-                    take_craft( other );
-                    break;
-                }
+            if( const item_location linked = find_cook_craft( here, me, cw.uid ) ) {
+                take_craft( *linked );
             }
         }
         sm.cookware.push_back( std::move( cw ) );
@@ -576,7 +636,7 @@ void capture_heat_and_cookware( map &here, const avatar &u, const tripoint_bub_m
         sm.heat.push_back( hv );
         // What is in or on it only as CDDA shows it (an oven is a container: seen into from next to it).
         if( here.could_see_items( p, u.pos_bub() ) ) {
-            capture_cookware( here, p, hv.tile, sm, seen, u.pos_bub() );
+            capture_cookware( here, p, hv.tile, sm, seen, u );
         }
     }
     heat_ms_total += std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
@@ -801,6 +861,31 @@ std::string start_cooking( avatar &u, const item_action &a )
     if( !pot->is_container() ) {
         return _( "Nothing can be cooked in that." );
     }
+    // One craft a pot: the one it was cooking (paused, lying by the avatar) goes on, as CDDA's own way on
+    // (iuse::craft), instead of a new one.
+    if( item_location linked = find_cook_craft( here, me, a.item.uid ) ) {
+        const recipe &making = linked->get_making();
+        if( making.ident().str() != a.recipe ) {
+            return string_format( _( "Something else is cooking in the %s already." ), pot->type_name() );
+        }
+        const std::string blocked = cook_craft_blocked( u, *linked );
+        if( !blocked.empty() ) {
+            return blocked;
+        }
+        if( u.is_driving() ) {
+            return _( "You can't craft while driving!" );
+        }
+        if( !u.can_continue_craft( *linked ) ) {
+            return _( "You can't go on with that now." );
+        }
+        if( !u.has_recipe( &making ) ) {
+            return string_format( _( "You don't know the recipe for the %s and can't continue crafting." ),
+                                  making.result_name() );
+        }
+        u.add_msg_if_player( pgettext( "in progress craft", "You start working on the %s." ), linked->tname() );
+        u.assign_activity( craft_activity_actor( linked, false ) );
+        return std::string();
+    }
     // Only a cooking recipe match_recipes would list for these contents. The client's text is compared, never
     // made an id itself.
     const contents_view cv = read_contents( *pot );
@@ -829,6 +914,10 @@ std::string start_cooking( avatar &u, const item_action &a )
     }
     if( !r.character_has_required_proficiencies( u ) ) {
         return _( "You don't have the required proficiencies to craft this!" );
+    }
+    // The pot cooks on its heat only (the craft stops when it leaves it, cook_craft_blocked).
+    if( !heat_lit_at( here, u, p ) ) {
+        return string_format( _( "The %s has to be on a lit heat source." ), pot->type_name() );
     }
     const std::function<bool( const item & )> filter = r.get_component_filter();
     tool_source tools{ u, *pot, std::nullopt };
@@ -945,6 +1034,60 @@ std::string start_cooking( avatar &u, const item_action &a )
     u.assign_activity( craft_activity_actor( craft_loc, false ) );
     u.add_msg_if_player( pgettext( "in progress craft", "You start working on the %s." ), craft_loc->tname() );
     return std::string();
+}
+
+std::string cook_craft_blocked( const Character &who, const item &craft )
+{
+    if( !active() || !who.is_avatar() ) {
+        return std::string();
+    }
+    const uint64_t uid = read_cook_pot( craft );
+    if( uid == 0 ) {
+        return std::string();
+    }
+    map &here = get_map();
+    tripoint_bub_ms at;
+    const item *pot = find_cook_pot( here, who.pos_bub( here ), uid, at );
+    if( pot == nullptr ) {
+        return _( "What that was cooking in isn't on the heat next to you." );
+    }
+    if( !heat_lit_at( here, who, at ) ) {
+        return string_format( _( "The %s has to be on a lit heat source." ), pot->type_name() );
+    }
+    return std::string();
+}
+
+bool cooked_into_pot( Character &who, const item &craft, item &result )
+{
+    if( !active() || !who.is_avatar() ) {
+        return false;
+    }
+    const uint64_t uid = read_cook_pot( craft );
+    if( uid == 0 ) {
+        return false;
+    }
+    map &here = get_map();
+    tripoint_bub_ms at;
+    item *pot = find_cook_pot( here, who.pos_bub( here ), uid, at );
+    if( pot == nullptr || !pot->is_container() ) {
+        return false;
+    }
+    // CDDA's own filling: its pockets' rules (a liquid never joins another kind) and their room.
+    const bool by_charges = result.count_by_charges();
+    const int wanted = by_charges ? result.charges : 1;
+    const int filled = pot->fill_with( result, wanted );
+    if( filled <= 0 ) {
+        return false;
+    }
+    pot->on_contents_changed();
+    //~ %1$s: what was cooked, %2$s: the pot
+    who.add_msg_if_player( m_good, _( "The %1$s is ready in the %2$s." ), result.type_name( filled ),
+                           pot->type_name() );
+    if( by_charges ) {
+        result.charges -= filled;
+        return result.charges <= 0;
+    }
+    return true;
 }
 
 } // namespace fp3d

@@ -24,11 +24,15 @@
 #include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
 #include "fp3d/snapshot.h"
+#include "field_type.h"
 #include "game_constants.h"
+#include "iexamine.h"
 #include "input_context.h"
 #include "item.h"
 #include "item_location.h"
 #include "item_pocket.h"
+#include "iuse.h"
+#include "iuse_actor.h"
 #include "itype.h"
 #include "line.h"
 #include "map.h"
@@ -52,6 +56,8 @@
 static const activity_id ACT_CONSUME( "ACT_CONSUME" );
 
 static const ammotype ammo_plutonium( "plutonium" );
+
+static const damage_type_id damage_bash( "bash" );
 
 static const efftype_id effect_incorporeal( "incorporeal" );
 static const json_character_flag json_flag_CANNOT_ATTACK( "CANNOT_ATTACK" );
@@ -1261,7 +1267,8 @@ int pour_into_best( avatar &u, item_location dst, const item &liquid, std::strin
     return 0;
 }
 
-// The liquid out of the carried container `a.item` (or, when `a.item` is a liquid, that liquid out of its container),
+// The liquid out of the container `a.item`, carried or lying in reach (or, when `a.item` is a carried liquid, that
+// liquid out of its container),
 // with CDDA's liquid rules and no menu, onto the square `a.pos` or into the container `a.container` (one or the other,
 // bridge.h). Only liquids pour: frozen ones and solids stay, and a container holding none is refused, as is one sealed
 // or in a sealed pocket, or a liquid in a gun, magazine or tool.
@@ -1276,7 +1283,12 @@ bool pour( avatar &u, const item_action &a )
     map &here = get_map();
     item_location src = find_carried( u, a.item );
     if( !src ) {
-        return refuse( u, _( "You don't have that any more." ) );
+        // Not carried: a container lying on the avatar's square or one next to it (a pot on its burner).
+        std::string why;
+        src = find_near( u, a.item, why );
+        if( !src ) {
+            return refuse( u, why );
+        }
     }
     item_location cont = src;
     std::vector<item_location> liquids;
@@ -1390,6 +1402,115 @@ bool pour( avatar &u, const item_action &a )
     }
     u.mod_moves( -100 * moved_stacks );
     after_inventory_change( u );
+    return true;
+}
+
+// The firestarter use of `it` (CDDA's iuse actor), null if it has none.
+const firestarter_actor *firestarter_of( const item &it )
+{
+    const use_function *usef = it.type->get_use( "firestarter" );
+    return usef != nullptr && usef->get_actor_ptr() != nullptr ?
+           dynamic_cast<const firestarter_actor *>( usef->get_actor_ptr() ) : nullptr;
+}
+
+// CDDA's fire starting (the firestarter item use: its questions, time and charges) on the square `a.pos` next to the
+// avatar, with the carried item `a.item`, or with none named the quickest carried one that works now (as examining a
+// fireplace picks it).
+bool light( avatar &u, const item_action &a )
+{
+    map &here = get_map();
+    const std::optional<tripoint_bub_ms> p = bubble_square( here, a.pos );
+    if( !p || !within_reach( u, *p ) ) {
+        return refuse( u, _( "You can't reach that from here." ) );
+    }
+    if( *p == u.pos_bub() ) {
+        return refuse( u, _( "You would set yourself on fire." ) );
+    }
+    item *tool = nullptr;
+    const firestarter_actor *actor = nullptr;
+    if( a.item.uid != 0 ) {
+        item_location loc = find_carried( u, a.item );
+        if( !loc ) {
+            return refuse( u, _( "You don't have that any more." ) );
+        }
+        const std::string why = pocket_block( loc );
+        if( !why.empty() ) {
+            return refuse( u, why );
+        }
+        actor = firestarter_of( *loc );
+        if( actor == nullptr ) {
+            return refuse( u, string_format( _( "You can't light a fire with your %s." ), loc->tname() ) );
+        }
+        const ret_val<void> can = actor->can_use( u, *loc, *p );
+        if( !can.success() ) {
+            return refuse( u, can.str() );
+        }
+        tool = loc.get_item();
+    } else {
+        for( item *it : u.items_with( []( const item & i ) {
+        return i.has_flag( flag_FIRESTARTER ) || i.has_flag( flag_FIRE );
+        } ) ) {
+            const firestarter_actor *found = firestarter_of( *it );
+            if( found != nullptr && ( actor == nullptr || found->moves_cost_fast < actor->moves_cost_fast ) &&
+                found->can_use( u, *it, *p ).success() ) {
+                actor = found;
+                tool = it;
+            }
+        }
+        if( tool == nullptr ) {
+            return refuse( u, _( "You have nothing to light a fire with." ) );
+        }
+    }
+    u.add_msg_if_player( _( "You attempt to start a fire with your %s…" ), tool->tname() );
+    const itype_id tool_type = tool->typeId();
+    // As examining a fireplace: CDDA says why itself when it doesn't start; a long start is its activity.
+    const std::optional<int> used = actor->use( &u, *tool, *p );
+    if( !used ) {
+        return refuse_quietly( _( "You weren't able to start a fire." ) );
+    }
+    if( *used > 0 ) {
+        u.use_charges( tool_type, *used );
+    }
+    after_inventory_change( u );
+    return true;
+}
+
+// CDDA's "Extinguish fire" of a fireplace (iexamine::fireplace): the fire in the fire furniture on `a.pos` is beaten
+// out with something that bashes, carried or lying near. A fire anywhere else isn't put out by hand.
+bool extinguish( avatar &u, const item_action &a )
+{
+    map &here = get_map();
+    const std::optional<tripoint_bub_ms> p = bubble_square( here, a.pos );
+    if( !p || !within_reach( u, *p ) ) {
+        return refuse( u, _( "You can't reach that from here." ) );
+    }
+    if( !here.get_field( *p, fd_fire ) ) {
+        return refuse( u, _( "There is no fire there." ) );
+    }
+    if( !here.furn( *p ).obj().has_examine( iexamine::fireplace ) ) {
+        return refuse( u, _( "You can't put that fire out by hand." ) );
+    }
+    const auto quenches = []( const item & it ) {
+        return it.damage_melee( damage_bash ) > 0;
+    };
+    bool have = !u.items_with( quenches ).empty();
+    for( const tripoint_bub_ms &q : closest_points_first( u.pos_bub(), PICKUP_RANGE ) ) {
+        if( have ) {
+            break;
+        }
+        // What lies in the fireplace can't quench it.
+        if( q == *p || !here.inbounds( q ) ) {
+            continue;
+        }
+        have = !here.items_with( q, quenches ).empty();
+    }
+    if( !have ) {
+        return refuse( u, _( "You need something to beat the fire out with." ) );
+    }
+    here.remove_field( *p, fd_fire );
+    u.mod_moves( -200 );
+    u.add_msg_if_player( m_info, _( "With a few determined moves you put out the fire in the %s." ),
+                         here.furnname( *p ) );
     return true;
 }
 } // namespace
@@ -1809,7 +1930,7 @@ bool consume( avatar &u, const item_action &a )
 
 void register_item_actions( input_context &ctxt )
 {
-    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw, pour, place, spot, hold, consume or cook one item" ) );
+    ctxt.register_action( item_action_name, no_translation( "take, put, drop, unload, reload, clear, throw, pour, place, spot, hold, consume or cook one item, light or put out a fire" ) );
 }
 
 bool is_item_action( const std::string &action )
@@ -1861,6 +1982,10 @@ bool run_one_item_action( avatar &u, const std::optional<item_action> &a )
             const std::string why = start_cooking( u, *a );
             return why.empty() || refuse( u, why );
         }
+        case item_op::light:
+            return light( u, *a );
+        case item_op::extinguish:
+            return extinguish( u, *a );
     }
     return false;
 }
