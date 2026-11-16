@@ -363,8 +363,9 @@ constexpr size_t max_sheet_description_columns = 400;
 constexpr size_t max_sheet_id_bytes = 64;
 
 // The avatar's character sheet as JSON. Over `max_bytes`, descriptions are emptied from the end (effects first,
-// then bionics, traits, proficiencies, skills) and "truncated" is true; the lists stay whole. The result can still
-// be over `max_bytes` when the rest alone is (the bridge then answers "too large").
+// then bionics, traits, proficiencies, skills) and "truncated" is true. Still over, entries go from the ends of the
+// lists: effects, proficiencies being learned, known ones, traits, bionics, speed modifiers, skills. Only the
+// fixed fields left can still be over `max_bytes` (a few KB; the bridge then answers "too large").
 std::string run_character_query( uint64_t query_id, size_t max_bytes );
 std::string character_query_error_json( uint64_t query_id, const std::string &error );
 

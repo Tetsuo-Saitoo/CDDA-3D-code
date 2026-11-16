@@ -268,6 +268,7 @@ std::atomic<uint64_t> lc_far_pack_uid{ 0 };     // a backpack 2 squares west hol
 std::mutex cq_m;
 std::string cq_full;   // run_character_query with no byte limit
 std::string cq_cut;    // the same with 300 bytes less room than it needs
+std::string cq_tiny;   // the same in 3000 bytes: lists cut too
 std::string cq_name;   // the avatar's name as the sheet shows it
 
 // Range op checks: 32 operations queued from inside the sim's hook (so none run before the queue is full), then one
@@ -1159,9 +1160,11 @@ void observe()
             u.add_effect( effect_winded, 1_hours );
             const std::string full = fp3d::run_character_query( 901, SIZE_MAX );
             const std::string cut = fp3d::run_character_query( 902, full.size() > 300 ? full.size() - 300 : 0 );
+            const std::string tiny = fp3d::run_character_query( 903, 3000 );
             std::lock_guard<std::mutex> lk( cq_m );
             cq_full = full;
             cq_cut = cut;
+            cq_tiny = tiny;
             cq_name = fp3d::client_text( u.get_name(), fp3d::max_sheet_name_columns, 4 * fp3d::max_sheet_name_columns );
             break;
         }
@@ -6381,11 +6384,13 @@ static bool run_character_query_checks()
     const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
     std::string full;
     std::string cut;
+    std::string tiny;
     std::string name;
     {
         std::lock_guard<std::mutex> lk( cq_m );
         full = cq_full;
         cut = cq_cut;
+        tiny = cq_tiny;
         name = cq_name;
     }
     if( !r || !r->timed || !s0 || full.empty() ) {
@@ -6425,6 +6430,17 @@ static bool run_character_query_checks()
            cut_winded != c.effects.end() && cut_winded->second.empty(),
            "less room: descriptions go from the end", std::to_string( cut.size() ) + " of " +
            std::to_string( full.size() ) + " bytes" );
+    // Far less room: list tails go too, effects first, skills last.
+    const parsed t = parse( tiny );
+    const size_t full_entries = f.skills.size() + f.traits.size() + f.bionics.size() + f.known + f.learning +
+                                f.effects.size();
+    const size_t tiny_entries = t.skills.size() + t.traits.size() + t.bionics.size() + t.known + t.learning +
+                                t.effects.size();
+    check( t.valid && t.ok && t.truncated && tiny.size() <= 3000 && tiny_entries < full_entries && t.effects.empty() &&
+           !t.skills.empty() && t.stat_ids.size() == 4 && t.encumbrance == f.encumbrance,
+           "in 3000 bytes: list tails go, skills last", std::to_string( tiny.size() ) + " bytes, " +
+           std::to_string( tiny_entries ) + " of " + std::to_string( full_entries ) + " entries, " +
+           std::to_string( t.skills.size() ) + " skills" );
 
     // Through the bridge: run by the main loop.
     r = fp3d::wait_request( 5000 );
