@@ -1272,6 +1272,19 @@ std::optional<tripoint_bub_ms> choose_adjacent_highlight( map &here, const tripo
         }
     }
 
+    // FP3D: an action the client queued for one square (fp3d::queue_action_at) takes exactly that square when CDDA
+    // allows it there, never another one picked for it, and asks nothing.
+    if( fp3d::active() ) {
+        if( const std::optional<fp3d::ui_point> sq = fp3d::take_action_square() ) {
+            const tripoint_bub_ms at = here.get_bub( fp3d::to_abs_ms( *sq ) );
+            if( std::find( valid.begin(), valid.end(), at ) != valid.end() ) {
+                return at;
+            }
+            add_msg( failure_message );
+            return std::nullopt;
+        }
+    }
+
     const bool auto_select = allow_autoselect && get_option<bool>( "AUTOSELECT_SINGLE_VALID_TARGET" );
     if( valid.empty() && auto_select ) {
         add_msg( failure_message );

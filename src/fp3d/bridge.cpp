@@ -24,6 +24,7 @@ struct queued_action {
     std::string action;
     std::optional<item_action> item;
     std::optional<stairs_action> stairs;
+    std::optional<ui_point> square;      // queue_action_at
 };
 
 // A recipe query (L9) waiting for the sim.
@@ -48,6 +49,8 @@ struct channel {
     std::deque<queued_action> actions;   // queued main-loop actions (block B5)
     std::optional<item_action> item_now; // the item action last answered as `fp3d_item`, until the sim takes it
     std::optional<stairs_action> stairs_now; // ... and the stairs action answered as `fp3d_stairs`
+    std::optional<ui_point> square_now;  // the square the action last answered was queued with, until the sim
+                                         // takes it or the main loop waits again
     bool save_wanted = false;            // request_save() until the sim takes it
     bool job_wanted = false;             // want_job() until the main loop takes it
     bool save_if_changed = false;
@@ -258,8 +261,9 @@ ui_answer ask( ui_request req )
     c.item_now.reset();   // only the answer to this request may carry one (a client can't send `fp3d_item` itself)
     c.stairs_now.reset();
     if( timed ) {
-        // The main loop waits for input again: what an interrupt was meant for has ended.
+        // The main loop waits for input again: what an interrupt or a queued square was meant for has ended.
         interrupt_requested.store( false );
+        c.square_now.reset();
     }
     c.pending = std::move( req );
     c.cv.notify_all();
@@ -299,6 +303,7 @@ ui_answer ask( ui_request req )
             queued.action = std::move( c.actions.front().action );
             c.item_now = std::move( c.actions.front().item );
             c.stairs_now = std::move( c.actions.front().stairs );
+            c.square_now = std::move( c.actions.front().square );
             queued.queued = true;
             c.actions.pop_front();
             c.reply = std::move( queued );
@@ -456,7 +461,7 @@ void hostile_spotted()
     }
 }
 
-bool queue_action( const std::string &action )
+static bool queue_plain_action( const std::string &action, const std::optional<ui_point> &square )
 {
     // The bridge's own answers (a save, cheats) only come from the bridge.
     if( action == save_action || action == job_action || action == item_action_name ||
@@ -468,9 +473,31 @@ bool queue_action( const std::string &action )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ sanitize_text( action, 128 ), std::nullopt, std::nullopt } );
+    c.actions.push_back( queued_action{ sanitize_text( action, 128 ), std::nullopt, std::nullopt, square } );
     c.cv.notify_all();
     return true;
+}
+
+bool queue_action( const std::string &action )
+{
+    return queue_plain_action( action, std::nullopt );
+}
+
+bool queue_action_at( const std::string &action, const ui_point &square )
+{
+    if( !coord_ok( square.x ) || !coord_ok( square.y ) || square.z < -OVERMAP_DEPTH || square.z > OVERMAP_HEIGHT ) {
+        return false;
+    }
+    return queue_plain_action( action, square );
+}
+
+std::optional<ui_point> take_action_square()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    std::optional<ui_point> sq = std::move( c.square_now );
+    c.square_now.reset();
+    return sq;
 }
 
 bool queue_item_action( const item_action &a )
@@ -503,7 +530,7 @@ bool queue_item_action( const item_action &a )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ item_action_name, a, std::nullopt } );
+    c.actions.push_back( queued_action{ item_action_name, a, std::nullopt, std::nullopt } );
     c.cv.notify_all();
     return true;
 }
@@ -528,7 +555,7 @@ bool queue_stairs_action( const stairs_action &a )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ stairs_action_name, std::nullopt, a } );
+    c.actions.push_back( queued_action{ stairs_action_name, std::nullopt, a, std::nullopt } );
     c.cv.notify_all();
     return true;
 }

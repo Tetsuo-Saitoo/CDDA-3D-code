@@ -263,6 +263,7 @@ std::atomic<int> weather_wait{ 0 };
 // The interrupt checks: 1 map travel to the next overmap tile over flat ground; 2 a 5-minute wait; 3 a 6-hour wait;
 // 4 read whether a route is left (interrupt_route: 1 yes, 0 no) and end the travel.
 std::atomic<int> interrupt_setup{ 0 };
+std::atomic<int> furniture_setup{ 0 };         // the furniture checks' scene (set_up_furniture)
 std::atomic<int> interrupt_route{ -1 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
@@ -529,6 +530,37 @@ void wait_in_weather( bool start )
                                   100 * to_turns<int>( 20_minutes ), 0 ) );
 }
 
+// The furniture checks' scene: flat ground; a closed safe east and another behind it, a locked safe west, a nailed
+// crate north, a dresser south and another 2 squares south: a rock in each.
+void set_up_furniture()
+{
+    avatar &u = get_avatar();
+    map &here = get_map();
+    const tripoint_bub_ms p = u.pos_bub();
+    g->clear_zombies();
+    for( int dx = -3; dx <= 3; dx++ ) {
+        for( int dy = -3; dy <= 3; dy++ ) {
+            const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+            here.i_clear( q );
+            here.furn_set( q, furn_str_id::NULL_ID() );
+            here.ter_set( q, ter_t_dirt );
+        }
+    }
+    const auto place = [&]( int dx, int dy, const char *id ) {
+        const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+        here.furn_set( q, furn_str_id( id ) );
+        here.add_item( q, item( itype_rock ) );
+    };
+    place( 1, 0, "f_safe_c" );
+    place( 2, 0, "f_safe_c" );
+    place( -1, 0, "f_safe_l" );
+    place( 0, -1, "f_crate_c" );
+    place( 0, 1, "f_dresser" );
+    place( 0, 2, "f_dresser" );
+    here.invalidate_map_cache( p.z() );
+    here.build_map_cache( p.z() );
+}
+
 // The interrupt checks' scenes (interrupt_setup).
 void set_up_interrupt( int stage )
 {
@@ -589,6 +621,9 @@ void observe()
     }
     if( const int stage = interrupt_setup.exchange( 0 ); stage != 0 ) {
         set_up_interrupt( stage );
+    }
+    if( furniture_setup.exchange( 0 ) != 0 ) {
+        set_up_furniture();
     }
     if( const int stage = physics_setup.exchange( 0 ); stage == 1 ) {
         set_up_item_physics();
@@ -1936,6 +1971,27 @@ static std::vector<fp3d::item_handle_view> handles_at( const fp3d::ui_point &p )
         }
     }
     return {};
+}
+
+// The furniture id on absolute square `p` in the newest snapshot ("" when not in it).
+static std::string furn_at( const fp3d::ui_point &p )
+{
+    const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+    if( !s ) {
+        return "";
+    }
+    const auto floor_div = []( int a ) {
+        return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+    };
+    const int sx = floor_div( p.x );
+    const int sy = floor_div( p.y );
+    const int tile = ( p.y - sy * fp3d::sm_size ) * fp3d::sm_size + ( p.x - sx * fp3d::sm_size );
+    for( const std::shared_ptr<const fp3d::submap_view> &sm : s->submaps ) {
+        if( sm->pos.x == sx && sm->pos.y == sy && sm->pos.z == p.z ) {
+            return fp3d::cdda_id_name( "furn", sm->furn[tile] );
+        }
+    }
+    return "";
 }
 
 static std::vector<fp3d::carried_view> carried_now()
@@ -5446,6 +5502,121 @@ static bool run_interrupt_checks()
     return failed == 0;
 }
 
+// Containers and their doors (L8, 2026-11-15): a closed CONTAINER's items are listed from the next square only, a
+// SEALED one's never; an action queued for one square (queue_action_at) opens or closes exactly that square, with
+// CDDA's rules and words, and never the only other one CDDA would pick by itself.
+static bool run_furniture_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  furniture: %-45s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    furniture_setup = 1;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 || furniture_setup.load() != 0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    const auto at = [&]( int dx, int dy ) {
+        return fp3d::ui_point{ here.x + dx, here.y + dy, here.z };
+    };
+    const auto has = []( const std::string & str, const char *part ) {
+        return str.find( part ) != std::string::npos;
+    };
+    const uint32_t t_rock = fp3d::intern_id( fp3d::id_kind::itype, "rock" );
+    // `action` queued for square (dx, dy) and run: its messages; `prompts` counts what it asked (cancelled).
+    int prompts = 0;
+    const auto act = [&]( const char *action, int dx, int dy ) {
+        std::vector<fp3d::event> evs;
+        fp3d::drain_events( evs );
+        evs.clear();
+        prompts = 0;
+        if( !fp3d::queue_action_at( action, at( dx, dy ) ) ) {
+            return std::string( "(refused)" );
+        }
+        const uint64_t before = r->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 20000 ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( !r->timed ) {
+                prompts++;
+                fp3d::ui_answer a;
+                a.id = r->id;
+                a.cancel = true;
+                fp3d::answer( a );
+                continue;
+            }
+            if( r->id != before ) {
+                break;
+            }
+        }
+        fp3d::drain_events( evs );
+        std::string msgs;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                msgs += ( msgs.empty() ? "" : " | " ) + e.text;
+            }
+        }
+        return msgs;
+    };
+    const auto rocks = [&]( int dx, int dy ) {
+        size_t n = 0;
+        for( const fp3d::item_handle_view &h : handles_at( at( dx, dy ) ) ) {
+            n += h.type == t_rock ? 1 : 0;
+        }
+        return n;
+    };
+
+    check( rocks( 0, 1 ) == 1 && rocks( 0, 2 ) == 0 && rocks( 1, 0 ) == 0 && rocks( -1, 0 ) == 0 &&
+           rocks( 0, -1 ) == 0 && furn_at( at( 1, 0 ) ) == "f_safe_c",
+           "a dresser's items: next to it yes, 2 away no", "dressers " + std::to_string( rocks( 0, 1 ) ) + " / " +
+           std::to_string( rocks( 0, 2 ) ) + ", sealed " + std::to_string( rocks( 1, 0 ) + rocks( -1, 0 ) +
+                   rocks( 0, -1 ) ) + ", east " + furn_at( at( 1, 0 ) ) );
+
+    // The safe east is the only square here that opens: CDDA would pick it for any `open` by itself.
+    std::string m = act( "open", -1, 0 );
+    check( furn_at( at( -1, 0 ) ) == "f_safe_l" && furn_at( at( 1, 0 ) ) == "f_safe_c" && prompts == 0 &&
+           has( m, "nothing that can be opened" ), "open a locked safe: nothing opens", "[" + m + "]" );
+    m = act( "open", 0, -1 );
+    check( furn_at( at( 0, -1 ) ) == "f_crate_c" && furn_at( at( 1, 0 ) ) == "f_safe_c" && prompts == 0 &&
+           has( m, "nothing that can be opened" ), "open a nailed crate: nothing opens", "[" + m + "]" );
+    m = act( "open", 2, 0 );
+    check( furn_at( at( 2, 0 ) ) == "f_safe_c" && furn_at( at( 1, 0 ) ) == "f_safe_c" && prompts == 0 &&
+           has( m, "nothing that can be opened" ), "open a safe 2 squares away: nothing opens", "[" + m + "]" );
+
+    m = act( "open", 1, 0 );
+    const std::vector<fp3d::item_handle_view> inside = handles_at( at( 1, 0 ) );
+    check( furn_at( at( 1, 0 ) ) == "f_safe_o" && inside.size() == 1 && inside[0].type == t_rock && prompts == 0,
+           "open the safe next to you: its rock listed", "[" + m + "] " + furn_at( at( 1, 0 ) ) + ", " +
+           std::to_string( inside.size() ) + " handles" );
+    m = act( "close", 1, 0 );
+    const bool shut = furn_at( at( 1, 0 ) ) == "f_safe_c" && handles_at( at( 1, 0 ) ).empty() && prompts == 0;
+    const std::string m2 = act( "open", 1, 0 );
+    const std::vector<fp3d::item_handle_view> again = handles_at( at( 1, 0 ) );
+    check( shut && again.size() == 1 && inside.size() == 1 && again[0].uid == inside[0].uid,
+           "close it: hidden, still inside when opened", "[" + m + "] [" + m2 + "]" );
+
+    // The bridge refuses its own answers and squares out of range.
+    check( !fp3d::queue_action_at( fp3d::save_action, at( 1, 0 ) ) &&
+           !fp3d::queue_action_at( "open", fp3d::ui_point{ 1 << 30, here.y, here.z } ) &&
+           !fp3d::queue_action_at( "open", fp3d::ui_point{ here.x, here.y, 1000 } ) && fp3d::queued_actions() == 0,
+           "bad squares refused", "" );
+    return failed == 0;
+}
+
 // A saved range game resumes only in a range world (fp3d/test_range.h resume_test_range, 2026-11-10): this normal
 // world's save carries the range's avatar values (mark_as_range), and resumed after the reload as the bridge does, it
 // stays a normal game: no range, no zones, AI not frozen.
@@ -6123,6 +6294,7 @@ int main()
         return event_counts[static_cast<size_t>( fp3d::event_kind::lightning )];
     } );
     const bool interrupt_ok = weather_cheat_ok && run_interrupt_checks();
+    const bool furniture_ok = interrupt_ok && run_furniture_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -6175,6 +6347,7 @@ int main()
     std::printf( "item physics: %s\n", physics_ok ? "ok" : "BAD" );
     std::printf( "weather cheat: %s\n", weather_cheat_ok ? "ok" : "BAD" );
     std::printf( "interrupt: %s\n", interrupt_ok ? "ok" : "BAD" );
+    std::printf( "furniture: %s\n", furniture_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
@@ -6185,6 +6358,6 @@ int main()
     return passed == static_cast<int>( n_goals ) && snap_ok && events_ok && queue_ok && safemode_ok && hands_ok &&
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
-           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok ?
+           resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }
