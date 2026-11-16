@@ -11,6 +11,9 @@
 // Nobody next to you that way: the main hand's weapon with reach strikes the first creature along it (CDDA's
 // reach attack, up to its reach, 3 at most). "fp3d_attack_<main|off>_aim_<DIR>" is the same strike, aimed: the
 // client's crosshair is on that creature, so the swing asks a `swing` request (fp3d/swing.h).
+// "fp3d_attack_main_at" / "fp3d_attack_main_aim_at", queued with a square (queue_action_at, take_action_square):
+// the main hand at that square, e.g. a knight's move off; this level, not your own square, within the weapon's
+// reach (rl_dist), else "That's out of reach." with no time spent.
 
 #include <string>
 #include <vector>
