@@ -279,6 +279,15 @@ struct mood_view {
 // >= -10: 0, >= -50: -1, >= -100: -2, lower: -3.
 int8_t mood_band( int level );
 
+// What the character is busy with, for a "time passes" line while the game runs on by itself.
+struct activity_view {
+    std::string id;                               // CDDA's activity type id ("ACT_WAIT"); letters, digits and _,
+                                                  // up to max_activity_id_bytes ("" if it is anything else)
+    std::string verb;                             // CDDA's verb for it ("waiting"); up to max_activity_verb_columns
+};
+constexpr size_t max_activity_id_bytes = 64;
+constexpr size_t max_activity_verb_columns = 40;
+
 struct player_view {
     uint64_t uid = 0;
     ui_point pos;
@@ -309,6 +318,8 @@ struct player_view {
     std::optional<gun_view> wielded_gun;          // when the wielded item is a gun
     std::vector<effect_view> effects;             // cap max_player_effects
     mood_view mood;
+    std::optional<activity_view> activity;        // while an activity runs
+    bool asleep = false;                          // asleep (the sleep effect), not while still trying to
 };
 
 struct environment_view {

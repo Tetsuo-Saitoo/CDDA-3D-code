@@ -604,7 +604,7 @@ void set_up_weather_mood( bool on )
 
 // The weather cheat's wait: 20 minutes of CDDA's wait activity at 20 C (so the storm brings no "You are freezing!"
 // question), nothing hostile about; then the world's own temperature again.
-void wait_in_weather( bool start )
+void wait_in_weather( bool start, int minutes = 20 )
 {
     weather_manager &w = get_weather();
     if( !start ) {
@@ -614,7 +614,22 @@ void wait_in_weather( bool start )
     g->clear_zombies();
     w.forced_temperature = units::from_celsius( 20 );
     get_avatar().assign_activity( player_activity( activity_id( "ACT_WAIT" ),
-                                  100 * to_turns<int>( 20_minutes ), 0 ) );
+                                  100 * to_turns<int>( time_duration::from_minutes( minutes ) ), 0 ) );
+}
+
+// The running hook (fp3d::set_running_hook), as the bridge sets it: a snapshot while the game runs on by itself.
+// Counted, with the game turn of the last one, for run_running_checks.
+std::atomic<int> running_calls{ 0 };
+std::atomic<int64_t> running_turn{ -1 };
+std::atomic<int64_t> running_us{ 0 };   // wall time spent in it
+void running()
+{
+    const auto t = std::chrono::steady_clock::now();
+    const std::shared_ptr<const fp3d::snapshot> s = fp3d::capture_snapshot();
+    running_turn.store( s->turn );
+    running_calls++;
+    fp3d::publish_snapshot( s );
+    running_us += std::chrono::duration_cast<std::chrono::microseconds>( std::chrono::steady_clock::now() - t ).count();
 }
 
 // The furniture checks' scene: flat ground; a closed safe east and another behind it, a locked safe west, a nailed
@@ -755,7 +770,7 @@ void observe()
         set_up_weather_mood( setup == 1 );
     }
     if( const int ww = weather_wait.exchange( 0 ); ww != 0 ) {
-        wait_in_weather( ww == 1 );
+        wait_in_weather( ww != 2, ww == 3 ? 60 : 20 );
     }
     if( const int stage = interrupt_setup.exchange( 0 ); stage != 0 ) {
         set_up_interrupt( stage );
@@ -1865,6 +1880,7 @@ void sim_main()
         const std::string save_id = get_avatar().get_save_id();
         std::printf( "sim: game started, scene built\n" );
         fp3d::set_before_ask_hook( observe );
+        fp3d::set_running_hook( running );
         while( !do_turn() ) {
         }
         // Each time the game saves and quits (the save goal, the cooking checks): back to it the way the main menu
@@ -6732,6 +6748,71 @@ static bool run_weather_cheat_checks( const std::function<size_t()> &lightning_s
     return failed == 0;
 }
 
+// The game running on by itself (fp3d::set_running_hook): during a wait of an hour, which asks nothing, snapshots
+// still come, with turns from inside the wait, and no more often than the gap allows.
+static bool run_running_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  running: %-41s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    // Turns pass until the main loop asks again; a question instead is cancelled and fails.
+    const auto pass = [&]( double ms ) {
+        const uint64_t before = r->id;
+        fp3d::queue_action( "pause" );
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < ms ) {
+            if( std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id ) ) {
+                r = next;
+                if( !r->timed ) {
+                    std::printf( "    question: %s %s\n", r->title.c_str(), r->text.c_str() );
+                    fp3d::ui_answer a;
+                    a.id = r->id;
+                    a.cancel = true;
+                    fp3d::answer( a );
+                    return false;
+                }
+                if( r->id != before ) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+    // A plain turn: a request comes, so the running hook stays out of it.
+    const int quiet = running_calls.load();
+    check( pass( 20000 ) && running_calls.load() == quiet, "no extra snapshot on a turn with a request", "" );
+    // The wait: started by the hook at one request, over at the next.
+    weather_wait.store( 3 );
+    const bool started = pass( 20000 ) && weather_wait.load() == 0;
+    const int64_t turn0 = r->turn;
+    const int calls0 = running_calls.load();
+    const int64_t us0 = running_us.load();
+    const auto t0 = std::chrono::steady_clock::now();
+    const bool waited = started && pass( 600000 );
+    const double ms = ms_since( t0 );
+    const int calls = running_calls.load() - calls0;
+    const int64_t passed = r->turn - turn0;
+    const int64_t last = running_turn.load();
+    check( waited && passed >= 3590, "an hour passes by itself", std::to_string( passed ) + " turns in " +
+           std::to_string( static_cast<int>( ms ) ) + " ms" );
+    check( calls >= 1 && last > turn0 && last < r->turn, "snapshots come meanwhile, from inside the wait",
+           std::to_string( calls ) + " snapshots, the last at turn " + std::to_string( last - turn0 ) + " of " +
+           std::to_string( passed ) );
+    check( calls <= static_cast<int>( ms / fp3d::running_hook_gap_ms ) + 1, "no more often than the gap",
+           std::to_string( calls ) + " in " + std::to_string( static_cast<int>( ms ) ) + " ms, " +
+           std::to_string( ( running_us.load() - us0 ) / 1000 ) + " ms of it taking them" );
+    weather_wait.store( 2 );
+    check( pass( 20000 ) && weather_wait.load() == 0, "the world's temperature again", "" );
+    return failed == 0;
+}
+
 // Interrupting (fp3d::interrupt, 2026-11-15): refused while the main loop waits for input, so a later wait runs to its
 // end; a wait and an auto-travel route are stopped after CDDA's popup, answered yes.
 static bool run_interrupt_checks()
@@ -8509,7 +8590,8 @@ int main()
         drain();
         return event_counts[static_cast<size_t>( fp3d::event_kind::lightning )];
     } );
-    const bool interrupt_ok = weather_cheat_ok && run_interrupt_checks();
+    const bool running_ok = weather_cheat_ok && run_running_checks();
+    const bool interrupt_ok = running_ok && run_interrupt_checks();
     const bool furniture_ok = interrupt_ok && run_furniture_checks();
     const bool consume_ok = furniture_ok && run_consume_checks();
     const bool offhand_ok = consume_ok && run_offhand_weight_checks();
@@ -8570,6 +8652,7 @@ int main()
     std::printf( "throw/pour: %s\n", throw_pour_ok ? "ok" : "BAD" );
     std::printf( "item physics: %s\n", physics_ok ? "ok" : "BAD" );
     std::printf( "weather cheat: %s\n", weather_cheat_ok ? "ok" : "BAD" );
+    std::printf( "running: %s\n", running_ok ? "ok" : "BAD" );
     std::printf( "interrupt: %s\n", interrupt_ok ? "ok" : "BAD" );
     std::printf( "furniture: %s\n", furniture_ok ? "ok" : "BAD" );
     std::printf( "consume: %s\n", consume_ok ? "ok" : "BAD" );
@@ -8595,6 +8678,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok && actions_ok && names_ok ?
+           peek_ok && number_ok && actions_ok && names_ok && running_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

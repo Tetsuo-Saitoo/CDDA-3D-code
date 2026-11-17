@@ -73,6 +73,8 @@
 
 static_assert( SEEX == fp3d::sm_size && SEEY == fp3d::sm_size, "snapshot submaps are 12x12" );
 
+static const efftype_id effect_sleep( "sleep" );
+
 namespace fp3d
 {
 namespace
@@ -664,6 +666,21 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
     pv.pain = clamp_i16( u.get_perceived_pain() );
     pv.morale = clamp_i16( u.get_morale_level() );
     capture_mood( u, pv.mood );
+    if( u.activity ) {
+        activity_view a;
+        const std::string &id = u.activity.id().str();
+        const bool plain = !id.empty() && id.size() <= max_activity_id_bytes &&
+        std::all_of( id.begin(), id.end(), []( const char ch ) {
+            return ( ch >= 'A' && ch <= 'Z' ) || ( ch >= 'a' && ch <= 'z' ) || ( ch >= '0' && ch <= '9' ) || ch == '_';
+        } );
+        if( plain ) {
+            a.id = id;
+        }
+        a.verb = client_text( u.activity.get_verb().translated(), max_activity_verb_columns,
+                              max_activity_verb_columns * 4 );
+        pv.activity = std::move( a );
+    }
+    pv.asleep = u.has_effect( effect_sleep );
     pv.wielded = wielded_index( u );
     if( const item_location w = u.get_wielded_item(); w && w->is_gun() ) {
         gun_view g;
@@ -1177,6 +1194,16 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     jo.member( "sleepiness", static_cast<int>( pv.sleepiness ) );
     jo.member( "pain", static_cast<int>( pv.pain ) );
     jo.member( "morale", static_cast<int>( pv.morale ) );
+    if( pv.activity ) {
+        jo.member( "activity" );
+        jo.start_object();
+        jo.member( "id", pv.activity->id );
+        jo.member( "verb", pv.activity->verb );
+        jo.end_object();
+    }
+    if( pv.asleep ) {
+        jo.member( "asleep", true );
+    }
     jo.member( "wielded", static_cast<int64_t>( pv.wielded ) );
     if( pv.wielded_gun ) {
         const gun_view &g = *pv.wielded_gun;
