@@ -385,6 +385,8 @@ hand_view view_of( const item_location &loc )
     }
     const item &it = *loc;
     h.held = true;
+    // Read only: the snapshot gives handles; an item it hasn't listed yet has none.
+    h.uid = read_item_handle( it );
     h.id = capped( it.typeId().str() );
     h.name = capped( remove_color_tags( item::tname( it.typeId() ) ) );
     const units::volume capacity = it.get_total_capacity();

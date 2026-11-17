@@ -89,6 +89,20 @@ int main()
         check( apple < t->items.size() && t->items[apple].id == "apple" && t->items[apple].volume_ml > 0 &&
                zombie < t->monsters.size() && t->monsters[zombie].hp > 0 && t->monsters[zombie].speed > 0 &&
                t->vparts.size() > 100 && !t->vparts[1].id.empty(), "apple, mon_zombie, vehicle parts defined" );
+        // The examine action's id goes with terrain and furniture: a fireplace's, none for a floor, an actor's type.
+        const auto examine_of = []( const std::vector<fp3d::terrain_def> &defs, const std::string & id ) {
+            for( const fp3d::terrain_def &d : defs ) {
+                if( d.id == id ) {
+                    return d.examine;
+                }
+            }
+            return std::string( "not in the table" );
+        };
+        check( examine_of( t->furn, "f_fireplace" ) == "fireplace" && examine_of( t->ter, "t_floor" ).empty() &&
+               examine_of( t->ter, "t_card_LIXA" ) == "cardreader",
+               "examine ids: fireplace, none for a floor, an actor's type",
+               examine_of( t->furn, "f_fireplace" ) + " / " + examine_of( t->ter, "t_floor" ) + " / " +
+               examine_of( t->ter, "t_card_LIXA" ) );
         // CDDA's phase goes with each item type: water is a liquid, an apple a solid.
         const uint32_t water = fp3d::intern_id( fp3d::id_kind::itype, "water" );
         check( water < t->items.size() && t->items[water].phase == "liquid" && apple < t->items.size() &&

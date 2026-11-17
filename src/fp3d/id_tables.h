@@ -16,12 +16,15 @@
 namespace fp3d
 {
 
+constexpr size_t max_examine_id_bytes = 64;
 struct terrain_def {               // terrain and furniture
     std::string id;
     std::string name;
     std::string symbol;            // UTF-8, the classic tile symbol
     std::string color;             // CDDA colour name, e.g. "c_light_gray"
     std::string looks_like;
+    std::string examine;           // CDDA's examine action id as the data names it (an actor: its type), "" = none;
+    // up to max_examine_id_bytes
     int move_cost = 0;             // terrain: move cost (0 = impassable); furniture: cost modifier (-1 impassable)
     int coverage = 0;              // percent
     int light_emitted = 0;
