@@ -42,6 +42,7 @@
 #include "pocket_type.h"
 #include "rng.h"
 #include "submap.h"
+#include "trap.h"
 #include "type_id.h"
 #include "units.h"
 #include "vehicle.h"
@@ -109,6 +110,55 @@ void check_against_mapbuffer( const fp3d::snapshot &s, const char *what )
            std::to_string( mismatched ) + " tiles differ" );
 }
 
+// Every tile's terrain, furniture, light, trap and floor / sign flags against the map's own calls. The capture
+// reads each submap directly and repeats what those calls do, so this is what says it still agrees with them
+// (after a merge from upstream too). Counts how many tiles had each, so an empty scene can't pass.
+void check_against_map_calls( const fp3d::snapshot &s, const char *what, int min_traps )
+{
+    map &here = get_map();
+    const avatar &u = get_avatar();
+    int differ = 0;
+    int traps = 0;
+    int holes = 0;
+    int floors = 0;
+    int signs = 0;
+    int lit = 0;
+    for( const std::shared_ptr<const fp3d::submap_view> &smp : s.submaps ) {
+        const fp3d::submap_view &sm = *smp;
+        const tripoint_bub_ms corner = here.get_bub( project_to<coords::ms>(
+                                           tripoint_abs_sm( sm.pos.x, sm.pos.y, sm.pos.z ) ) );
+        for( int y = 0; y < fp3d::sm_size; y++ ) {
+            for( int x = 0; x < fp3d::sm_size; x++ ) {
+                const int i = y * fp3d::sm_size + x;
+                const tripoint_bub_ms p = corner + tripoint_rel_ms( x, y, 0 );
+                const uint8_t light = static_cast<uint8_t>( std::clamp( std::lround( here.ambient_light_at( p ) ),
+                                      0L, 255L ) );
+                const trap &tr = here.tr_at( p );
+                const uint32_t trap_shown = !tr.is_null() && ( u.knows_trap( p ) ||
+                                            ( sm.vis[i] == fp3d::vis_seen_lit && here.can_see_trap_at( p, u ) ) ) ?
+                                            static_cast<uint32_t>( tr.loadid.to_i() ) : 0;
+                const bool hole = !here.has_floor( p );
+                const bool sign = here.has_graffiti_at( p );
+                if( sm.ter[i] != static_cast<uint32_t>( here.ter( p ).to_i() ) ||
+                    sm.furn[i] != static_cast<uint32_t>( here.furn( p ).to_i() ) || sm.light[i] != light ||
+                    sm.trap[i] != trap_shown || ( ( sm.flags[i] & fp3d::tile_open_air_below ) != 0 ) != hole ||
+                    ( ( sm.flags[i] & fp3d::tile_has_sign ) != 0 ) != sign ) {
+                    differ++;
+                }
+                traps += sm.trap[i] != 0 ? 1 : 0;
+                holes += hole ? 1 : 0;
+                floors += hole ? 0 : 1;
+                signs += sign ? 1 : 0;
+                lit += light > 0 ? 1 : 0;
+            }
+        }
+    }
+    check( differ == 0 && traps >= min_traps && holes > 0 && floors > 0 && signs >= 1 && lit > 0, what,
+           std::to_string( differ ) + " tiles differ; " + std::to_string( traps ) + " traps shown, " +
+           std::to_string( holes ) + " without a floor, " + std::to_string( signs ) + " signs, " +
+           std::to_string( lit ) + " lit" );
+}
+
 // Caches as fresh as after a game turn: the test edits the map between turns, and CDDA's outside cache
 // (the roof flag) is only rebuilt when marked dirty. Vehicles also need the refresh map::actualize()
 // gives them (their "fake" diagonal parts and roofed insides), which a map shift triggers and the
@@ -161,6 +211,28 @@ int main()
         u.wear_item( item( itype_id( "tshirt" ) ), false );
         u.wear_item( item( itype_id( "jacket_leather" ) ), false );
         u.add_effect( efftype_id( "bandaged" ), 1_hours, bodypart_id( "arm_l" ) );
+        {
+            // For check_against_map_calls, west of the player: a cot (a trap anyone sees), a bear trap the player
+            // knows about and one they don't, a pit (the terrain's own trap, known), graffiti, and a hole in the
+            // ground.
+            const tripoint_bub_ms west = u.pos_bub() + tripoint_rel_ms( -3, 0, 0 );
+            for( int dx = -2; dx <= 0; dx++ ) {
+                for( int dy = -2; dy <= 2; dy++ ) {
+                    const tripoint_bub_ms q = west + tripoint_rel_ms( dx, dy, 0 );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.ter_set( q, ter_str_id( "t_dirt" ) );
+                    here.i_clear( q );
+                }
+            }
+            here.trap_set( west + tripoint_rel_ms( 0, 1, 0 ), trap_str_id( "tr_cot" ).id() );
+            here.trap_set( west, trap_str_id( "tr_beartrap" ).id() );
+            u.add_known_trap( west, trap_str_id( "tr_beartrap" ).obj() );
+            here.trap_set( west + tripoint_rel_ms( 0, -1, 0 ), trap_str_id( "tr_beartrap" ).id() );
+            here.ter_set( west + tripoint_rel_ms( -1, 0, 0 ), ter_str_id( "t_pit" ) );
+            u.add_known_trap( west + tripoint_rel_ms( -1, 0, 0 ), trap_str_id( "tr_pit" ).obj() );
+            here.set_graffiti( west + tripoint_rel_ms( 0, 2, 0 ), "fp3d" );
+            here.ter_set( west + tripoint_rel_ms( -1, 2, 0 ), ter_str_id( "t_open_air" ) );
+        }
         refresh_caches();
         check( ter_str_id::NULL_ID().id().to_i() == 0 && furn_str_id::NULL_ID().id().to_i() == 0,
                "index 0 is t_null / f_null" );
@@ -169,6 +241,27 @@ int main()
         const std::shared_ptr<const fp3d::snapshot> first = timed_capture( ms );
         std::printf( "  capture took %.0f ms, origin %d,%d\n", ms, first->bubble_origin.x, first->bubble_origin.y );
         check_against_mapbuffer( *first, "full capture matches the submap buffer" );
+        check_against_map_calls( *first, "every tile as the map's own calls give it", 3 );
+        {
+            // The unknown bear trap stays hidden; the known one, the cot and the pit show.
+            const auto trap_at = [&]( const tripoint_rel_ms & d ) {
+                const tripoint_abs_ms abs = here.get_abs( u.pos_bub() + tripoint_rel_ms( -3, 0, 0 ) + d );
+                const tripoint_abs_sm sm_pos = project_to<coords::sm>( abs );
+                for( const std::shared_ptr<const fp3d::submap_view> &sm : first->submaps ) {
+                    if( key_of( *sm ) == key{ sm_pos.x(), sm_pos.y(), sm_pos.z() } ) {
+                        const point local = abs.raw().xy() - project_to<coords::ms>( sm_pos ).raw().xy();
+                        return sm->trap[local.y * fp3d::sm_size + local.x];
+                    }
+                }
+                return uint32_t{ 0 };
+            };
+            check( trap_at( tripoint_rel_ms( 0, 0, 0 ) ) ==
+                   static_cast<uint32_t>( trap_str_id( "tr_beartrap" ).id().to_i() ) &&
+                   trap_at( tripoint_rel_ms( 0, -1, 0 ) ) == 0 &&
+                   trap_at( tripoint_rel_ms( 0, 1, 0 ) ) == static_cast<uint32_t>( trap_str_id( "tr_cot" ).id().to_i() ) &&
+                   trap_at( tripoint_rel_ms( -1, 0, 0 ) ) == static_cast<uint32_t>( trap_str_id( "tr_pit" ).id().to_i() ),
+                   "traps: known, plain to see and built into the terrain show; an unknown one doesn't" );
+        }
         check( first->creatures.size() >= 1 && first->creatures[0].kind == 0 &&
                first->creatures[0].pos.x == first->player.pos.x, "player is the first creature" );
         {
@@ -519,6 +612,8 @@ int main()
                shifted->bubble_origin.y == with_zed2->bubble_origin.y, "bubble origin moved 2 submaps east",
                std::to_string( shifted->bubble_origin.x - with_zed2->bubble_origin.x ) );
         check_against_mapbuffer( *shifted, "after the shift, still matches" );
+        // The cot is out of sight from here; the two known traps still show.
+        check_against_map_calls( *shifted, "after the shift, every tile as the map's calls give it", 2 );
         std::map<key, const fp3d::submap_view *> before;
         for( const auto &sm : with_zed2->submaps ) {
             before[key_of( *sm )] = sm.get();

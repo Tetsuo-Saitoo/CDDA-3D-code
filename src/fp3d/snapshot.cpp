@@ -47,6 +47,7 @@
 #include "item_pocket.h"
 #include "itype.h"
 #include "json.h"
+#include "level_cache.h"
 #include "lightmap.h"
 #include "line.h"
 #include "map.h"
@@ -62,6 +63,8 @@
 #include "overmapbuffer.h"
 #include "mtype.h"
 #include "npc.h"
+#include "shadowcasting.h"
+#include "submap.h"
 #include "trap.h"
 #include "units.h"
 #include "veh_type.h"
@@ -231,7 +234,8 @@ size_t bubble_index( const tripoint_bub_ms &p )
 
 // `items_seen`: CDDA's could_see_items (never inside sealed containers, others only from next to them).
 // What this square adds to CDDA's lightmap, as map::build_lightmap gathers it. Nothing when it adds none.
-std::optional<light_view> light_source_at( map &here, const tripoint_bub_ms &p, uint8_t tile )
+std::optional<light_view> light_source_at( map &here, const tripoint_bub_ms &p, uint8_t tile,
+        const ter_t &ter, const furn_t &furn )
 {
     light_view best;
     float lum = 0.0f;
@@ -241,8 +245,8 @@ std::optional<light_view> light_source_at( map &here, const tripoint_bub_ms &p, 
             best.kind = kind;
         }
     };
-    offer( static_cast<float>( here.ter( p ).obj().light_emitted ), light_fixed );
-    offer( static_cast<float>( here.furn( p ).obj().light_emitted ), light_fixed );
+    offer( static_cast<float>( ter.light_emitted ), light_fixed );
+    offer( static_cast<float>( furn.light_emitted ), light_fixed );
     size_t n = 0;
     for( const item &it : here.i_at( p ) ) {
         if( n++ >= 64 ) {
@@ -389,13 +393,26 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
     auto sm = std::make_shared<submap_view>();
     const tripoint_bub_ms corner( grid.x * SEEX, grid.y * SEEY, z );
     sm->pos = to_ui_point( project_to<coords::sm>( here.get_abs( corner ) ) );
+    // CDDA's submap is looked up once for its 144 tiles, and the level's light table once. map::ter, furn, tr_at,
+    // has_floor, has_graffiti_at and ambient_light_at each find the submap again for every tile, which was half
+    // of a capture's time; what they return is worked out here the same way (fp3d-snapshot-test compares every
+    // tile of the bubble with the map's own calls). A submap that isn't loaded goes through those calls, as before.
+    const submap *const tiles = std::as_const( here ).maptile_at( corner ).wrapped_submap();
+    const level_cache &level = here.get_cache_ref( z );
+    // map::has_floor: a map without levels, and the lowest level, have a floor everywhere.
+    const bool floor_everywhere = !here.supports_zlevels() || z < -OVERMAP_DEPTH + 1 || z > OVERMAP_HEIGHT;
     for( int y = 0; y < SEEY; y++ ) {
         for( int x = 0; x < SEEX; x++ ) {
             const int i = y * SEEX + x;
             const tripoint_bub_ms p = corner + tripoint_rel_ms( x, y, 0 );
-            sm->ter[i] = static_cast<uint32_t>( here.ter( p ).to_i() );
-            sm->furn[i] = static_cast<uint32_t>( here.furn( p ).to_i() );
-            sm->light[i] = clamp_u8( here.ambient_light_at( p ) );
+            const point_sm_ms in_submap( x, y );
+            const ter_id ter = tiles != nullptr ? tiles->get_ter( in_submap ) : here.ter( p );
+            const furn_id furn = tiles != nullptr ? tiles->get_furn( in_submap ) : here.furn( p );
+            const ter_t &ter_obj = ter.obj();
+            const furn_t &furn_obj = furn.obj();
+            sm->ter[i] = static_cast<uint32_t>( ter.to_i() );
+            sm->furn[i] = static_cast<uint32_t>( furn.to_i() );
+            sm->light[i] = clamp_u8( level.lm[p.x()][p.y()].max() );
 
             uint8_t vis = vis_never;
             switch( here.get_visibility( here.apparent_light_at( p, cache ), cache ) ) {
@@ -419,19 +436,26 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
             }
             sm->vis[i] = vis;
 
-            const trap &tr = here.tr_at( p );
-            if( !tr.is_null() && ( u.knows_trap( p ) || ( vis == vis_seen_lit && here.can_see_trap_at( p, u ) ) ) ) {
-                sm->trap[i] = static_cast<uint32_t>( tr.loadid.to_i() );
+            // map::tr_at: the terrain's built-in trap, else the one set on the square.
+            const trap_id trap_here = tiles == nullptr ? here.tr_at( p ).loadid :
+                                      ter_obj.trap != tr_null ? ter_obj.trap : tiles->get_trap( in_submap );
+            if( trap_here != tr_null &&
+                ( u.knows_trap( p ) || ( vis == vis_seen_lit && here.can_see_trap_at( p, u ) ) ) ) {
+                sm->trap[i] = static_cast<uint32_t>( trap_here.to_i() );
             }
 
             uint8_t flags = 0;
             if( !here.is_outside( p ) || ( vehicle_tiles[bubble_index( p )] & 2 ) ) {
                 flags |= tile_has_roof;
             }
-            if( !here.has_floor( p ) ) {
+            // map::has_floor: no NO_FLOOR or NO_FLOOR_WATER flag on the terrain or the furniture.
+            if( !floor_everywhere && ( ter_obj.has_flag( ter_furn_flag::TFLAG_NO_FLOOR ) ||
+                                       furn_obj.has_flag( ter_furn_flag::TFLAG_NO_FLOOR ) ||
+                                       ter_obj.has_flag( ter_furn_flag::TFLAG_NO_FLOOR_WATER ) ||
+                                       furn_obj.has_flag( ter_furn_flag::TFLAG_NO_FLOOR_WATER ) ) ) {
                 flags |= tile_open_air_below;
             }
-            if( here.has_graffiti_at( p ) ) {
+            if( tiles != nullptr ? tiles->has_graffiti( in_submap ) : here.has_graffiti_at( p ) ) {
                 flags |= tile_has_sign;
             }
             if( vehicle_tiles[bubble_index( p )] & 1 ) {
@@ -445,7 +469,8 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
                                   here.accessible_items( p );
                 capture_items_and_fields( here, p, static_cast<uint8_t>( i ), *sm, seen,
                                           here.could_see_items( p, u.pos_bub() ), by_player );
-                if( const std::optional<light_view> l = light_source_at( here, p, static_cast<uint8_t>( i ) ) ) {
+                if( const std::optional<light_view> l = light_source_at( here, p, static_cast<uint8_t>( i ),
+                        ter_obj, furn_obj ) ) {
                     sm->lights.push_back( *l );
                 }
             }
