@@ -889,6 +889,16 @@ shared_ptr_fast<uilist_impl> uilist::query( bool loop, int timeout,
             const int rv = entries[i].retval == -1 ? static_cast<int>( i ) : entries[i].retval;
             req.entries.push_back( { rv, entries[i].txt, entries[i].enabled, entries[i].desc } );
         }
+        // CDDA's highlighted entry: the caller's `selected`, or the next enabled entry after it (uilist never
+        // rests on a disabled one); none when nothing is enabled.
+        const int count = static_cast<int>( entries.size() );
+        for( int k = 0; k < count; k++ ) {
+            const int idx = ( std::clamp( selected, 0, count - 1 ) + k ) % count;
+            if( entries[idx].enabled ) {
+                req.selected = idx;
+                break;
+            }
+        }
         while( true ) {
             const fp3d::ui_answer a = fp3d::ask( req );
             if( a.cancel && allow_cancel ) {

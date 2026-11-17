@@ -96,6 +96,7 @@
 #include "talker.h"
 #include "translation.h"
 #include "type_id.h"
+#include "uilist.h"
 #include "units.h"
 #include "vehicle.h"
 #include "vpart_position.h"
@@ -1383,6 +1384,24 @@ void observe()
             }
             here.remove_field( fire_at, fd_fire );
             here.add_field( fire_at, fd_fire, 2 );
+            break;
+        }
+        case 35: {
+            // Menus: three with the caller's choice on a disabled entry, on an enabled one, and with nothing
+            // enabled. The driver reads each request's `selected` and cancels it.
+            for( const int pick : { 0, 2 } ) {
+                uilist m;
+                m.title = "fp3d selected";
+                m.addentry( 10, false, 'a', "first, disabled" );
+                m.addentry( 11, true, 'b', "second" );
+                m.addentry( 12, true, 'c', "third" );
+                m.selected = pick;
+                m.query();
+            }
+            uilist none;
+            none.title = "fp3d selected";
+            none.addentry( 20, false, 'a', "only one, disabled" );
+            none.query();
             break;
         }
         case 34: {
@@ -3542,6 +3561,29 @@ static bool run_action_checks()
     if( !ra || !ra->timed ) {
         return false;
     }
+
+    // Menu requests carry CDDA's highlighted entry (scene 35): the caller's choice, the next enabled entry when that
+    // one is disabled, -1 when nothing is enabled.
+    hand_setup = 35;
+    fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+    std::vector<int> highlighted;
+    ra = fp3d::wait_request( 20000, ra->id );
+    for( int i = 0; i < 10 && ra && !ra->timed; i++ ) {
+        if( ra->kind == fp3d::request_kind::menu && ra->title == "fp3d selected" ) {
+            highlighted.push_back( ra->selected );
+        }
+        fp3d::ui_answer cancel;
+        cancel.id = ra->id;
+        cancel.cancel = true;
+        fp3d::answer( cancel );
+        ra = fp3d::wait_request( 10000, ra->id );
+    }
+    std::string highlighted_text;
+    for( const int h : highlighted ) {
+        highlighted_text += std::to_string( h ) + " ";
+    }
+    check( highlighted == std::vector<int> { 1, 2, -1 } && ra && ra->timed, "menus carry the highlighted entry",
+           highlighted_text );
 
     return failed == 0;
 }
