@@ -5641,7 +5641,7 @@ static bool run_smash_checks()
         return false;
     }
     hand_setup = 40;
-    fp3d::queue_action( "pause" );
+    fp3d::queue_action( "no_such_action" );   // dropped, no turn passes: the scene runs before the next request
     r = fp3d::wait_request( 20000, r->id );
     const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
     if( !r || !r->timed || !s0 || hand_setup.load() != 0 ) {
@@ -5738,7 +5738,7 @@ static bool run_smash_checks()
            "the window next to you: smashed at its square, nothing asked", ter_at( at( 1, 0 ) ) + " after " +
            std::to_string( tries ) + " tries, " + std::to_string( asked ) + " asked, [" + m + "]" );
     hand_setup = 41;
-    fp3d::queue_action( "pause" );
+    fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the next request
     r = fp3d::wait_request( 20000, r->id );
     check( r && r->timed && hand_setup.load() == 0, "after: the weapon from before back", "" );
     return failed == 0;
