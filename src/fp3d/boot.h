@@ -17,7 +17,7 @@ namespace fp3d
 // Sets CDDA's data directory (`base_path`, "" = the current directory) and user directory (config, saves,
 // debug.log) and creates the user subfolders. boot_world() calls it with "" and "./fp3d_user" unless it
 // already ran. The fp3d test binaries call it first with a folder of their own ("./fp3d_user_sim",
-// "./fp3d_user_events", ...; the range test keeps "./fp3d_user"), so no test sees what another left behind.
+// "./fp3d_user_events", "./fp3d_user_range", ...), so no test sees what another left behind.
 // Throws std::runtime_error on failure.
 void init_paths( const std::string &base_path, const std::string &user_dir );
 
