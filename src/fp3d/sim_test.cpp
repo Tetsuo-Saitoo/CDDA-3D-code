@@ -66,6 +66,7 @@
 #include "fp3d/swing.h"
 #include "game.h"
 #include "game_constants.h"
+#include "input_context.h"
 #include "inventory.h"
 #include "item.h"
 #include "item_location.h"
@@ -337,6 +338,10 @@ struct name_results {
 };
 std::mutex names_mutex;
 name_results names_out;
+// Bounded polling: what scene 34's two polling loops saw (sim thread writes, driver reads). Polls until the loop
+// ended; negative when it ended another way.
+std::atomic<int> poll_quit_after{ 0 };
+std::atomic<int> poll_asked_after{ 0 };
 std::atomic<int> interrupt_route{ -1 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
@@ -1378,6 +1383,27 @@ void observe()
             }
             here.remove_field( fire_at, fd_fire );
             here.add_field( fire_at, fd_fire, 2 );
+            break;
+        }
+        case 34: {
+            // Bounded polling: a screen that only polls its input context is told QUIT after max_idle_polls polls;
+            // one that goes on polling gets a blocking request (the driver answers CONFIRM).
+            input_context ctxt( "FP3D_POLL_TEST" );
+            ctxt.register_action( "QUIT" );
+            ctxt.register_action( "CONFIRM" );
+            int polls = 0;
+            std::string got;
+            do {
+                got = ctxt.handle_input( 50 );
+                polls++;
+            } while( got == "TIMEOUT" && polls < 100000 );
+            poll_quit_after = got == "QUIT" ? polls : -polls;
+            int more = 0;
+            do {
+                got = ctxt.handle_input( 50 );
+                more++;
+            } while( got != "CONFIRM" && more < 100000 );
+            poll_asked_after = got == "CONFIRM" ? more : -more;
             break;
         }
         case 33: {
@@ -3535,6 +3561,34 @@ static bool run_queue_checks()
     }
     fp3d::set_cheats_allowed( cheats_were );
     check( debug_menu && ra && ra->timed, "debug menu only while cheats are allowed", "" );
+    if( !ra || !ra->timed ) {
+        return false;
+    }
+
+    // Bounded polling (scene 34 on the sim thread): the first loop is told QUIT at its 256th poll; the second
+    // ignores QUIT and is asked at the 1024th poll in all (its 768th), a request this answers with CONFIRM.
+    poll_quit_after = 0;
+    poll_asked_after = 0;
+    hand_setup = 34;
+    fp3d::queue_action( "pause" );
+    ra = fp3d::wait_request( 20000, ra->id );
+    const bool asked = ra && !ra->timed && ra->kind == fp3d::request_kind::key && ra->context == "FP3D_POLL_TEST";
+    for( int i = 0; i < 10 && ra && !ra->timed; i++ ) {
+        fp3d::ui_answer a;
+        a.id = ra->id;
+        if( ra->context == "FP3D_POLL_TEST" ) {
+            a.action = "CONFIRM";
+        } else {
+            a.cancel = true;
+        }
+        fp3d::answer( a );
+        ra = fp3d::wait_request( 10000, ra->id );
+    }
+    check( asked && poll_quit_after.load() == fp3d::max_idle_polls &&
+           poll_asked_after.load() == 3 * fp3d::max_idle_polls && ra && ra->timed,
+           "a polling screen is told QUIT, then asked",
+           "QUIT after " + std::to_string( poll_quit_after.load() ) + " polls, asked after " +
+           std::to_string( poll_asked_after.load() ) + " more" );
     if( !ra || !ra->timed ) {
         return false;
     }

@@ -79,6 +79,8 @@ thread_local bool hook_timed = false;
 thread_local bool in_query = false;
 std::mutex poll_mutex;
 std::map<std::string, uint64_t> poll_counts;
+int idle_polls = 0;              // polls since the last request, in the game turn idle_poll_turn
+int64_t idle_poll_turn = -1;
 // Answer coordinates feed CDDA's int point maths (absolute -> bubble); keep them far from overflow.
 constexpr int max_answer_coord = 1 << 28;
 
@@ -213,6 +215,21 @@ void note_poll( const std::string &where )
     }
 }
 
+poll_verdict idle_poll( int64_t turn )
+{
+    std::lock_guard<std::mutex> lk( poll_mutex );
+    if( turn != idle_poll_turn ) {
+        idle_poll_turn = turn;
+        idle_polls = 0;
+    }
+    idle_polls++;
+    if( idle_polls >= 4 * max_idle_polls ) {
+        idle_polls = 0;
+        return poll_verdict::ask;
+    }
+    return idle_polls % max_idle_polls == 0 ? poll_verdict::close : poll_verdict::go_on;
+}
+
 std::string poll_report()
 {
     std::lock_guard<std::mutex> lk( poll_mutex );
@@ -248,6 +265,11 @@ ui_answer ask( ui_request req )
 {
     if( in_query ) {
         throw query_prompt();
+    }
+    {
+        // A request: the count of idle polls starts again (idle_poll).
+        std::lock_guard<std::mutex> lk( poll_mutex );
+        idle_polls = 0;
     }
     channel &c = chan();
     std::function<void()> hook;

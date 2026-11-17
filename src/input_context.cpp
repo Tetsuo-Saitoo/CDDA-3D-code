@@ -35,6 +35,7 @@
 #include "string_input_popup.h"
 #include "translations.h"
 #include "ui_manager.h"
+#include "calendar.h" // FP3D:
 #include "fp3d/boot.h" // FP3D:
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/cheats.h" // FP3D:
@@ -140,6 +141,7 @@ static const std::string ANY_INPUT = "ANY_INPUT";
 static const std::string HELP_KEYBINDINGS = "HELP_KEYBINDINGS";
 static const std::string COORDINATE = "COORDINATE";
 static const std::string TIMEOUT = "TIMEOUT";
+static const std::string FP3D_QUIT = "QUIT"; // FP3D: bounded polling
 
 const std::string &input_context::input_to_action( const input_event &inp ) const
 {
@@ -446,7 +448,14 @@ const std::string &input_context::handle_input( const int timeout )
                 throw fp3d::shutdown_signal();
             }
             fp3d::note_poll( category );
-            return TIMEOUT;
+            // FP3D: bounded polling (fp3d/bridge.h): a screen that only polls is told to close, then asked below
+            const fp3d::poll_verdict idle = fp3d::idle_poll( to_turn<int64_t>( calendar::turn ) );
+            if( idle == fp3d::poll_verdict::close ) {
+                return FP3D_QUIT;
+            }
+            if( idle != fp3d::poll_verdict::ask ) {
+                return TIMEOUT;
+            }
         }
         fp3d::ui_request req;
         req.kind = fp3d::request_kind::key;

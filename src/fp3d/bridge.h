@@ -395,6 +395,14 @@ bool want_job();
 // Diagnostics: input polls answered with a timeout (they never reach the client), counted per place.
 void note_poll( const std::string &where );
 std::string poll_report();
+// Bounded polling. An input context polled with a timeout never waits for the client, so a screen that only polls
+// would run the sim thread without end. Each such poll is counted here; the count starts again at every request
+// and whenever the game turn changes. At every max_idle_polls polls the poll is answered `close` (the screen is
+// told QUIT); at 4 x max_idle_polls it is answered `ask` (a blocking request, as an input context without a
+// timeout gets) and the count starts again. `turn`: the game turn now.
+enum class poll_verdict : int { go_on, close, ask };
+constexpr int max_idle_polls = 256;
+poll_verdict idle_poll( int64_t turn );
 
 // Strips control characters and caps the length; for any text coming from the client.
 std::string sanitize_text( const std::string &s, size_t max_len );
