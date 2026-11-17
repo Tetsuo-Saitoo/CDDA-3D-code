@@ -8362,6 +8362,10 @@ int main()
     std::printf( "number requests: %s\n", number_ok ? "ok" : "BAD" );
     std::printf( "actions: %s\n", actions_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
+    // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
+    // the game's turns got slower.
+    std::printf( "real-time slot: %d ms%s\n", 250 * fp3d::slow_build * rt_stretch,
+                 rt_stretch > 1 ? " (stretched: turns took longer than the usual slot)" : "" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
     std::printf( "boot progress: %s\n", boot_ok ? "ok" : "BAD" );
