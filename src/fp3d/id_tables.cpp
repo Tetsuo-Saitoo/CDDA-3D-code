@@ -12,6 +12,7 @@
 #include "catacharset.h"
 #include "color.h"
 #include "damage.h"
+#include "enums.h"
 #include "field_type.h"
 #include "fp3d/snapshot.h"
 #include "fp3d/bridge.h"
@@ -251,6 +252,8 @@ void build_id_tables()
         d.color = color_name( it.color );
         d.looks_like = it.looks_like.str();
         d.category = it.category_force.str();
+        d.phase = it.phase == phase_id::LIQUID ? "liquid" : it.phase == phase_id::GAS ? "gas" :
+                  it.phase == phase_id::PLASMA ? "plasma" : it.phase == phase_id::SOLID ? "solid" : "";
         if( it.gun ) {
             d.gun = it.gun->skill_used.str();
             if( !it.gun->ammo.empty() ) {
@@ -388,6 +391,7 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         jo.member( "color", d.color );
         jo.member( "looks_like", d.looks_like );
         jo.member( "category", d.category );
+        jo.member( "phase", d.phase );
         if( !d.gun.empty() ) {
             jo.member( "gun", d.gun );
             jo.member( "gun_ammo", d.gun_ammo );

@@ -89,6 +89,11 @@ int main()
         check( apple < t->items.size() && t->items[apple].id == "apple" && t->items[apple].volume_ml > 0 &&
                zombie < t->monsters.size() && t->monsters[zombie].hp > 0 && t->monsters[zombie].speed > 0 &&
                t->vparts.size() > 100 && !t->vparts[1].id.empty(), "apple, mon_zombie, vehicle parts defined" );
+        // CDDA's phase goes with each item type: water is a liquid, an apple a solid.
+        const uint32_t water = fp3d::intern_id( fp3d::id_kind::itype, "water" );
+        check( water < t->items.size() && t->items[water].phase == "liquid" && apple < t->items.size() &&
+               t->items[apple].phase == "solid", "item phase: water liquid, apple solid",
+               water < t->items.size() ? t->items[water].phase : "water not in the table" );
 
         // Pockets per item type: a plastic bottle has one rigid, watertight, sealable 500 ml pocket.
         const uint32_t bottle = fp3d::intern_id( fp3d::id_kind::itype, "bottle_plastic" );
