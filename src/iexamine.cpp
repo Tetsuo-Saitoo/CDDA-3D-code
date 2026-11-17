@@ -45,6 +45,7 @@
 #include "game_inventory.h"
 #include "handle_liquid.h"
 #include "harvest.h"
+#include "iexamine_actors.h" // FP3D:
 #include "input_context.h"
 #include "input_enums.h"
 #include "inventory.h"
@@ -7738,7 +7739,8 @@ void iexamine::invalid( Character &/*you*/, const tripoint_bub_ms &examp )
  * @param function_name The name of the function to get.
  * @return A function pointer to the specified function.
  */
-iexamine_functions iexamine_functions_from_string( const std::string &function_name )
+// FP3D: the name -> function table, shared with fp3d_examine_name below
+static const std::map<std::string, iexamine_examine_function> &fp3d_examine_function_map()
 {
     static const std::map<std::string, iexamine_examine_function> function_map = {{
             { "none", &iexamine::none },
@@ -7823,6 +7825,35 @@ iexamine_functions iexamine_functions_from_string( const std::string &function_n
             { "invalid", &iexamine::invalid },
         }
     };
+    return function_map;
+}
+
+// FP3D: the examine action of a terrain or furniture as the game data names it, for the client's id tables
+// (fp3d/id_tables.cpp): a data-driven actor's type, else the function's name; "" when examining does nothing or
+// the action is one this doesn't know.
+std::string fp3d_examine_name( const map_data_common_t &thing );
+std::string fp3d_examine_name( const map_data_common_t &thing )
+{
+    // The actors mapdata.cpp registers, by their own type names.
+    for( const std::string &actor : {
+             appliance_convert_examine_actor().type, cardreader_examine_actor().type,
+             eoc_examine_actor().type, mortar_examine_actor().type
+         } ) {
+        if( thing.has_examine( actor ) ) {
+            return actor;
+        }
+    }
+    for( const std::pair<const std::string, iexamine_examine_function> &named : fp3d_examine_function_map() ) {
+        if( named.first != "none" && named.first != "invalid" && thing.has_examine( named.second ) ) {
+            return named.first;
+        }
+    }
+    return std::string();
+}
+
+iexamine_functions iexamine_functions_from_string( const std::string &function_name )
+{
+    const std::map<std::string, iexamine_examine_function> &function_map = fp3d_examine_function_map();
 
     static const std::set<std::string> harvestable_functions = {
         "harvest_furn_nectar",

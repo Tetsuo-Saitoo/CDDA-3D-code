@@ -18,6 +18,7 @@
 #include "fp3d/bridge.h"
 #include "item_factory.h"
 #include "item_pocket.h"
+#include "iexamine.h"
 #include "itype.h"
 #include "json.h"
 #include "mapdata.h"
@@ -29,6 +30,10 @@
 #include "veh_type.h"
 #include "weakpoint.h"
 #include "weather_type.h"
+
+// Defined in iexamine.cpp (FP3D): a terrain's or furniture's examine action as the game data names it, ""
+// for none.
+std::string fp3d_examine_name( const map_data_common_t &thing );
 
 namespace fp3d
 {
@@ -86,6 +91,13 @@ void fill_common( terrain_def &d, const T &t, const std::vector<std::string> &gr
     d.symbol = symbol_text( t.symbol() );
     d.color = color_name( t.color() );
     d.looks_like = t.looks_like;
+    // The examine action as the game data names it. Game data (mods): bounded, and only a plain id is passed on.
+    const std::string examine = fp3d_examine_name( t );
+    const bool plain_id = !examine.empty() && examine.size() <= max_examine_id_bytes &&
+    std::all_of( examine.begin(), examine.end(), []( char ch ) {
+        return ( ch >= 'a' && ch <= 'z' ) || ( ch >= 'A' && ch <= 'Z' ) || ( ch >= '0' && ch <= '9' ) || ch == '_';
+    } );
+    d.examine = plain_id ? examine : std::string();
     d.move_cost = t.movecost;
     d.coverage = t.coverage;
     d.light_emitted = t.light_emitted;
@@ -132,6 +144,7 @@ void write_terrain( JsonOut &jo, const char *name, const std::vector<terrain_def
         jo.member( "coverage", d.coverage );
         jo.member( "light_emitted", d.light_emitted );
         jo.member( "transparent", d.transparent );
+        jo.member( "examine", d.examine );
         write_strings( jo, "flags", d.flags );
         write_strings( jo, "connect_groups", d.connect_groups );
         write_strings( jo, "connects_to", d.connects_to );
