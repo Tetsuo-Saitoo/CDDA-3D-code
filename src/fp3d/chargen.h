@@ -32,8 +32,9 @@ std::string apply_chargen( avatar &u, const std::string &choices_json );
 bool run_chargen();
 
 // Input validation for the name of a new game's character, whatever made it (the client, a template, the game's
-// own name lists): a name that fails is picked again a few times, then a fixed name is used. The save id is set
-// once here, to that name. Sim side, once per new game before it starts.
+// own name lists): a name that fails, or that a character saved in this world has already, is picked again a few
+// times, then a fixed name is used (numbered when that one is taken too). The save id is set once here, to that
+// name. Sim side, once per new game before it starts.
 void settle_new_character( avatar &u );
 // Input validation for a name the avatar takes over in play (CDDA's control_npc): one that fails is tidied, else
 // the fixed name is used. The save id stays as it is.
