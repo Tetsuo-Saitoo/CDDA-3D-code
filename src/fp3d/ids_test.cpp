@@ -51,6 +51,14 @@ int main()
     test_mode = true;
     setupDebug( DebugOutput::std_err );
     rng_set_engine_seed( 5 );
+    // This test's own user folder (config, saves, caches): what another test binary leaves behind never
+    // reaches it.
+    try {
+        fp3d::init_paths( "", "./fp3d_user_ids" );
+    } catch( const std::exception &e ) {
+        std::printf( "error: %s\n", e.what() );
+        return EXIT_FAILURE;
+    }
     try {
         fp3d::boot_world( "fp3d-ids", false );
         const std::shared_ptr<const fp3d::id_tables> t = fp3d::latest_id_tables();

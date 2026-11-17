@@ -8259,6 +8259,14 @@ int main()
     test_mode = true;
     setupDebug( DebugOutput::std_err );
     rng_set_engine_seed( 42 );
+    // This test's own user folder (config, saves, caches): what another test binary leaves behind never
+    // reaches it.
+    try {
+        fp3d::init_paths( "", "./fp3d_user_sim" );
+    } catch( const std::exception &e ) {
+        std::printf( "error: %s\n", e.what() );
+        return EXIT_FAILURE;
+    }
     fp3d::set_active( true );
     fp3d::set_events_enabled( true );
     std::thread sim( sim_main );
@@ -8284,10 +8292,12 @@ int main()
     int requests = 0;
     driver_state d;
     while( g_idx < n_goals && requests < 400 ) {
-        std::optional<fp3d::ui_request> req = fp3d::wait_request( 180000 );
+        // The first boot in a new user folder checks the game data once, which takes minutes on a busy machine.
+        const int wait_s = requests == 0 ? 600 : 180;
+        std::optional<fp3d::ui_request> req = fp3d::wait_request( wait_s * 1000 );
         if( !req && !fp3d::is_shut_down() ) {
             // The sim is stuck outside ask() (a loop that never asks); join() would hang.
-            std::printf( "FAIL: no request within %d s; timed-out polls: %s\n", 180 * fp3d::slow_build,
+            std::printf( "FAIL: no request within %d s; timed-out polls: %s\n", wait_s * fp3d::slow_build,
                          fp3d::poll_report().c_str() );
             std::_Exit( 2 );
         }
