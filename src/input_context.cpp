@@ -451,7 +451,12 @@ const std::string &input_context::handle_input( const int timeout )
         fp3d::ui_request req;
         req.kind = fp3d::request_kind::key;
         req.context = category;
-        req.actions = registered_actions;
+        // FP3D: the action allow-list (fp3d/bridge.h): only what a client is meant to send here
+        for( const std::string &name : registered_actions ) {
+            if( fp3d::action_allowed( category, name, fp3d::cheats_allowed() ) ) {
+                req.actions.push_back( name );
+            }
+        }
         const bool timed = fp3d::next_is_timed();
         while( true ) {
             if( timed ) {
@@ -471,7 +476,8 @@ const std::string &input_context::handle_input( const int timeout )
             // A timed (main loop) request expired in real time: the player waits out the turn.
             const std::string wanted = a.timed_out ? "pause" : a.cancel ? "QUIT" : a.action;
             const auto it = std::find( registered_actions.begin(), registered_actions.end(), wanted );
-            if( it != registered_actions.end() ) {
+            if( it != registered_actions.end() &&
+                fp3d::action_allowed( category, wanted, fp3d::cheats_allowed() ) ) {
                 return *it;
             }
             // A queued action that isn't valid here is dropped; tell the client why.

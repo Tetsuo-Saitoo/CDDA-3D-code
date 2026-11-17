@@ -134,6 +134,10 @@ constexpr int max_number_asks = 8;
 constexpr size_t max_candidates = 256;
 
 bool active();
+// Action allow-list. The main loop (context "DEFAULTMODE") takes from the client only the actions a client is meant
+// to send: movement, the plain game actions the client uses, FP3D's own (`fp3d_...`), and `debug` while `cheats`
+// (cheats.h cheats_allowed). Every other context takes what it registered.
+bool action_allowed( const std::string &context, const std::string &action, bool cheats );
 void set_active( bool on );
 
 // Sim side. Blocks until the client answers request `req` (its id is assigned here).

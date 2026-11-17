@@ -3491,13 +3491,61 @@ static bool run_queue_checks()
         return false;
     }
 
+    // The action allow-list: CDDA actions a client isn't meant to send are dropped like unknown ones (no screen
+    // opens), the debug menu too unless cheats are allowed.
+    const bool cheats_were = fp3d::cheats_allowed();
+    fp3d::set_cheats_allowed( false );
+    const std::vector<std::string> not_allowed = { "missions", "diary", "action_menu", "main_menu", "open_options",
+                                                   "help", "quickload", "debug"
+                                                 };
+    for( const std::string &name : not_allowed ) {
+        fp3d::queue_action( name );
+    }
+    fp3d::queue_action( "pause" );
+    std::optional<fp3d::ui_request> ra = fp3d::wait_request( 20000, r1->id );
+    evs.clear();
+    fp3d::drain_events( evs );
+    size_t refused = 0;
+    for( const std::string &name : not_allowed ) {
+        refused += std::any_of( evs.begin(), evs.end(), [&name]( const fp3d::event & e ) {
+            return e.kind == fp3d::event_kind::message && e.text == "Can't do that here: " + name;
+        } ) ? 1 : 0;
+    }
+    const bool listed = ra && std::find( ra->actions.begin(), ra->actions.end(), "pause" ) != ra->actions.end() &&
+                        std::find( ra->actions.begin(), ra->actions.end(), "missions" ) == ra->actions.end() &&
+                        std::find( ra->actions.begin(), ra->actions.end(), "debug" ) == ra->actions.end();
+    check( ra && ra->timed && refused == not_allowed.size() && listed && fp3d::queued_actions() == 0,
+           "actions off the allow-list dropped",
+           std::to_string( refused ) + " of " + std::to_string( not_allowed.size() ) + " refused" +
+           ( ra ? std::string( ra->timed ? "" : ", a screen opened" ) + ( listed ? "" : ", listed" ) : ", no request" ) );
+    // With cheats allowed the debug menu opens (a menu request); it is closed again.
+    fp3d::set_cheats_allowed( true );
+    bool debug_menu = false;
+    if( ra && ra->timed ) {
+        fp3d::queue_action( "debug" );
+        ra = fp3d::wait_request( 20000, ra->id );
+        debug_menu = ra && !ra->timed && ra->kind == fp3d::request_kind::menu;
+        for( int i = 0; i < 10 && ra && !ra->timed; i++ ) {
+            fp3d::ui_answer cancel;
+            cancel.id = ra->id;
+            cancel.cancel = true;
+            fp3d::answer( cancel );
+            ra = fp3d::wait_request( 10000, ra->id );
+        }
+    }
+    fp3d::set_cheats_allowed( cheats_were );
+    check( debug_menu && ra && ra->timed, "debug menu only while cheats are allowed", "" );
+    if( !ra || !ra->timed ) {
+        return false;
+    }
+
     // Paused: the queue waits; resuming lets the sim take it.
     fp3d::set_paused( true );
     fp3d::queue_action( "pause" );
-    const std::optional<fp3d::ui_request> during = fp3d::wait_request( 1000, r1->id );
+    const std::optional<fp3d::ui_request> during = fp3d::wait_request( 1000, ra->id );
     const bool held = !during && fp3d::queued_actions() == 1;
     fp3d::set_paused( false );
-    const std::optional<fp3d::ui_request> r2 = fp3d::wait_request( 20000, r1->id );
+    const std::optional<fp3d::ui_request> r2 = fp3d::wait_request( 20000, ra->id );
     check( held && r2 && r2->timed && fp3d::queued_actions() == 0, "held while paused, taken on resume", "" );
 
     // Bounded: the 33rd action is refused.

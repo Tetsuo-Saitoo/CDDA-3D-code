@@ -180,6 +180,30 @@ void set_active( bool on )
     bridge_active.store( on );
 }
 
+bool action_allowed( const std::string &context, const std::string &action, bool cheats )
+{
+    if( context != "DEFAULTMODE" ) {
+        return true;
+    }
+    static const char *const allowed[] = {
+        "UP", "RIGHTUP", "RIGHT", "RIGHTDOWN", "DOWN", "LEFTDOWN", "LEFT", "LEFTUP", "LEVEL_UP", "LEVEL_DOWN",
+        "pause", "toggle_run", "toggle_crouch",
+        "open", "close", "smash", "examine", "pickup", "grab", "butcher", "look", "peek",
+        "inventory", "apply", "wear", "take_off", "eat", "read", "wield", "reload_weapon", "unload", "throw",
+        "fire", "drop",
+        "wait", "sleep", "safemode", "save", "SUICIDE"
+    };
+    if( action.rfind( "fp3d_", 0 ) == 0 ) {
+        return true;
+    }
+    if( action == "debug" ) {
+        return cheats;
+    }
+    return std::any_of( std::begin( allowed ), std::end( allowed ), [&action]( const char *name ) {
+        return action == name;
+    } );
+}
+
 void note_poll( const std::string &where )
 {
     std::lock_guard<std::mutex> lk( poll_mutex );
