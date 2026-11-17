@@ -1867,21 +1867,23 @@ void sim_main()
         fp3d::set_before_ask_hook( observe );
         while( !do_turn() ) {
         }
-        if( g->uquit != QUIT_SAVED ) {
-            throw std::runtime_error( "game ended without saving" );
+        // Each time the game saves and quits (the save goal, the cooking checks): back to it the way the main menu
+        // loads one. Any other end is an error.
+        for( ;; ) {
+            if( g->uquit != QUIT_SAVED ) {
+                throw std::runtime_error( loads == 0 ? "game ended without saving" : "game ended" );
+            }
+            std::printf( "sim: saved and quit, reloading\n" );
+            g->setup();
+            if( !fp3d_game_access::load_game( *g, save_t::from_save_id( save_id ) ) ) {
+                throw std::runtime_error( "load failed" );
+            }
+            loads++;
+            note_resume();
+            fp3d::reset_snapshots();
+            while( !do_turn() ) {
+            }
         }
-        // Back to the game the way the main menu loads one.
-        std::printf( "sim: saved and quit, reloading\n" );
-        g->setup();
-        if( !fp3d_game_access::load_game( *g, save_t::from_save_id( save_id ) ) ) {
-            throw std::runtime_error( "load failed" );
-        }
-        loads++;
-        note_resume();
-        fp3d::reset_snapshots();
-        while( !do_turn() ) {
-        }
-        sim_error = "game ended";
     } catch( const fp3d::shutdown_signal & ) {
         // normal end: the driver shut the bridge down
     } catch( const std::exception &e ) {
@@ -3427,6 +3429,39 @@ static bool run_cooking_checks()
            "cook: 2 water used, the craft shown with the pot",
            after ? "water " + std::to_string( water_left( after ) ) + ", craft '" + after->craft_recipe + "' " +
            std::to_string( after->craft_progress ) + " permille" : "pot not seen" );
+
+    // A save and a load keep the pot's handle and the paused craft's link to it (both are item vars): the game is
+    // saved and quit here and loaded again as the main menu does; everything below runs on the loaded game.
+    {
+        const int loads_before = snapshot().loads;
+        r = fp3d::wait_request( 5000 );
+        fp3d::queue_action( "save" );
+        std::optional<fp3d::ui_request> sv = fp3d::wait_request( 20000, r ? r->id : 0 );
+        for( int i = 0; i < 5 && sv && !sv->timed; i++ ) {
+            fp3d::ui_answer a;
+            a.id = sv->id;
+            if( std::find( sv->actions.begin(), sv->actions.end(), "YES" ) != sv->actions.end() ) {
+                a.action = "YES";
+            } else {
+                a.cancel = true;
+            }
+            fp3d::answer( a );
+            sv = fp3d::wait_request( 300000, sv->id );   // the load takes a while
+        }
+        r = sv;
+        const std::optional<fp3d::cookware_view> kept = pot_now();
+        check( r && r->timed && snapshot().loads == loads_before + 1 && kept && after &&
+               kept->craft_recipe == "water_clean" && kept->craft_progress == after->craft_progress &&
+               water_left( kept ) == water_left( after ),
+               "save and load: the pot keeps its handle, the craft its link",
+               std::string( r && r->timed ? "" : "main loop not back, " ) + "loads " +
+               std::to_string( snapshot().loads - loads_before ) +
+               ( kept ? ", craft '" + kept->craft_recipe + "' " + std::to_string( kept->craft_progress ) +
+                 " permille, water " + std::to_string( water_left( kept ) ) : ", pot not seen" ) );
+        if( !r || !r->timed ) {
+            return false;
+        }
+    }
 
     // The rest of L9 on that paused craft (2 of the 4 water still in the pot on the fire): pouring out of the pot
     // where it stands, the pot off the heat and back, the fire put out, fed and lit again, and the craft to its end.
