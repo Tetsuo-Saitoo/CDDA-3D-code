@@ -239,7 +239,8 @@ int main()
     std::error_code mec;
     fs::path mod_dir;
     try {
-        fp3d::init_paths( "", "./fp3d_user" );
+        // This test's own user folder: what another test binary leaves behind never reaches it.
+        fp3d::init_paths( "", "./fp3d_user_chargen" );
         mod_dir = fs::u8path( PATH_INFO::user_moddir() ) / nodeps_mod;
         fs::create_directories( mod_dir, mec );
         write_file( mod_dir / "modinfo.json", std::string( "[{\"type\":\"MOD_INFO\",\"id\":\"" ) + nodeps_mod +
