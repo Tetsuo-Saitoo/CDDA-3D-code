@@ -392,6 +392,94 @@ int main()
         }
         check( bumped == 1 && wall_seen, "a new wall bumps one submap's revision",
                std::to_string( bumped ) + " bumped" );
+        {
+            // Only the levels a host wants (want_snapshot_levels): what it gets for them is the same as from a full
+            // capture, the other levels are left out, and a level that comes back goes on from its old revisions.
+            const int pz = u.posz();
+            const size_t per_level = static_cast<size_t>( MAPSIZE ) * MAPSIZE;
+            double all_ms = 0;
+            const std::shared_ptr<const fp3d::snapshot> all = timed_capture( all_ms );
+            fp3d::want_snapshot_levels( 1, 1 );
+            double few_ms = 0;
+            const std::shared_ptr<const fp3d::snapshot> few = timed_capture( few_ms );
+            std::map<key, const fp3d::submap_view *> in_all;
+            for( const auto &sm : all->submaps ) {
+                in_all[key_of( *sm )] = sm.get();
+            }
+            size_t same_view = 0;
+            bool levels_ok = few->z_first == pz - 1 && few->z_last == pz + 1;
+            for( const auto &sm : few->submaps ) {
+                const auto it = in_all.find( key_of( *sm ) );
+                same_view += it != in_all.end() && it->second == sm.get() ? 1 : 0;
+                levels_ok = levels_ok && sm->pos.z >= pz - 1 && sm->pos.z <= pz + 1;
+            }
+            check( all->submaps.size() == per_level * OVERMAP_LAYERS && all->z_first == -OVERMAP_DEPTH &&
+                   all->z_last == OVERMAP_HEIGHT && levels_ok && few->submaps.size() == 3 * per_level &&
+                   same_view == few->submaps.size(), "wanted levels: 3 of 21 taken, each submap as in a full capture",
+                   std::to_string( few->submaps.size() ) + " submaps, " + std::to_string( same_view ) + " the same" );
+            std::printf( "  capture took %.0f ms for all levels, %.0f ms for 3\n", all_ms, few_ms );
+            // What a client reads of those levels is the same text, but for the seq.
+            const auto json_of = [&]( const fp3d::snapshot & s ) {
+                std::ostringstream out;
+                fp3d::write_snapshot_json( out, s, pz - 1, pz + 1 );
+                std::string j = out.str();
+                const std::string tag = "\"seq\":" + std::to_string( s.seq );
+                const size_t at = j.find( tag );
+                if( at != std::string::npos ) {
+                    j.replace( at, tag.size(), "\"seq\":0" );
+                }
+                return j;
+            };
+            const std::string all_json = json_of( *all );
+            check( all_json == json_of( *few ) && all_json.size() > 1000, "wanted levels: the same JSON for them",
+                   std::to_string( all_json.size() ) + " bytes" );
+            // A wall two levels up, where no capture looks now; then that level is wanted: its submap's revision
+            // goes on by one from the full capture's, the others on that level keep theirs, none runs backwards.
+            const tripoint_bub_ms high = u.pos_bub() + tripoint_rel_ms( 3, 0, 2 );
+            const ter_id was = here.ter( high );
+            here.ter_set( high, ter_t_wall );
+            refresh_caches();
+            const std::shared_ptr<const fp3d::snapshot> blind = timed_capture( few_ms );
+            fp3d::want_snapshot_levels( 2, 0 );   // the wider of each side: 2 below, 1 above
+            const std::shared_ptr<const fp3d::snapshot> lopsided = timed_capture( few_ms );
+            check( lopsided->z_first == pz - 2 && lopsided->z_last == pz + 1 &&
+                   lopsided->submaps.size() == 4 * per_level, "wanted levels: only ever wider, each side on its own",
+                   std::to_string( lopsided->z_first ) + ".." + std::to_string( lopsided->z_last ) );
+            fp3d::want_snapshot_levels( 0, 2 );
+            const std::shared_ptr<const fp3d::snapshot> wider = timed_capture( few_ms );
+            const tripoint_abs_sm high_sm = project_to<coords::sm>( here.get_abs( high ) );
+            const key high_key{ high_sm.x(), high_sm.y(), high_sm.z() };
+            int went_on = 0;
+            int kept = 0;
+            int backwards = 0;
+            for( const auto &sm : wider->submaps ) {
+                const auto it = in_all.find( key_of( *sm ) );
+                if( it == in_all.end() ) {
+                    continue;
+                }
+                backwards += sm->revision < it->second->revision ||
+                             sm->detail_revision < it->second->detail_revision ? 1 : 0;
+                if( sm->pos.z == pz + 2 ) {
+                    if( key_of( *sm ) == high_key ) {
+                        went_on += sm->revision == it->second->revision + 1 ? 1 : 0;
+                    } else {
+                        kept += sm->revision == it->second->revision ? 1 : 0;
+                    }
+                }
+            }
+            check( blind->submaps.size() == 3 * per_level && wider->z_first == pz - 2 && wider->z_last == pz + 2 &&
+                   wider->submaps.size() == 5 * per_level && went_on == 1 &&
+                   kept == static_cast<int>( per_level ) - 1 && backwards == 0,
+                   "wanted levels: a level that comes back goes on from its revisions",
+                   std::to_string( wider->submaps.size() ) + " submaps, " + std::to_string( went_on ) + " went on, " +
+                   std::to_string( kept ) + " kept, " + std::to_string( backwards ) + " backwards" );
+            here.ter_set( high, was );
+            refresh_caches();
+            fp3d::want_all_snapshot_levels();
+            const std::shared_ptr<const fp3d::snapshot> back = timed_capture( all_ms );
+            check( back->submaps.size() == per_level * OVERMAP_LAYERS && back->z_first == -OVERMAP_DEPTH &&
+                   back->z_last == OVERMAP_HEIGHT, "wanted levels: all of them again" );
+        }
 
         // A zombie in view shows up with its type and keeps its uid. A tamed dog comes along for the attitudes.
         const tripoint_bub_ms zed_at = u.pos_bub() + tripoint_rel_ms( 0, 2, 0 );

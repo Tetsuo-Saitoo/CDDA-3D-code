@@ -1,6 +1,7 @@
 #include "fp3d/snapshot.h"
 
 #include <algorithm>
+#include <atomic>
 #include <climits>
 #include <cmath>
 #include <cstdint>
@@ -112,6 +113,17 @@ capture_state state;
 
 std::mutex latest_mutex;
 std::shared_ptr<const snapshot> latest;
+
+// want_snapshot_levels: levels below and above the player's that a capture takes; -1 = all of them.
+std::atomic<int> want_below{ -1 };
+std::atomic<int> want_above{ -1 };
+
+void widen_levels( std::atomic<int> &side, int want )
+{
+    int cur = side.load();
+    while( ( cur < 0 || want > cur ) && !side.compare_exchange_weak( cur, want ) ) {
+    }
+}
 
 uint8_t clamp_u8( double v )
 {
@@ -1100,8 +1112,15 @@ std::shared_ptr<const snapshot> capture_snapshot()
     here.update_visibility_cache( u.posz() );
     const visibility_variables &cache = here.get_visibility_variables_cache();
     std::map<sm_key, std::shared_ptr<const submap_view>> current;
-    s->submaps.reserve( static_cast<size_t>( MAPSIZE ) * MAPSIZE * OVERMAP_LAYERS );
-    for( int z = -OVERMAP_DEPTH; z <= OVERMAP_HEIGHT; z++ ) {
+    // The levels the host wants (want_snapshot_levels), around the player's.
+    const int below = want_below.load();
+    const int above = want_above.load();
+    const int z_first = below < 0 ? -OVERMAP_DEPTH : std::max( -OVERMAP_DEPTH, u.posz() - below );
+    const int z_last = above < 0 ? OVERMAP_HEIGHT : std::min( OVERMAP_HEIGHT, u.posz() + above );
+    s->z_first = static_cast<int8_t>( z_first );
+    s->z_last = static_cast<int8_t>( z_last );
+    s->submaps.reserve( static_cast<size_t>( MAPSIZE ) * MAPSIZE * ( z_last - z_first + 1 ) );
+    for( int z = z_first; z <= z_last; z++ ) {
         for( int gy = 0; gy < MAPSIZE; gy++ ) {
             for( int gx = 0; gx < MAPSIZE; gx++ ) {
                 std::shared_ptr<const submap_view> fresh = capture_submap( here, u, cache, vehicle_tiles,
@@ -1130,7 +1149,19 @@ std::shared_ptr<const snapshot> capture_snapshot()
     }
     // Live item tiles: the lying items in reach, now that the piles gave them their handles.
     capture_near_item_states( here, u, seen, s->player.item_states, s->player.item_amounts );
-    // Submaps that left the bubble are forgotten; if they come back they start over at revision 1.
+    // Submaps that left the bubble are forgotten; if they come back they start over at revision 1. Ones on a
+    // level this capture left out keep their last view: their revisions go on from it when the level is taken again.
+    if( z_first > -OVERMAP_DEPTH || z_last < OVERMAP_HEIGHT ) {
+        for( auto &old : state.previous ) {
+            const int x = std::get<0>( old.first );
+            const int y = std::get<1>( old.first );
+            const int z = std::get<2>( old.first );
+            if( ( z < z_first || z > z_last ) && x >= origin.x() && x < origin.x() + MAPSIZE &&
+                y >= origin.y() && y < origin.y() + MAPSIZE ) {
+                current.emplace( old.first, std::move( old.second ) );
+            }
+        }
+    }
     state.previous = std::move( current );
     return s;
 }
@@ -1142,6 +1173,18 @@ void reset_snapshots()
     fresh.seq = state.seq;
     fresh.next_uid = state.next_uid;
     state = std::move( fresh );
+}
+
+void want_snapshot_levels( int below, int above )
+{
+    widen_levels( want_below, std::clamp( below, 0, OVERMAP_LAYERS ) );
+    widen_levels( want_above, std::clamp( above, 0, OVERMAP_LAYERS ) );
+}
+
+void want_all_snapshot_levels()
+{
+    want_below.store( -1 );
+    want_above.store( -1 );
 }
 
 void publish_snapshot( std::shared_ptr<const snapshot> s )

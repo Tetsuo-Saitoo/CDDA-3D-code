@@ -4,8 +4,9 @@
 
 // FP3D block B3: immutable copies of the reality bubble for the client. See contracts/snapshot.md.
 // Captured on the sim thread (capture_snapshot), handed over with publish_snapshot / latest_snapshot.
-// Every snapshot lists all submaps of the bubble; ones that didn't change since the previous capture are
-// shared (same pointer, same revisions), so a client that only reads the newest snapshot never misses a change.
+// Every snapshot lists all submaps of the bubble on the levels it takes (want_snapshot_levels; every level
+// by default); ones that didn't change since the previous capture are shared (same pointer, same revisions), so
+// a client that only reads the newest snapshot never misses a change.
 
 #include <array>
 #include <cstdint>
@@ -359,7 +360,9 @@ struct snapshot {
     uint32_t ids_generation = 0;                  // the id tables (block B6) these indices belong to
     ui_point bubble_origin;                       // absolute submap of bubble (0,0); z = 0
     player_view player;
-    std::vector<std::shared_ptr<const submap_view>> submaps;  // 11 * 11 * 21
+    int8_t z_first = 0;                           // the levels `submaps` holds, lowest and highest
+    int8_t z_last = 0;
+    std::vector<std::shared_ptr<const submap_view>> submaps;  // 11 * 11 * the levels (21 when all are taken)
     std::vector<creature_view> creatures;         // perceived only (cap 1024)
     std::vector<vehicle_view> vehicles;           // cap 256
     environment_view env;
@@ -382,6 +385,13 @@ std::string cdda_id_name( const std::string &table, uint32_t index );
 
 // Sim side. Captures the bubble; submaps unchanged since the previous capture are shared with it.
 std::shared_ptr<const snapshot> capture_snapshot();
+// Which levels a capture takes. Walking a level costs the same whether anyone reads it or not, so a host that
+// only writes a few levels (write_snapshot_json's range) says so with every write: captures then take the widest
+// range wanted so far, `below` and `above` the player's level, and leave the rest out of `submaps`. Before the
+// first call, and after want_all_snapshot_levels(), a capture takes every level. A level that is left out keeps
+// its revision counters, so they never run backwards when it is taken again. Any thread; the next capture uses it.
+void want_snapshot_levels( int below, int above );
+void want_all_snapshot_levels();
 // Sim side. Forgets revisions and creature uids (call after loading a different game).
 void reset_snapshots();
 // Sim side. The uid a creature has (or gets) in snapshots, and the seq the next capture will have.
