@@ -1116,6 +1116,8 @@ int Character::fire_gun( map &here, const tripoint_bub_ms &target, int shots, it
         projectile proj = make_gun_projectile( gun );
         const fp3d::explosion_item_scope fp3d_item( projectile_use_ammo_id.is_null() ? std::string() :
                 projectile_use_ammo_id.str() ); // FP3D: rockets, 40 mm grenades
+        const fp3d::shot_ammo_scope fp3d_ammo( projectile_use_ammo_id.is_null() ? std::string() :
+                                               projectile_use_ammo_id.str() ); // FP3D: projectile events name the ammo
 
         for( damage_unit &elem : proj.impact.damage_units ) {
             elem.amount = enchantment_cache->modify_value( enchant_vals::mod::RANGED_DAMAGE, elem.amount );

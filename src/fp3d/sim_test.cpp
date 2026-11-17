@@ -4562,6 +4562,11 @@ static bool run_combat_checks()
         const int end_dy = m.projectiles.empty() || !m.target ? 99 : m.projectiles.front().pos.y - m.target->origin.y;
         check( fired( m, 1 ) && delta( m.c0.planned, m.c1.planned ) == 1 && end_dy == 0,
                "FIRE answer: a miss keeps the aim line", "end dy " + std::to_string( end_dy ) + ", " + counts( m ) );
+        // A real gun shot's projectile event names its ammo (detail) and no flying item (type).
+        const uint32_t ammo_fired = m.projectiles.empty() ? 0 : m.projectiles.front().detail;
+        check( !m.projectiles.empty() && ammo_fired != 0 && m.projectiles.front().type == 0 &&
+               ammo_fired == fp3d::intern_id( fp3d::id_kind::itype, "9mm" ),
+               "a gun's projectile names its ammo", std::to_string( ammo_fired ) );
     }
     // Nothing stored: a cancel, a throw, a hit on a creature the request didn't offer, an outcome from an earlier turn.
     {

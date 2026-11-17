@@ -195,6 +195,21 @@ void on_damage( const Creature &target, const Creature *source, const std::strin
     push( std::move( e ) );
 }
 
+namespace
+{
+thread_local std::string shot_ammo;
+} // namespace
+
+shot_ammo_scope::shot_ammo_scope( const std::string &itype ) : prev( shot_ammo )
+{
+    shot_ammo = itype;
+}
+
+shot_ammo_scope::~shot_ammo_scope()
+{
+    shot_ammo = prev;
+}
+
 void on_projectile( const map &here, const Creature *shooter, const std::vector<tripoint_bub_ms> &path,
                     const tripoint_bub_ms &end, const Creature *hit, const std::string &thrown )
 {
@@ -221,6 +236,7 @@ void on_projectile( const map &here, const Creature *shooter, const std::vector<
     e.other = hit != nullptr ? creature_uid( *hit ) : 0;
     e.pos = abs_of( end );
     e.type = thrown.empty() ? 0 : item_index( thrown );
+    e.detail = shot_ammo.empty() ? 0 : item_index( shot_ammo );
     push( std::move( e ) );
 }
 
