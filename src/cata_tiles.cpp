@@ -44,6 +44,7 @@
 #include "field.h"
 #include "field_type.h"
 #include "flexbuffer_json.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "game.h"
 #include "input.h"
 #include "item.h"
@@ -364,7 +365,9 @@ void cata_tiles::load_tileset( const std::string &tileset_id, const bool prechec
     // reset the overlay ordering from the previous loaded tileset
     tileset_mutation_overlay_ordering.clear();
 
-    tileset_ptr = cache.load_tileset( tileset_id, renderer, precheck, force, pump_events, terrain );
+    // FP3D: headless: nothing is drawn, so only the tile sizes are read, never the images
+    tileset_ptr = cache.load_tileset( tileset_id, renderer, precheck || fp3d::active(), force,
+                                      pump_events, terrain );
 
     set_draw_scale( 16 );
 
@@ -5425,6 +5428,10 @@ void cata_tiles::get_tile_values_with_ter(
 
 void cata_tiles::do_tile_loading_report()
 {
+    // FP3D: headless: no tiles are loaded, so there is nothing to report
+    if( fp3d::active() ) {
+        return;
+    }
     DebugLog( D_INFO, DC_ALL ) << "Loaded tileset: " << tileset_ptr->get_tileset_id();
 
     if( !g->is_core_data_loaded() ) {
