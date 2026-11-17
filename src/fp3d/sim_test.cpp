@@ -228,6 +228,8 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 uint64_t pk_rock_uid = 0;
 uint64_t pk_wielded_uid = 0;
 std::atomic<int> hand_setup{ 0 };
+// The smash checks' scene (hand_setup 40 / 41): what the avatar wielded before it (sim thread only).
+std::optional<item> smash_saved_weapon;
 // The random start's strength while a scene sets its own (sim thread only; -1 = nothing saved).
 int siphon_str_saved = -1;
 int offhand_str_saved = -1;
@@ -778,6 +780,45 @@ void observe()
         zombies_placed++;
     }
     switch( hand_setup.exchange( 0 ) ) {
+        case 40: {
+            // The smash checks (run_smash_checks): flat dirt, a rock wielded, a window east and another 2 north.
+            g->clear_zombies();
+            for( int dx = -2; dx <= 2; dx++ ) {
+                for( int dy = -2; dy <= 2; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    here.i_clear( q );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.ter_set( q, ter_t_dirt );
+                }
+            }
+            here.ter_set( p + tripoint_rel_ms( 1, 0, 0 ), ter_str_id( "t_window" ) );
+            here.ter_set( p + tripoint_rel_ms( 0, -2, 0 ), ter_str_id( "t_window" ) );
+            const item_location w = get_avatar().get_wielded_item();
+            smash_saved_weapon = w ? std::optional<item>( *w ) : std::nullopt;
+            get_avatar().set_wielded_item( item( itype_rock ) );
+            here.invalidate_map_cache( p.z() );
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 41: {
+            // After the smash checks: flat dirt again (no glass about), the weapon from before.
+            for( int dx = -2; dx <= 2; dx++ ) {
+                for( int dy = -2; dy <= 2; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    here.i_clear( q );
+                    here.ter_set( q, ter_t_dirt );
+                }
+            }
+            if( smash_saved_weapon ) {
+                get_avatar().set_wielded_item( *smash_saved_weapon );
+            } else {
+                get_avatar().remove_weapon();
+            }
+            smash_saved_weapon.reset();
+            here.invalidate_map_cache( p.z() );
+            here.build_map_cache( p.z() );
+            break;
+        }
         case 1:
             g->clear_zombies();
             g->place_critter_at( mon_zombie, p + tripoint_rel_ms( -1, 0, 0 ) );
@@ -5583,6 +5624,126 @@ static bool run_combat_checks()
     return failed == 0;
 }
 
+// Smash at a square (2026-11-17; the client's strike keys at a wall, door, window or furniture send
+// queue_action_at("smash", square)): CDDA's smash takes exactly the queued square next to the avatar and asks no
+// direction; a square farther off or on another level is refused ("Never mind."), nothing asked, and isn't left for
+// a later prompt; a smash queued without a square still asks the way.
+static bool run_smash_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  smash: %-58s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 40;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !r || !r->timed || !s0 || hand_setup.load() != 0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point me = s0->player.pos;
+    const auto at = [&]( int dx, int dy, int dz = 0 ) {
+        return fp3d::ui_point{ me.x + dx, me.y + dy, me.z + dz };
+    };
+    // The terrain id on absolute square `p` in the newest snapshot ("" when not in it).
+    const auto ter_at = []( const fp3d::ui_point & p ) {
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return std::string();
+        }
+        const auto floor_div = []( int a ) {
+            return a >= 0 ? a / fp3d::sm_size : ( a - fp3d::sm_size + 1 ) / fp3d::sm_size;
+        };
+        const int sx = floor_div( p.x );
+        const int sy = floor_div( p.y );
+        const int tile = ( p.y - sy * fp3d::sm_size ) * fp3d::sm_size + ( p.x - sx * fp3d::sm_size );
+        for( const std::shared_ptr<const fp3d::submap_view> &sm : s->submaps ) {
+            if( sm->pos.x == sx && sm->pos.y == sy && sm->pos.z == p.z ) {
+                return fp3d::cdda_id_name( "ter", sm->ter[tile] );
+            }
+        }
+        return std::string();
+    };
+    // `smash` queued (at `sq`, or plain without one) and run to the next main-loop request: its messages; `prompts`
+    // counts what it asked (each cancelled).
+    int prompts = 0;
+    const auto act = [&]( const std::optional<fp3d::ui_point> &sq ) {
+        std::vector<fp3d::event> evs;
+        fp3d::drain_events( evs );
+        evs.clear();
+        prompts = 0;
+        if( !( sq ? fp3d::queue_action_at( "smash", *sq ) : fp3d::queue_action( "smash" ) ) ) {
+            return std::string( "(refused)" );
+        }
+        const uint64_t before = r->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 20000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( !r->timed ) {
+                prompts++;
+                fp3d::ui_answer a;
+                a.id = r->id;
+                a.cancel = true;
+                fp3d::answer( a );
+                continue;
+            }
+            if( r->id != before ) {
+                break;
+            }
+        }
+        fp3d::drain_events( evs );
+        std::string msgs;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                msgs += ( msgs.empty() ? "" : " | " ) + e.text;
+            }
+        }
+        return msgs;
+    };
+    const auto has = []( const std::string & str, const char *part ) {
+        return str.find( part ) != std::string::npos;
+    };
+
+    check( ter_at( at( 1, 0 ) ) == "t_window" && ter_at( at( 0, -2 ) ) == "t_window",
+           "scene: a window east, another 2 north", ter_at( at( 1, 0 ) ) + " " + ter_at( at( 0, -2 ) ) );
+    std::string m = act( at( 0, -2 ) );
+    check( prompts == 0 && ter_at( at( 0, -2 ) ) == "t_window" && has( m, "Never mind" ),
+           "a window 2 squares off: refused, nothing asked", "[" + m + "]" );
+    m = act( std::nullopt );
+    check( prompts == 1 && ter_at( at( 1, 0 ) ) == "t_window",
+           "then a smash with no square still asks the way", "[" + m + "] " + std::to_string( prompts ) + " asked" );
+    m = act( at( 1, 0, 1 ) );
+    check( prompts == 0 && ter_at( at( 1, 0 ) ) == "t_window" && has( m, "Never mind" ),
+           "a square on the level above: refused, nothing asked", "[" + m + "]" );
+    // CDDA rolls each bash: a few tries at most with a rock against glass.
+    int tries = 0;
+    int asked = 0;
+    while( ter_at( at( 1, 0 ) ) == "t_window" && tries < 10 ) {
+        m = act( at( 1, 0 ) );
+        asked += prompts;
+        tries++;
+    }
+    check( ter_at( at( 1, 0 ) ) != "t_window" && ter_at( at( 0, -2 ) ) == "t_window" && asked == 0,
+           "the window next to you: smashed at its square, nothing asked", ter_at( at( 1, 0 ) ) + " after " +
+           std::to_string( tries ) + " tries, " + std::to_string( asked ) + " asked, [" + m + "]" );
+    hand_setup = 41;
+    fp3d::queue_action( "pause" );
+    r = fp3d::wait_request( 20000, r->id );
+    check( r && r->timed && hand_setup.load() == 0, "after: the weapon from before back", "" );
+    return failed == 0;
+}
+
 // Safe mode (2026-11-10): FP3D games start with CDDA's safe mode off, new and loaded (boot.cpp); the `safemode`
 // action (Shift+1) still toggles it; auto-pause on a new hostile is its own clock setting (bridge.h).
 static bool run_safemode_checks()
@@ -8334,7 +8495,7 @@ int main()
     const bool cheats_ok = cooking_ok && run_cheat_checks();
     const bool stairs_ok = cheats_ok && run_stairs_checks();
     const bool guns_ok = stairs_ok && run_gun_item_checks();
-    const bool combat_ok = guns_ok && run_combat_checks();
+    const bool combat_ok = guns_ok && run_combat_checks() && run_smash_checks();
     const bool range_ok = combat_ok && run_range_op_checks() && run_point_teleport_checks();
     const bool throw_pour_ok = range_ok && run_throw_pour_checks();
     const bool physics_ok = throw_pour_ok && run_item_physics_checks();

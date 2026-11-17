@@ -1088,20 +1088,31 @@ action_id handle_main_menu()
 // FP3D: square the next direction prompt is centred on, when it isn't the player's (choose_adjacent)
 static thread_local std::optional<tripoint_abs_ms> fp3d_direction_origin;
 
-// FP3D: one `direction` request replaces the key loop. An answer outside the allowed 3x3(x3) cancels.
+// FP3D: one `direction` request replaces the key loop. An answer outside the allowed 3x3(x3) cancels. An action
+// queued for one square (fp3d::queue_action_at, e.g. smash) answers it without asking: that square, taken once (also
+// when refused, so it never reaches a later prompt), allowed only inside the same 3x3(x3) around the origin.
 static std::optional<tripoint_rel_ms> fp3d_choose_direction( const std::string &message,
         const bool allow_vertical )
 {
     Character &player_character = get_player_character();
-    fp3d::ui_request req;
-    req.kind = fp3d::request_kind::direction;
-    req.text = message;
-    req.allow_vertical = allow_vertical;
-    req.origin = fp3d::to_ui_point( fp3d_direction_origin.value_or( player_character.pos_abs() ) );
+    const tripoint_abs_ms origin = fp3d_direction_origin.value_or( player_character.pos_abs() );
     fp3d_direction_origin.reset();
-    const fp3d::ui_answer a = fp3d::ask( req );
-    if( !a.cancel && a.pos ) {
-        const tripoint_rel_ms vec( a.pos->x, a.pos->y, a.pos->z );
+    std::optional<tripoint_rel_ms> picked;
+    if( const std::optional<fp3d::ui_point> sq = fp3d::take_action_square() ) {
+        picked = fp3d::to_abs_ms( *sq ) - origin;
+    } else {
+        fp3d::ui_request req;
+        req.kind = fp3d::request_kind::direction;
+        req.text = message;
+        req.allow_vertical = allow_vertical;
+        req.origin = fp3d::to_ui_point( origin );
+        const fp3d::ui_answer a = fp3d::ask( req );
+        if( !a.cancel && a.pos ) {
+            picked = tripoint_rel_ms( a.pos->x, a.pos->y, a.pos->z );
+        }
+    }
+    if( picked ) {
+        const tripoint_rel_ms vec = *picked;
         if( std::abs( vec.x() ) <= 1 && std::abs( vec.y() ) <= 1 &&
             ( allow_vertical ? std::abs( vec.z() ) <= 1 : vec.z() == 0 ) ) {
             if( vec.x() > 0 ) {
