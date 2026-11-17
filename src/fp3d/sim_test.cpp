@@ -2229,6 +2229,23 @@ static bool run_siphon_checks()
     check( r && r->timed && h.main.id == "hose" && h.off.id == "jerrycan" && h.off.capacity_ml >= 10000,
            "hose in the main hand, jerrycan in the off", h.main.id + " / " + h.off.id + " " +
            std::to_string( h.off.capacity_ml ) + " ml" );
+    // The held view names each hand's item by its handle: the uid the snapshot lists for the wielded item and for
+    // the one held in the off hand.
+    uint64_t wielded_uid = 0;
+    uint64_t offhand_uid = 0;
+    if( const std::shared_ptr<const fp3d::snapshot> held_snap = fp3d::latest_snapshot() ) {
+        for( const fp3d::carried_view &c : held_snap->player.items ) {
+            if( c.flags & fp3d::carried_wielded ) {
+                wielded_uid = c.uid;
+            }
+            if( c.flags & fp3d::carried_offhand ) {
+                offhand_uid = c.uid;
+            }
+        }
+    }
+    check( h.main.uid != 0 && h.main.uid == wielded_uid && h.off.uid != 0 && h.off.uid == offhand_uid,
+           "held view: each hand's item by its handle",
+           std::to_string( h.main.uid == wielded_uid ) + std::to_string( h.off.uid == offhand_uid ) );
     if( !r ) {
         return false;
     }

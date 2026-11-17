@@ -49,6 +49,7 @@ bool watched_activity( const avatar &u );
 
 struct hand_view {
     bool held = false;
+    uint64_t uid = 0;            // the item's handle, as the snapshot lists it; 0 = it has none yet
     std::string id;              // itype id
     std::string name;            // display name, no colour tags
     std::string liquid;          // the liquid inside ("" none)
