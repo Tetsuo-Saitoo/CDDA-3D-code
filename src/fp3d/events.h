@@ -81,6 +81,18 @@ constexpr size_t max_weakpoint_id = 32;
 // A weak point id as damage events send it: ASCII letters, digits and '_', not starting with a digit, at most
 // max_weakpoint_id bytes; anything else (a mod's id with spaces or markup, an empty one) is "".
 std::string weakpoint_text( const std::string &id );
+// The ammo of the gun shot in progress (Character::fire_gun): projectile events sent inside the scope carry its
+// itype as `detail`, so a client can tell what flies (a 9 mm round, buckshot, an arrow) when nothing drops.
+class shot_ammo_scope
+{
+    public:
+        explicit shot_ammo_scope( const std::string &itype );
+        ~shot_ammo_scope();
+        shot_ammo_scope( const shot_ammo_scope & ) = delete;
+        shot_ammo_scope &operator=( const shot_ammo_scope & ) = delete;
+    private:
+        std::string prev;
+};
 // `path` from the shooter's square; the projectile got as far as `end`.
 void on_projectile( const map &here, const Creature *shooter, const std::vector<tripoint_bub_ms> &path,
                     const tripoint_bub_ms &end, const Creature *hit, const std::string &thrown );

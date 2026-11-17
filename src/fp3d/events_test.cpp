@@ -492,6 +492,18 @@ int main()
                same( prj[0].path[1], abs_of( at + tripoint_rel_ms( -1, 0, 0 ) ) ),
                "projectile: path from the shooter", prj.empty() ? "none" :
                std::to_string( prj[0].path.size() ) + " squares" );
+        // Inside a gun shot's scope the event names the ammo; outside one (the shot above) it names none.
+        std::vector<event> shot_prj;
+        {
+            const fp3d::shot_ammo_scope ammo( "9mm" );
+            dealt_projectile_attack second;
+            projectile_attack( second, proj, &here, at, at + tripoint_rel_ms( -4, 0, 0 ), dispersion_sources( 0 ), &u );
+            shot_prj = drain( event_kind::projectile );
+        }
+        check( prj.size() == 1 && prj[0].detail == 0 && shot_prj.size() == 1 &&
+               name_of( fp3d::id_kind::itype, shot_prj[0].detail ) == "9mm" && shot_prj[0].type == 0,
+               "projectile: a gun shot names its ammo", shot_prj.empty() ? "none" :
+               name_of( fp3d::id_kind::itype, shot_prj[0].detail ) );
 
         zed->die( &here, &u );
         std::vector<event> dead = drain( event_kind::death );
