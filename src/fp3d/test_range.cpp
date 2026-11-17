@@ -1741,6 +1741,11 @@ std::string spawn_item( uint32_t itype, int count, const ui_point &square )
     }
     // On that square only (no overflow onto its neighbours): as many as fit.
     item it( type, calendar::turn );
+    // A type with a countdown (grenade_act and other lit forms) spawns ticking, as CDDA's activation leaves it: the
+    // constructor sets the countdown but not active, and only active items are processed.
+    if( type->countdown_interval > 0_seconds ) {
+        it.active = true;
+    }
     int placed = 0;
     if( it.count_by_charges() ) {
         it.charges = count;
