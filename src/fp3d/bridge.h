@@ -56,6 +56,7 @@ struct ui_request {
     std::string title;
     std::string text;                    // CDDA colour-tagged text
     std::vector<ui_entry> entries;       // menu, item_select, item_multi
+    int selected = -1;                   // menu: index into entries of CDDA's highlighted entry, -1 = none
     std::vector<std::string> actions;    // key, popup, target
     bool allow_cancel = true;
     int max_len = 0;                     // string
