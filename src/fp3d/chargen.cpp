@@ -520,6 +520,14 @@ namespace
 {
 const char *const fallback_name = "Survivor";
 constexpr int max_name_picks = 8;
+constexpr int max_fallback_number = 9999;
+
+// A character of that name is saved in the world being played already.
+bool name_taken( const std::string &n )
+{
+    return world_generator && world_generator->active_world != nullptr &&
+           world_generator->active_world->save_exists( save_t::from_save_id( n ) );
+}
 
 // A name from the game's own data made to pass name_ok where it can: what name_ok refuses is dropped, then as a
 // typed name (checked_name). "" when nothing passes.
@@ -544,11 +552,18 @@ std::string tidied_name( const std::string &raw )
 
 void settle_new_character( avatar &u )
 {
-    for( int i = 0; i < max_name_picks && !name_ok( u.name ); i++ ) {
+    const auto fits = []( const std::string & n ) {
+        return name_ok( n ) && !name_taken( n );
+    };
+    for( int i = 0; i < max_name_picks && !fits( u.name ); i++ ) {
         u.pick_name();
     }
-    if( !name_ok( u.name ) ) {
+    if( !fits( u.name ) ) {
+        // The fixed name, numbered when the world has a character of that name already.
         u.name = fallback_name;
+        for( int n = 2; n <= max_fallback_number && name_taken( u.name ); n++ ) {
+            u.name = std::string( fallback_name ) + " " + std::to_string( n );
+        }
     }
     u.set_save_id( u.name );
 }

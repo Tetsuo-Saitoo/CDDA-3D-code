@@ -35,6 +35,7 @@
 #include "string_input_popup.h"
 #include "translations.h"
 #include "ui_manager.h"
+#include "calendar.h" // FP3D:
 #include "fp3d/boot.h" // FP3D:
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/cheats.h" // FP3D:
@@ -140,6 +141,7 @@ static const std::string ANY_INPUT = "ANY_INPUT";
 static const std::string HELP_KEYBINDINGS = "HELP_KEYBINDINGS";
 static const std::string COORDINATE = "COORDINATE";
 static const std::string TIMEOUT = "TIMEOUT";
+static const std::string FP3D_QUIT = "QUIT"; // FP3D: bounded polling
 
 const std::string &input_context::input_to_action( const input_event &inp ) const
 {
@@ -446,12 +448,24 @@ const std::string &input_context::handle_input( const int timeout )
                 throw fp3d::shutdown_signal();
             }
             fp3d::note_poll( category );
-            return TIMEOUT;
+            // FP3D: bounded polling (fp3d/bridge.h): a screen that only polls is told to close, then asked below
+            const fp3d::poll_verdict idle = fp3d::idle_poll( to_turn<int64_t>( calendar::turn ) );
+            if( idle == fp3d::poll_verdict::close ) {
+                return FP3D_QUIT;
+            }
+            if( idle != fp3d::poll_verdict::ask ) {
+                return TIMEOUT;
+            }
         }
         fp3d::ui_request req;
         req.kind = fp3d::request_kind::key;
         req.context = category;
-        req.actions = registered_actions;
+        // FP3D: the action allow-list (fp3d/bridge.h): only what a client is meant to send here
+        for( const std::string &name : registered_actions ) {
+            if( fp3d::action_allowed( category, name, fp3d::cheats_allowed() ) ) {
+                req.actions.push_back( name );
+            }
+        }
         const bool timed = fp3d::next_is_timed();
         while( true ) {
             if( timed ) {
@@ -471,7 +485,8 @@ const std::string &input_context::handle_input( const int timeout )
             // A timed (main loop) request expired in real time: the player waits out the turn.
             const std::string wanted = a.timed_out ? "pause" : a.cancel ? "QUIT" : a.action;
             const auto it = std::find( registered_actions.begin(), registered_actions.end(), wanted );
-            if( it != registered_actions.end() ) {
+            if( it != registered_actions.end() &&
+                fp3d::action_allowed( category, wanted, fp3d::cheats_allowed() ) ) {
                 return *it;
             }
             // A queued action that isn't valid here is dropped; tell the client why.

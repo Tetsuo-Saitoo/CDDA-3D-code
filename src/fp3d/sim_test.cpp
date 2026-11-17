@@ -66,6 +66,7 @@
 #include "fp3d/swing.h"
 #include "game.h"
 #include "game_constants.h"
+#include "input_context.h"
 #include "inventory.h"
 #include "item.h"
 #include "item_location.h"
@@ -337,6 +338,10 @@ struct name_results {
 };
 std::mutex names_mutex;
 name_results names_out;
+// Bounded polling: what scene 34's two polling loops saw (sim thread writes, driver reads). Polls until the loop
+// ended; negative when it ended another way.
+std::atomic<int> poll_quit_after{ 0 };
+std::atomic<int> poll_asked_after{ 0 };
 std::atomic<int> interrupt_route{ -1 };            // 1: a 20-minute wait at 20 C begins; 2: the world's temperature back
 
 // Range resume checks (run_range_resume_checks): sim_main gives the avatar the test range's avatar values, so this
@@ -1380,6 +1385,27 @@ void observe()
             here.add_field( fire_at, fd_fire, 2 );
             break;
         }
+        case 34: {
+            // Bounded polling: a screen that only polls its input context is told QUIT after max_idle_polls polls;
+            // one that goes on polling gets a blocking request (the driver answers CONFIRM).
+            input_context ctxt( "FP3D_POLL_TEST" );
+            ctxt.register_action( "QUIT" );
+            ctxt.register_action( "CONFIRM" );
+            int polls = 0;
+            std::string got;
+            do {
+                got = ctxt.handle_input( 50 );
+                polls++;
+            } while( got == "TIMEOUT" && polls < 100000 );
+            poll_quit_after = got == "QUIT" ? polls : -polls;
+            int more = 0;
+            do {
+                got = ctxt.handle_input( 50 );
+                more++;
+            } while( got != "CONFIRM" && more < 100000 );
+            poll_asked_after = got == "CONFIRM" ? more : -more;
+            break;
+        }
         case 33: {
             // Names: an ally with a refused name is taken over (CDDA's control_npc), then a save under a refused
             // save id is tried. Last scene of the game: the avatar is another character afterwards.
@@ -2085,8 +2111,16 @@ static bool run_hand_checks()
     std::vector<fp3d::event> evs;
     hand_setup = 1;
     check( act( "pause", evs ), "scene: zombie west, rock in hand", "" );
-    check( act( "fp3d_attack_off_LEFT", evs ) && player_attacks( evs, true ) == 1 &&
-           player_attacks( evs, false ) == 0, "off hand strikes unarmed", "" );
+    const bool off_ran = act( "fp3d_attack_off_LEFT", evs );
+    std::string off_seen = std::string( off_ran ? "" : "main loop not back, " ) + std::to_string( player_attacks( evs,
+                           true ) ) + " unarmed, " + std::to_string( player_attacks( evs, false ) ) + " armed";
+    for( const fp3d::event &e : evs ) {
+        if( e.kind == fp3d::event_kind::message ) {
+            off_seen += " | " + e.text.substr( 0, 60 );
+        }
+    }
+    check( off_ran && player_attacks( evs, true ) == 1 && player_attacks( evs, false ) == 0,
+           "off hand strikes unarmed", off_seen );
     check( act( "fp3d_attack_main_LEFT", evs ) && player_attacks( evs, false ) == 1 &&
            player_attacks( evs, true ) == 0, "main hand uses the rock", "" );
     check( act( "fp3d_attack_off_UP", evs ) && player_attacks( evs, true ) + player_attacks( evs, false ) == 0 &&
@@ -2129,7 +2163,10 @@ static bool run_siphon_checks()
     std::optional<fp3d::ui_request> menu = fp3d::wait_request( 20000, r->id );
     std::string label;
     const int entry = menu ? first_entry_with( *menu, "jerrycan", label ) : -1;
-    check( menu && !menu->timed && entry >= 0, "hold asks which item", label );
+    check( menu && !menu->timed && entry >= 0, "hold asks which item",
+           entry >= 0 ? label : menu ? std::string( fp3d::kind_name( menu->kind ) ) + " in " + menu->context +
+           ( menu->timed ? ", timed" : "" ) + ": " + menu->text.substr( 0, 60 ) + " | polls " + fp3d::poll_report() :
+           "no request" );
     if( !menu || menu->timed || entry < 0 ) {
         return false;
     }
@@ -3410,6 +3447,102 @@ static bool run_cooking_checks()
            cook_text( finished ) + " | clean water " + std::to_string( clean ) +
            ( served ? ", craft '" + served->craft_recipe + "'" : ", pot not seen" ) );
     scene( 32 );
+    return failed == 0;
+}
+
+// The action allow-list and bounded polling (fp3d/bridge.h, scene 34). Late in the game: the scenes before it count
+// on the turns and the random numbers as they were.
+static bool run_action_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  actions: %-44s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    const std::optional<fp3d::ui_request> r1 = fp3d::wait_request( 5000 );
+    if( !r1 || !r1->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    std::vector<fp3d::event> evs;
+    fp3d::drain_events( evs );
+
+    // The action allow-list: CDDA actions a client isn't meant to send are dropped like unknown ones (no screen
+    // opens), the debug menu too unless cheats are allowed.
+    const bool cheats_were = fp3d::cheats_allowed();
+    fp3d::set_cheats_allowed( false );
+    const std::vector<std::string> not_allowed = { "missions", "diary", "action_menu", "main_menu", "open_options",
+                                                   "help", "quickload", "debug"
+                                                 };
+    for( const std::string &name : not_allowed ) {
+        fp3d::queue_action( name );
+    }
+    // No game turn passes here or in the checks below (the later scenes count on the turns as they were).
+    std::optional<fp3d::ui_request> ra = fp3d::wait_request( 20000, r1->id );
+    evs.clear();
+    fp3d::drain_events( evs );
+    size_t refused = 0;
+    for( const std::string &name : not_allowed ) {
+        refused += std::any_of( evs.begin(), evs.end(), [&name]( const fp3d::event & e ) {
+            return e.kind == fp3d::event_kind::message && e.text == "Can't do that here: " + name;
+        } ) ? 1 : 0;
+    }
+    const bool listed = ra && std::find( ra->actions.begin(), ra->actions.end(), "pause" ) != ra->actions.end() &&
+                        std::find( ra->actions.begin(), ra->actions.end(), "missions" ) == ra->actions.end() &&
+                        std::find( ra->actions.begin(), ra->actions.end(), "debug" ) == ra->actions.end();
+    check( ra && ra->timed && refused == not_allowed.size() && listed && fp3d::queued_actions() == 0,
+           "actions off the allow-list dropped",
+           std::to_string( refused ) + " of " + std::to_string( not_allowed.size() ) + " refused" +
+           ( ra ? std::string( ra->timed ? "" : ", a screen opened" ) + ( listed ? "" : ", listed" ) : ", no request" ) );
+    // With cheats allowed the debug menu opens (a menu request); it is closed again.
+    fp3d::set_cheats_allowed( true );
+    bool debug_menu = false;
+    if( ra && ra->timed ) {
+        fp3d::queue_action( "debug" );
+        ra = fp3d::wait_request( 20000, ra->id );
+        debug_menu = ra && !ra->timed && ra->kind == fp3d::request_kind::menu;
+        for( int i = 0; i < 10 && ra && !ra->timed; i++ ) {
+            fp3d::ui_answer cancel;
+            cancel.id = ra->id;
+            cancel.cancel = true;
+            fp3d::answer( cancel );
+            ra = fp3d::wait_request( 10000, ra->id );
+        }
+    }
+    fp3d::set_cheats_allowed( cheats_were );
+    check( debug_menu && ra && ra->timed, "debug menu only while cheats are allowed", "" );
+    if( !ra || !ra->timed ) {
+        return false;
+    }
+
+    // Bounded polling (scene 34 on the sim thread): the first loop is told QUIT at its 256th poll; the second
+    // ignores QUIT and is asked at the 1024th poll in all (its 768th), a request this answers with CONFIRM.
+    poll_quit_after = 0;
+    poll_asked_after = 0;
+    hand_setup = 34;
+    fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+    ra = fp3d::wait_request( 20000, ra->id );
+    const bool asked = ra && !ra->timed && ra->kind == fp3d::request_kind::key && ra->context == "FP3D_POLL_TEST";
+    for( int i = 0; i < 10 && ra && !ra->timed; i++ ) {
+        fp3d::ui_answer a;
+        a.id = ra->id;
+        if( ra->context == "FP3D_POLL_TEST" ) {
+            a.action = "CONFIRM";
+        } else {
+            a.cancel = true;
+        }
+        fp3d::answer( a );
+        ra = fp3d::wait_request( 10000, ra->id );
+    }
+    check( asked && poll_quit_after.load() == fp3d::max_idle_polls &&
+           poll_asked_after.load() == 3 * fp3d::max_idle_polls && ra && ra->timed,
+           "a polling screen is told QUIT, then asked",
+           "QUIT after " + std::to_string( poll_quit_after.load() ) + " polls, asked after " +
+           std::to_string( poll_asked_after.load() ) + " more" );
+    if( !ra || !ra->timed ) {
+        return false;
+    }
+
     return failed == 0;
 }
 
@@ -8072,7 +8205,8 @@ int main()
     const bool character_ok = lying_ok && run_character_query_checks();
     const bool peek_ok = character_ok && run_peek_checks();
     const bool number_ok = peek_ok && run_number_checks();
-    const bool names_ok = number_ok && run_name_checks();
+    const bool actions_ok = number_ok && run_action_checks();
+    const bool names_ok = actions_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -8132,6 +8266,7 @@ int main()
     std::printf( "character query: %s\n", character_ok ? "ok" : "BAD" );
     std::printf( "peek: %s\n", peek_ok ? "ok" : "BAD" );
     std::printf( "number requests: %s\n", number_ok ? "ok" : "BAD" );
+    std::printf( "actions: %s\n", actions_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     const bool worlds_ok = world_name_failures == 0;
     std::printf( "worlds: %s\n", worlds_ok ? "ok" : "BAD" );
@@ -8144,6 +8279,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok && names_ok ?
+           peek_ok && number_ok && actions_ok && names_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

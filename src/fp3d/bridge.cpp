@@ -79,6 +79,8 @@ thread_local bool hook_timed = false;
 thread_local bool in_query = false;
 std::mutex poll_mutex;
 std::map<std::string, uint64_t> poll_counts;
+int idle_polls = 0;              // polls since the last request, in the game turn idle_poll_turn
+int64_t idle_poll_turn = -1;
 // Answer coordinates feed CDDA's int point maths (absolute -> bubble); keep them far from overflow.
 constexpr int max_answer_coord = 1 << 28;
 
@@ -180,6 +182,30 @@ void set_active( bool on )
     bridge_active.store( on );
 }
 
+bool action_allowed( const std::string &context, const std::string &action, bool cheats )
+{
+    if( context != "DEFAULTMODE" ) {
+        return true;
+    }
+    static const char *const allowed[] = {
+        "UP", "RIGHTUP", "RIGHT", "RIGHTDOWN", "DOWN", "LEFTDOWN", "LEFT", "LEFTUP", "LEVEL_UP", "LEVEL_DOWN",
+        "pause", "toggle_run", "toggle_crouch",
+        "open", "close", "smash", "examine", "pickup", "grab", "butcher", "look", "peek",
+        "inventory", "apply", "wear", "take_off", "eat", "read", "wield", "reload_weapon", "unload", "throw",
+        "fire", "drop",
+        "wait", "sleep", "safemode", "save", "SUICIDE"
+    };
+    if( action.rfind( "fp3d_", 0 ) == 0 ) {
+        return true;
+    }
+    if( action == "debug" ) {
+        return cheats;
+    }
+    return std::any_of( std::begin( allowed ), std::end( allowed ), [&action]( const char *name ) {
+        return action == name;
+    } );
+}
+
 void note_poll( const std::string &where )
 {
     std::lock_guard<std::mutex> lk( poll_mutex );
@@ -187,6 +213,21 @@ void note_poll( const std::string &where )
     if( poll_counts.size() < 256 || poll_counts.count( where ) ) {
         poll_counts[where]++;
     }
+}
+
+poll_verdict idle_poll( int64_t turn )
+{
+    std::lock_guard<std::mutex> lk( poll_mutex );
+    if( turn != idle_poll_turn ) {
+        idle_poll_turn = turn;
+        idle_polls = 0;
+    }
+    idle_polls++;
+    if( idle_polls >= 4 * max_idle_polls ) {
+        idle_polls = 0;
+        return poll_verdict::ask;
+    }
+    return idle_polls % max_idle_polls == 0 ? poll_verdict::close : poll_verdict::go_on;
 }
 
 std::string poll_report()
@@ -224,6 +265,11 @@ ui_answer ask( ui_request req )
 {
     if( in_query ) {
         throw query_prompt();
+    }
+    {
+        // A request: the count of idle polls starts again (idle_poll).
+        std::lock_guard<std::mutex> lk( poll_mutex );
+        idle_polls = 0;
     }
     channel &c = chan();
     std::function<void()> hook;

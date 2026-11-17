@@ -512,13 +512,30 @@ int main()
             u.name = "x/y";
             fp3d::settle_new_character( u );
             check( u.name == "Survivor" && u.get_save_id() == "Survivor", "only refused names: the fixed name", u.name );
+            // A name a character saved in this world has already is passed over too; the fixed name gets a number.
+            const bool have_world = world_generator->active_world != nullptr;
+            const std::vector<save_t> saves_before = have_world ? world_generator->active_world->world_saves :
+                    std::vector<save_t>();
+            if( have_world ) {
+                world_generator->active_world->add_save( save_t::from_save_id( "Ok Name" ) );
+                world_generator->active_world->add_save( save_t::from_save_id( "Survivor" ) );
+            }
+            name_lists( "[\"Ok Name\"]" );
+            u.name = "Ok Name";
+            fp3d::settle_new_character( u );
+            check( have_world && u.name == "Survivor 2" && u.get_save_id() == "Survivor 2",
+                   "a name saved in the world already: passed over, the fixed name numbered", u.name );
+            if( have_world ) {
+                world_generator->active_world->world_saves = saves_before;
+            }
             // A name taken over in play: tidied, else the fixed name; the save id stays.
+            const std::string id_before = u.get_save_id();
             u.name = std::string( "#Ann\x01/Lee.." );
             fp3d::settle_taken_name( u );
             const std::string tidied = u.name;
             u.name = "#/\\";
             fp3d::settle_taken_name( u );
-            check( tidied == "AnnLee." && u.name == "Survivor" && u.get_save_id() == "Survivor",
+            check( tidied == "AnnLee." && u.name == "Survivor" && u.get_save_id() == id_before,
                    "a taken-over name: tidied, else the fixed name", tidied + " | " + u.name );
             check( fp3d::save_id_ok( "Good Name" ) && !fp3d::save_id_ok( "#x" ) && !fp3d::save_id_ok( "" ) &&
                    !fp3d::save_id_ok( std::string( 65, 'a' ) ) && !fp3d::save_id_ok( std::string( "a\x01" ) ),
