@@ -24,8 +24,11 @@
 #include "calendar.h"
 #include "debug.h"
 #include "item.h"
+#include "flag.h"
 #include "fp3d/boot.h"
 #include "fp3d/points.h"
+#include "fp3d/id_tables.h"
+#include "fp3d/item_hands.h"
 #include "fp3d/snapshot.h"
 #include "game.h"
 #include "map.h"
@@ -36,6 +39,7 @@
 #include "monster.h"
 #include "npc.h"
 #include "overmapbuffer.h"
+#include "pocket_type.h"
 #include "rng.h"
 #include "submap.h"
 #include "type_id.h"
@@ -480,6 +484,107 @@ int main()
             w.weather_override = WEATHER_NULL;
             w.set_nextweather( calendar::turn );
             w.update_weather();
+        }
+
+        // Live item tiles: what the carried items and those lying in reach show of their state (player.item_states).
+        {
+            const tripoint_bub_ms beside = u.pos_bub() + tripoint_rel_ms( 1, 0, 0 );
+            here.ter_set( beside, ter_t_floor );
+            here.furn_set( beside, furn_str_id::NULL_ID() );
+            here.i_clear( beside );
+            // Carried: a plastic bottle (500 ml, see-through) with 250 ml of hot water.
+            item water( itype_id( "water" ), calendar::turn, 1 );
+            water.set_flag( flag_HOT );
+            item bottle( itype_id( "bottle_plastic" ) );
+            bottle.put_in( water, pocket_type::CONTAINER );
+            item_location carried = u.i_add( bottle );
+            // Lying next to the player: frozen meat well past rotten, a fouled pistol, a pistol whose fouling a save
+            // spelled as text, a pot with old meat in it, a rock.
+            item meat( itype_id( "meat" ) );
+            meat.set_relative_rot( 1.5 );
+            meat.set_flag( flag_FROZEN );
+            item fouled( itype_id( "glock_19" ) );
+            fouled.set_var( "dirt", 5000.0 );
+            item odd( itype_id( "glock_19" ) );
+            odd.set_var( "dirt", std::string( "lots" ) );
+            item old_meat( itype_id( "meat" ) );
+            old_meat.set_relative_rot( 0.95 );
+            item pot( itype_id( "pot" ) );
+            pot.put_in( old_meat, pocket_type::CONTAINER );
+            for( const item &it : { meat, fouled, odd, pot, item( itype_id( "rock" ) ) } ) {
+                here.add_item( beside, it );
+            }
+            const std::shared_ptr<const fp3d::snapshot> live = fp3d::capture_snapshot();
+            const auto state_of = [&live]( const item & it ) {
+                const uint64_t uid = fp3d::read_item_handle( it );
+                for( const fp3d::item_state_view &st : live->player.item_states ) {
+                    if( uid != 0 && st.uid == uid ) {
+                        return std::optional<fp3d::item_state_view>( st );
+                    }
+                }
+                return std::optional<fp3d::item_state_view>();
+            };
+            const auto text = []( const std::optional<fp3d::item_state_view> &st ) {
+                return st ? "temp " + std::to_string( st->temp ) + " rot " + std::to_string( st->rot ) + " fill " +
+                       std::to_string( st->fill ) + " type " + std::to_string( st->fill_type ) +
+                       ( st->see_through ? " clear " : " opaque " ) + std::to_string( st->fill_ml ) + " ml dirt " +
+                       std::to_string( st->dirt ) : std::string( "not listed" );
+            };
+            const uint32_t t_water = fp3d::intern_id( fp3d::id_kind::itype, "water" );
+            const uint32_t t_meat = fp3d::intern_id( fp3d::id_kind::itype, "meat" );
+            std::optional<fp3d::item_state_view> b;
+            std::optional<fp3d::item_state_view> w;
+            if( carried ) {
+                b = state_of( *carried );
+                if( !carried->all_items_top( pocket_type::CONTAINER ).empty() ) {
+                    w = state_of( *carried->all_items_top( pocket_type::CONTAINER ).front() );
+                }
+            }
+            check( b && b->temp == 0 && b->rot == -1 && b->fill == 500 && b->fill_type == t_water && b->see_through &&
+                   b->fill_ml == 250 && b->dirt == -1, "a carried bottle: half full of water, see-through", text( b ) );
+            check( w && w->temp == 1 && w->rot == -1 && w->fill == -1 && w->fill_ml == -1 && w->dirt == -1,
+                   "the hot water in it", text( w ) );
+            std::optional<fp3d::item_state_view> m;
+            std::optional<fp3d::item_state_view> g1;
+            std::optional<fp3d::item_state_view> g2;
+            std::optional<fp3d::item_state_view> p;
+            std::optional<fp3d::item_state_view> inside;
+            bool rock_listed = false;
+            int pistols = 0;
+            for( const item &it : here.i_at( beside ) ) {
+                if( it.typeId() == itype_id( "meat" ) ) {
+                    m = state_of( it );
+                } else if( it.typeId() == itype_id( "glock_19" ) ) {
+                    ( pistols++ == 0 ? g1 : g2 ) = state_of( it );
+                } else if( it.typeId() == itype_id( "pot" ) ) {
+                    p = state_of( it );
+                    if( !it.all_items_top( pocket_type::CONTAINER ).empty() ) {
+                        inside = state_of( *it.all_items_top( pocket_type::CONTAINER ).front() );
+                    }
+                } else if( it.typeId() == itype_id( "rock" ) ) {
+                    rock_listed = state_of( it ).has_value();
+                }
+            }
+            check( m && m->temp == 3 && m->rot == 1500 && m->fill == -1 && m->fill_ml == -1 && m->dirt == -1,
+                   "lying meat: frozen, rot 1500", text( m ) );
+            check( g1 && g2 && std::max( g1->dirt, g2->dirt ) == 5000 && std::min( g1->dirt, g2->dirt ) == 0 &&
+                   g1->fill == -1 && g1->rot == -1, "lying pistols: fouling 5000, and 0 for a fouling that isn't a number",
+                   text( g1 ) + " | " + text( g2 ) );
+            check( p && p->rot == 950 && p->fill > 0 && p->fill <= 1000 && p->fill_ml > 0 && p->fill_type == t_meat &&
+                   !p->see_through && inside && inside->rot == 950,
+                   "a lying pot: the rot of the meat inside, not see-through", text( p ) + " | " + text( inside ) );
+            check( !rock_listed && live->player.item_states.size() <= fp3d::max_item_states,
+                   "a rock shows nothing: not listed" );
+            std::ostringstream st_json;
+            fp3d::write_snapshot_json( st_json, *live, u.posz(), u.posz() );
+            const std::string sj = st_json.str();
+            const std::string meat_entry = m ? "[" + std::to_string( m->uid ) + ",3,1500,-1,0,0,-1,-1]" : "?";
+            check( sj.find( "\"item_states\":[[" ) != std::string::npos && sj.find( meat_entry ) != std::string::npos,
+                   "item states in the JSON", meat_entry );
+            here.i_clear( beside );
+            if( carried ) {
+                carried.remove_item();
+            }
         }
 
         // Names from a save or a mod are untrusted: an NPC's and a vehicle's come cleaned and capped. Last: the

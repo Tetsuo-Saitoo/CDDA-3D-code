@@ -52,6 +52,7 @@
 #include "map_memory.h"
 #include "map_scale_constants.h"
 #include "mapdata.h"
+#include "math_parser_diag_value.h"
 #include "memory_fast.h"
 #include "monster.h"
 #include "mood_face.h"
@@ -448,9 +449,105 @@ std::shared_ptr<const submap_view> capture_submap( map &here, const avatar &u,
     return sm;
 }
 
-// `loc` and what's inside it, depth first, into `out` (capped).
+// A gun's fouling as CDDA keeps it (item var `dirt`), 0..10000; the var comes from a save: anything else is 0.
+int16_t gun_dirt( const item &gun )
+{
+    const diag_value *v = gun.maybe_get_value( "dirt" );
+    const double dirt = v != nullptr && v->is_dbl() ? v->dbl() : 0.0;
+    return static_cast<int16_t>( std::isfinite( dirt ) ? std::clamp( dirt, 0.0, 10000.0 ) : 0.0 );
+}
+
+// What `it` shows of its state (live item tiles) into `out`; nothing is added when it shows nothing or the list is
+// full.
+void add_item_state( const item &it, uint64_t uid, std::vector<item_state_view> &out )
+{
+    if( uid == 0 || out.size() >= max_item_states ) {
+        return;
+    }
+    const auto rot_of = []( const item & food ) {
+        const double r = food.get_relative_rot();
+        return static_cast<int16_t>( std::isfinite( r ) ? std::clamp( r * 1000.0, 0.0, 2000.0 ) : 2000.0 );
+    };
+    item_state_view st;
+    st.uid = uid;
+    st.temp = it.has_own_flag( flag_FROZEN ) ? 3 : it.has_own_flag( flag_COLD ) ? 2 :
+              it.has_own_flag( flag_HOT ) ? 1 : 0;
+    if( it.goes_bad() ) {
+        st.rot = rot_of( it );
+    }
+    bool has_pocket = false;
+    int64_t cap_ml = 0;
+    int64_t held_ml = 0;
+    units::volume biggest = -1_ml;
+    size_t looked = 0;
+    for( const item_pocket *pk : it.get_all_contained_pockets() ) {
+        has_pocket = true;
+        cap_ml += std::max<int64_t>( 0, units::to_milliliter( pk->volume_capacity() ) );
+        held_ml += std::max<int64_t>( 0, units::to_milliliter( pk->contains_volume() ) );
+        // The pocket's material (glass, clear plastic), not CDDA's transparent(), which also counts any open
+        // container.
+        const pocket_data *pd = pk->get_pocket_data();
+        st.see_through = st.see_through || ( pd != nullptr && pd->transparent );
+        for( const item *c : pk->all_items_top() ) {
+            if( looked++ >= max_state_contents ) {
+                break;
+            }
+            if( c->goes_bad() ) {
+                st.rot = std::max( st.rot, rot_of( *c ) );
+            }
+            const units::volume v = c->volume();
+            if( v > biggest ) {
+                biggest = v;
+                st.fill_type = intern_id( id_kind::itype, c->typeId().str() );
+            }
+        }
+    }
+    if( has_pocket ) {
+        st.fill_ml = static_cast<int32_t>( std::min<int64_t>( held_ml, INT32_MAX ) );
+        st.fill = cap_ml > 0 ? static_cast<int16_t>( std::clamp<int64_t>( held_ml * 1000 / cap_ml, 0, 1000 ) ) : 0;
+    }
+    if( it.is_gun() && !it.has_flag( flag_NON_FOULING ) ) {
+        st.dirt = gun_dirt( it );
+    }
+    if( st.temp != 0 || st.rot >= 0 || st.fill >= 0 || st.dirt >= 0 ) {
+        out.push_back( st );
+    }
+}
+
+// The states of the items lying on the avatar's square and the eight around it, and of what is directly inside
+// them: those this capture listed handles for (`seen`), after the carried ones.
+void capture_near_item_states( map &here, const avatar &u, const std::unordered_set<uint64_t> &seen,
+                               std::vector<item_state_view> &out )
+{
+    for( const tripoint_bub_ms &p : here.points_in_radius( u.pos_bub(), 1 ) ) {
+        size_t listed = 0;
+        for( const item &it : here.i_at( p ) ) {
+            if( listed++ >= max_handles_near_player || out.size() >= max_item_states ) {
+                break;
+            }
+            const uint64_t uid = read_item_handle( it );
+            if( uid == 0 || seen.count( uid ) == 0 ) {
+                continue;
+            }
+            add_item_state( it, uid, out );
+            size_t inside = 0;
+            for( const item *c : it.all_items_top( pocket_type::CONTAINER ) ) {
+                if( inside++ >= max_inside_per_container ) {
+                    break;
+                }
+                const uint64_t cuid = read_item_handle( *c );
+                if( cuid != 0 && seen.count( cuid ) != 0 ) {
+                    add_item_state( *c, cuid, out );
+                }
+            }
+        }
+    }
+}
+
+// `loc` and what's inside it, depth first, into `out` (capped), with what each shows of its state into `states`.
 void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags, int depth,
-                   const item *offhand, std::unordered_set<uint64_t> &seen, std::vector<carried_view> &out )
+                   const item *offhand, std::unordered_set<uint64_t> &seen, std::vector<carried_view> &out,
+                   std::vector<item_state_view> &states )
 {
     if( out.size() >= max_carried_listed || !loc ) {
         return;
@@ -463,6 +560,7 @@ void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags
     cv.pocket = static_cast<int16_t>( pocket );
     cv.flags = static_cast<uint8_t>( flags | ( &it == offhand ? carried_offhand : 0 ) );
     out.push_back( cv );
+    add_item_state( it, cv.uid, states );
     if( depth + 1 >= max_carried_depth ) {
         return;
     }
@@ -472,7 +570,7 @@ void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags
             break;
         }
         for( item *child : pk->all_items_top() ) {
-            list_carried( item_location( loc, child ), cv.uid, index, 0, depth + 1, offhand, seen, out );
+            list_carried( item_location( loc, child ), cv.uid, index, 0, depth + 1, offhand, seen, out, states );
         }
         index++;
     }
@@ -550,8 +648,7 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
         gun_view g;
         g.type = pv.wielded;
         if( !w->has_flag( flag_NON_FOULING ) ) {
-            const double dirt = w->get_var( "dirt", 0.0 );
-            g.dirt = static_cast<int16_t>( std::isfinite( dirt ) ? std::clamp( dirt, 0.0, 10000.0 ) : 0.0 );
+            g.dirt = gun_dirt( *w );
         }
         if( !w->ammo_types().empty() ) {
             g.rounds = std::clamp( w->ammo_remaining(), 0, 100000 );
@@ -646,10 +743,10 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
     const item_location held = offhand_item( u );
     const item *offhand = held ? held.get_item() : nullptr;
     if( const item_location weapon = u.get_wielded_item() ) {
-        list_carried( weapon, 0, -1, carried_wielded, 0, offhand, seen, pv.items );
+        list_carried( weapon, 0, -1, carried_wielded, 0, offhand, seen, pv.items, pv.item_states );
     }
     for( const item_location &worn : u.top_items_loc() ) {
-        list_carried( worn, 0, -1, carried_worn, 0, offhand, seen, pv.items );
+        list_carried( worn, 0, -1, carried_worn, 0, offhand, seen, pv.items, pv.item_states );
     }
 }
 
@@ -992,6 +1089,8 @@ std::shared_ptr<const snapshot> capture_snapshot()
             }
         }
     }
+    // Live item tiles: the lying items in reach, now that the piles gave them their handles.
+    capture_near_item_states( here, u, seen, s->player.item_states );
     // Submaps that left the bubble are forgotten; if they come back they start over at revision 1.
     state.previous = std::move( current );
     return s;
@@ -1135,6 +1234,21 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         jo.write( static_cast<int64_t>( c.parent ) );
         jo.write( static_cast<int>( c.pocket ) );
         jo.write( static_cast<int>( c.flags ) );
+        jo.end_array();
+    }
+    jo.end_array();
+    jo.member( "item_states" );
+    jo.start_array();
+    for( const item_state_view &st : pv.item_states ) {
+        jo.start_array();
+        jo.write( static_cast<int64_t>( st.uid ) );
+        jo.write( static_cast<int>( st.temp ) );
+        jo.write( static_cast<int>( st.rot ) );
+        jo.write( static_cast<int>( st.fill ) );
+        jo.write( static_cast<int64_t>( st.fill_type ) );
+        jo.write( st.see_through ? 1 : 0 );
+        jo.write( static_cast<int>( st.fill_ml ) );
+        jo.write( static_cast<int>( st.dirt ) );
         jo.end_array();
     }
     jo.end_array();

@@ -77,6 +77,24 @@ struct inside_view {
     bool operator==( const inside_view &o ) const;
 };
 
+// Live item tiles: what an item shows of its state. Listed for the carried items and for those lying on the player's
+// square or one next to it (with what is directly inside them), only when there is something to show.
+constexpr size_t max_item_states = 512;
+constexpr size_t max_state_contents = 256;       // contents looked at per item
+struct item_state_view {
+    uint64_t uid = 0;                             // the item's handle
+    uint8_t temp = 0;                             // 0 normal, 1 hot, 2 cold, 3 frozen (CDDA's HOT / COLD / FROZEN flags)
+    int16_t rot = -1;                             // relative rot in permille, 0..2000; -1 = it doesn't rot. A container:
+    // the worst of what is directly inside
+    int16_t fill = -1;                            // permille of its CONTAINER pockets' capacity in use, 0..1000; -1 = it
+    // has no such pocket
+    uint32_t fill_type = 0;                       // itype index of the content with the largest volume, 0 none
+    bool see_through = false;                     // one of those pockets is of a see-through material
+    int32_t fill_ml = -1;                         // the volume inside, ml; -1 = no such pocket
+    int16_t dirt = -1;                            // a gun's fouling 0..10000 (as gun_view::dirt); -1 = not a gun, or
+    // one that doesn't foul
+};
+
 // carried_view::flags
 constexpr uint8_t carried_worn = 1, carried_wielded = 2, carried_offhand = 4;
 
@@ -274,6 +292,7 @@ struct player_view {
     std::vector<uint8_t> infected;
     std::vector<worn_view> worn;                  // inner to outer (CDDA's worn order); cap 64
     std::vector<carried_view> items;              // wielded, then worn items and what's inside; cap 256
+    std::vector<item_state_view> item_states;     // of those, then of items lying in reach; cap max_item_states
     std::optional<gun_view> wielded_gun;          // when the wielded item is a gun
     std::vector<effect_view> effects;             // cap max_player_effects
     mood_view mood;
