@@ -1215,6 +1215,9 @@ void want_all_snapshot_levels()
 void publish_snapshot( std::shared_ptr<const snapshot> s )
 {
     std::lock_guard<std::mutex> lk( latest_mutex );
+    if( s && latest && s->seq < latest->seq ) {
+        return;
+    }
     latest = std::move( s );
 }
 

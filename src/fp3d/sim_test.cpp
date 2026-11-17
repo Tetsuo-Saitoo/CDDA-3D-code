@@ -622,8 +622,19 @@ void wait_in_weather( bool start, int minutes = 20 )
 std::atomic<int> running_calls{ 0 };
 std::atomic<int64_t> running_turn{ -1 };
 std::atomic<int64_t> running_us{ 0 };   // wall time spent in it
+// run_running_checks: 1 = the next running hook asks a question in the middle, as a debug message there would;
+// then how often the before-ask hook ran for it (it must not: 0) and what the answer was.
+std::atomic<int> observe_calls{ 0 };
+std::atomic<int> running_asks{ 0 };
+std::atomic<int> running_nested{ -1 };
+std::atomic<int> running_answer{ -1 };
 void running()
 {
+    if( running_asks.exchange( 0 ) == 1 ) {
+        const int before = observe_calls.load();
+        running_answer.store( query_yn( "fp3d test: asked inside the running hook" ) ? 1 : 0 );
+        running_nested.store( observe_calls.load() - before );
+    }
     const auto t = std::chrono::steady_clock::now();
     const std::shared_ptr<const fp3d::snapshot> s = fp3d::capture_snapshot();
     running_turn.store( s->turn );
@@ -755,6 +766,7 @@ static void fresh_cook_water( map &here, const tripoint_bub_ms &fire_at )
 
 void observe()
 {
+    observe_calls++;
     // As the client's hook (bridge/src/sim_session.cpp).
     fp3d::run_range_requests();
     if( number_setup.exchange( 0 ) != 0 ) {
@@ -6838,6 +6850,49 @@ static bool run_running_checks()
     check( calls <= static_cast<int>( ms / fp3d::running_hook_gap_ms ) + 1, "no more often than the gap",
            std::to_string( calls ) + " in " + std::to_string( static_cast<int>( ms ) ) + " ms, " +
            std::to_string( ( running_us.load() - us0 ) / 1000 ) + " ms of it taking them" );
+    // A question asked from inside the running hook (a debug message would ask one): the client gets it and
+    // answers, and the before-ask hook does not run for it, so no second snapshot is taken inside the first.
+    running_nested.store( -1 );
+    running_answer.store( -1 );
+    weather_wait.store( 3 );
+    const bool again = pass( 20000 ) && weather_wait.load() == 0;
+    const uint64_t start_id = r->id;
+    const int64_t turn1 = r->turn;
+    const int calls1 = running_calls.load();
+    running_asks.store( 1 );
+    fp3d::queue_action( "pause" );
+    bool asked = false;
+    bool back = false;
+    const auto t1 = std::chrono::steady_clock::now();
+    while( again && !back && ms_since( t1 ) < 600000 ) {
+        const std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+        if( !next ) {
+            continue;
+        }
+        r = next;
+        if( r->timed ) {
+            back = r->id != start_id;
+        } else {
+            fp3d::ui_answer a;
+            a.id = r->id;
+            if( r->text.find( "asked inside the running hook" ) != std::string::npos ) {
+                asked = true;
+                a.action = "YES";
+            } else {
+                std::printf( "    question: %s %s\n", r->title.c_str(), r->text.c_str() );
+                a.cancel = true;
+            }
+            fp3d::answer( a );
+        }
+    }
+    const std::shared_ptr<const fp3d::snapshot> newest = fp3d::latest_snapshot();
+    check( back && asked && running_answer.load() == 1 && running_nested.load() == 0 &&
+           running_calls.load() > calls1 && r->turn - turn1 >= 3590 && newest && newest->turn == r->turn,
+           "a question inside the hook: asked, no hook of its own",
+           std::string( asked ? "asked" : "not asked" ) + ", answer " + std::to_string( running_answer.load() ) +
+           ", before-ask hooks inside " + std::to_string( running_nested.load() ) + ", " +
+           std::to_string( r->turn - turn1 ) + " turns" );
+    running_asks.store( 0 );
     weather_wait.store( 2 );
     check( pass( 20000 ) && weather_wait.load() == 0, "the world's temperature again", "" );
     return failed == 0;

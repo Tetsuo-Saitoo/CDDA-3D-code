@@ -145,7 +145,8 @@ void set_active( bool on );
 // Throws shutdown_signal after shutdown().
 ui_answer ask( ui_request req );
 // Sim side. Called on the sim thread right before every request is posted, so the client can copy game
-// state (snapshot, block B3) while the sim is parked and consistent.
+// state (snapshot, block B3) while the sim is parked and consistent. Not for a request asked from inside this
+// hook or the running hook.
 void set_before_ask_hook( std::function<void()> hook );
 // Sim side. Makes the next request timed (the main game loop's): in real time it expires at the end of
 // the current turn and comes back with `timed_out` set.

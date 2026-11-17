@@ -397,7 +397,9 @@ void reset_snapshots();
 // Sim side. The uid a creature has (or gets) in snapshots, and the seq the next capture will have.
 uint64_t creature_uid( const Creature &c );
 uint64_t next_snapshot_seq();
-// Sim side: makes `s` the newest snapshot. Client side: reads it (nullptr before the first publish).
+// Sim side: makes `s` the newest snapshot, unless a later capture (a higher seq) is published already: the
+// newest one never goes back to an earlier capture. nullptr clears it. Client side: reads it (nullptr before the
+// first publish).
 void publish_snapshot( std::shared_ptr<const snapshot> s );
 std::shared_ptr<const snapshot> latest_snapshot();
 
