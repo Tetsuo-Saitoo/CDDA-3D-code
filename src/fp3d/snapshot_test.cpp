@@ -514,6 +514,8 @@ int main()
             for( const item &it : { meat, fouled, odd, pot, item( itype_id( "rock" ) ) } ) {
                 here.add_item( beside, it );
             }
+            // For the exact numbers: a stack of 15 rounds lying there too.
+            here.add_item( beside, item( itype_id( "9mm" ), calendar::turn, 15 ) );
             const std::shared_ptr<const fp3d::snapshot> live = fp3d::capture_snapshot();
             const auto state_of = [&live]( const item & it ) {
                 const uint64_t uid = fp3d::read_item_handle( it );
@@ -581,6 +583,49 @@ int main()
             const std::string meat_entry = m ? "[" + std::to_string( m->uid ) + ",3,1500,-1,0,0,-1,-1]" : "?";
             check( sj.find( "\"item_states\":[[" ) != std::string::npos && sj.find( meat_entry ) != std::string::npos,
                    "item states in the JSON", meat_entry );
+            // Exact numbers (player.item_amounts): every carried item in the order of `items`, then the lying ones;
+            // weight and volume as CDDA counts them.
+            const auto amount_of = [&live]( const item & it ) {
+                const uint64_t uid = fp3d::read_item_handle( it );
+                for( const fp3d::item_amount_view &av : live->player.item_amounts ) {
+                    if( uid != 0 && av.uid == uid ) {
+                        return std::optional<fp3d::item_amount_view>( av );
+                    }
+                }
+                return std::optional<fp3d::item_amount_view>();
+            };
+            bool carried_in_order = live->player.item_amounts.size() >= live->player.items.size();
+            for( size_t i = 0; carried_in_order && i < live->player.items.size(); i++ ) {
+                carried_in_order = live->player.item_amounts[i].uid == live->player.items[i].uid;
+            }
+            std::optional<fp3d::item_amount_view> ba;
+            if( carried ) {
+                ba = amount_of( *carried );
+            }
+            check( carried_in_order && ba && carried && ba->count == 1 &&
+                   ba->weight_g == units::to_gram( carried->weight() ) &&
+                   ba->volume_ml == units::to_milliliter( carried->volume() ) &&
+                   ba->weight_g > units::to_gram( carried->weight( false ) ),
+                   "item amounts: every carried item in order; a bottle weighs with its water",
+                   ba ? std::to_string( ba->weight_g ) + " g, " + std::to_string( ba->volume_ml ) + " ml" : "not listed" );
+            std::optional<fp3d::item_amount_view> rounds;
+            int64_t rounds_g = 0;
+            for( const item &it : here.i_at( beside ) ) {
+                if( it.typeId() == itype_id( "9mm" ) ) {
+                    rounds = amount_of( it );
+                    rounds_g = units::to_gram( it.weight() );
+                }
+            }
+            check( rounds && rounds->count == 15 && rounds->weight_g == rounds_g && rounds->weight_g > 0 &&
+                   rounds->volume_ml > 0 && live->player.item_amounts.size() <= fp3d::max_item_amounts,
+                   "item amounts: a lying stack of 15 rounds, its whole weight",
+                   rounds ? std::to_string( rounds->count ) + " x, " + std::to_string( rounds->weight_g ) + " g" :
+                   "not listed" );
+            const std::string rounds_entry = rounds ? "[" + std::to_string( rounds->uid ) + ",15," +
+                                             std::to_string( rounds->weight_g ) + "," +
+                                             std::to_string( rounds->volume_ml ) + "]" : "?";
+            check( sj.find( "\"item_amounts\":[[" ) != std::string::npos && sj.find( rounds_entry ) != std::string::npos,
+                   "item amounts in the JSON", rounds_entry );
             here.i_clear( beside );
             if( carried ) {
                 carried.remove_item();

@@ -95,6 +95,18 @@ struct item_state_view {
     // one that doesn't foul
 };
 
+// Exact numbers for the item lists (G2). One entry for every carried item, in the order of `items`, then for every
+// item lying on the player's square or one next to it and for what is directly inside those.
+constexpr size_t max_item_amounts = 1024;
+constexpr int32_t max_item_amount = 1000000000;   // weight and volume are clamped to this
+struct item_amount_view {
+    uint64_t uid = 0;                             // the item's handle
+    int32_t count = 1;                            // charges when CDDA counts it by charges, else 1; 1..INT32_MAX
+    int32_t weight_g = 0;                         // CDDA's weight with everything in it, the whole stack
+    int32_t volume_ml = 0;                        // the room it takes where it is, as CDDA counts it (a rigid
+    // container: its own size; a soft one: plus its contents), the whole stack
+};
+
 // carried_view::flags
 constexpr uint8_t carried_worn = 1, carried_wielded = 2, carried_offhand = 4;
 
@@ -293,6 +305,7 @@ struct player_view {
     std::vector<worn_view> worn;                  // inner to outer (CDDA's worn order); cap 64
     std::vector<carried_view> items;              // wielded, then worn items and what's inside; cap 256
     std::vector<item_state_view> item_states;     // of those, then of items lying in reach; cap max_item_states
+    std::vector<item_amount_view> item_amounts;   // the same items, every one; cap max_item_amounts
     std::optional<gun_view> wielded_gun;          // when the wielded item is a gun
     std::vector<effect_view> effects;             // cap max_player_effects
     mood_view mood;

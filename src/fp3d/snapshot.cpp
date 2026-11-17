@@ -514,10 +514,27 @@ void add_item_state( const item &it, uint64_t uid, std::vector<item_state_view> 
     }
 }
 
-// The states of the items lying on the avatar's square and the eight around it, and of what is directly inside
-// them: those this capture listed handles for (`seen`), after the carried ones.
+// The item's exact numbers (G2) into `out`; nothing is added when the list is full.
+void add_item_amount( const item &it, uint64_t uid, std::vector<item_amount_view> &out )
+{
+    if( uid == 0 || out.size() >= max_item_amounts ) {
+        return;
+    }
+    const auto clamped = []( int64_t v ) {
+        return static_cast<int32_t>( std::clamp<int64_t>( v, 0, max_item_amount ) );
+    };
+    item_amount_view av;
+    av.uid = uid;
+    av.count = it.count_by_charges() ? std::max( it.charges, 1 ) : 1;
+    av.weight_g = clamped( units::to_gram( it.weight() ) );
+    av.volume_ml = clamped( units::to_milliliter( it.volume() ) );
+    out.push_back( av );
+}
+
+// The states and the exact numbers of the items lying on the avatar's square and the eight around it, and of what
+// is directly inside them: those this capture listed handles for (`seen`), after the carried ones.
 void capture_near_item_states( map &here, const avatar &u, const std::unordered_set<uint64_t> &seen,
-                               std::vector<item_state_view> &out )
+                               std::vector<item_state_view> &out, std::vector<item_amount_view> &amounts )
 {
     for( const tripoint_bub_ms &p : here.points_in_radius( u.pos_bub(), 1 ) ) {
         size_t listed = 0;
@@ -530,6 +547,7 @@ void capture_near_item_states( map &here, const avatar &u, const std::unordered_
                 continue;
             }
             add_item_state( it, uid, out );
+            add_item_amount( it, uid, amounts );
             size_t inside = 0;
             for( const item *c : it.all_items_top( pocket_type::CONTAINER ) ) {
                 if( inside++ >= max_inside_per_container ) {
@@ -538,6 +556,7 @@ void capture_near_item_states( map &here, const avatar &u, const std::unordered_
                 const uint64_t cuid = read_item_handle( *c );
                 if( cuid != 0 && seen.count( cuid ) != 0 ) {
                     add_item_state( *c, cuid, out );
+                    add_item_amount( *c, cuid, amounts );
                 }
             }
         }
@@ -547,7 +566,7 @@ void capture_near_item_states( map &here, const avatar &u, const std::unordered_
 // `loc` and what's inside it, depth first, into `out` (capped), with what each shows of its state into `states`.
 void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags, int depth,
                    const item *offhand, std::unordered_set<uint64_t> &seen, std::vector<carried_view> &out,
-                   std::vector<item_state_view> &states )
+                   std::vector<item_state_view> &states, std::vector<item_amount_view> &amounts )
 {
     if( out.size() >= max_carried_listed || !loc ) {
         return;
@@ -561,6 +580,7 @@ void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags
     cv.flags = static_cast<uint8_t>( flags | ( &it == offhand ? carried_offhand : 0 ) );
     out.push_back( cv );
     add_item_state( it, cv.uid, states );
+    add_item_amount( it, cv.uid, amounts );
     if( depth + 1 >= max_carried_depth ) {
         return;
     }
@@ -570,7 +590,8 @@ void list_carried( item_location loc, uint64_t parent, int pocket, uint8_t flags
             break;
         }
         for( item *child : pk->all_items_top() ) {
-            list_carried( item_location( loc, child ), cv.uid, index, 0, depth + 1, offhand, seen, out, states );
+            list_carried( item_location( loc, child ), cv.uid, index, 0, depth + 1, offhand, seen, out, states,
+                          amounts );
         }
         index++;
     }
@@ -743,10 +764,11 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
     const item_location held = offhand_item( u );
     const item *offhand = held ? held.get_item() : nullptr;
     if( const item_location weapon = u.get_wielded_item() ) {
-        list_carried( weapon, 0, -1, carried_wielded, 0, offhand, seen, pv.items, pv.item_states );
+        list_carried( weapon, 0, -1, carried_wielded, 0, offhand, seen, pv.items, pv.item_states,
+                      pv.item_amounts );
     }
     for( const item_location &worn : u.top_items_loc() ) {
-        list_carried( worn, 0, -1, carried_worn, 0, offhand, seen, pv.items, pv.item_states );
+        list_carried( worn, 0, -1, carried_worn, 0, offhand, seen, pv.items, pv.item_states, pv.item_amounts );
     }
 }
 
@@ -1090,7 +1112,7 @@ std::shared_ptr<const snapshot> capture_snapshot()
         }
     }
     // Live item tiles: the lying items in reach, now that the piles gave them their handles.
-    capture_near_item_states( here, u, seen, s->player.item_states );
+    capture_near_item_states( here, u, seen, s->player.item_states, s->player.item_amounts );
     // Submaps that left the bubble are forgotten; if they come back they start over at revision 1.
     state.previous = std::move( current );
     return s;
@@ -1249,6 +1271,17 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         jo.write( st.see_through ? 1 : 0 );
         jo.write( static_cast<int>( st.fill_ml ) );
         jo.write( static_cast<int>( st.dirt ) );
+        jo.end_array();
+    }
+    jo.end_array();
+    jo.member( "item_amounts" );
+    jo.start_array();
+    for( const item_amount_view &av : pv.item_amounts ) {
+        jo.start_array();
+        jo.write( static_cast<int64_t>( av.uid ) );
+        jo.write( static_cast<int>( av.count ) );
+        jo.write( static_cast<int>( av.weight_g ) );
+        jo.write( static_cast<int>( av.volume_ml ) );
         jo.end_array();
     }
     jo.end_array();
