@@ -2520,6 +2520,64 @@ void check_resume_refusals( size_t pick )
 // Death, last (the game is over after it): the character's torso at 0 hit points. The game ends without asking the
 // client anything (no end screen, deathcam, diary, scores or epilogue question; CDDA's own end-of-game cleanup runs),
 // and a polling loop after it (as CDDA's end screens wait for a key) ends once fp3d::shutdown() is called.
+// A spawned lit grenade (grenade_act) ticks and goes off on its square: an explosion event within its countdown. Its
+// shrapnel kills in the open out to some 30 squares, so the grenade sits in a ring of reinforced glass (impassable
+// terrain stops fragments; the player still sees the blast through it). Run just before the death check, which needs
+// no unscorched range.
+void check_live_grenade()
+{
+    std::printf( "live grenade:\n" );
+    const uint32_t grenade = fp3d::intern_id( fp3d::id_kind::itype, "grenade_act" );
+    std::vector<fp3d::event> evs;
+    fp3d::set_events_enabled( true );
+    fp3d::drain_events( evs );
+    evs.clear();
+    std::string why = "not run";
+    bool lit = false;
+    tripoint_abs_ms sq;
+    on_sim( [&] {
+        const tripoint_abs_ms u = get_avatar().pos_abs();
+        map &here = get_map();
+        for( const point &d : { point( 6, 0 ), point( -6, 0 ), point( 0, 6 ), point( 0, -6 ) } ) {
+            sq = offset( u, d.x, d.y );
+            why = fp3d::spawn_item( grenade, 1, ui( sq ) );
+            if( why.empty() ) {
+                break;
+            }
+        }
+        for( int dy = -1; dy <= 1; dy++ ) {
+            for( int dx = -1; dx <= 1; dx++ ) {
+                if( dx != 0 || dy != 0 ) {
+                    here.ter_set( here.get_bub( offset( sq, dx, dy ) ), ter_str_id( "t_reinforced_glass" ).id() );
+                }
+            }
+        }
+        for( const item &it : here.i_at( here.get_bub( sq ) ) ) {
+            lit = lit || ( it.typeId().str() == "grenade_act" && it.active );
+        }
+    } );
+    check( why.empty() && lit, "spawn_item: a lit grenade spawns active", ok_or( why ) );
+    int turns = 0;
+    size_t blasts = 0;
+    const fp3d::ui_point at = ui( sq );
+    bool looped = true;
+    while( blasts == 0 && turns < 12 && looped ) {
+        looped = act( "pause" ).has_value();
+        turns++;
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            blasts += e.kind == fp3d::event_kind::explosion && e.pos.x == at.x && e.pos.y == at.y ? 1 : 0;
+        }
+        evs.clear();
+    }
+    check( blasts > 0 && looped && !died.load(),
+           "spawn_item: it goes off on its square within its countdown (an explosion event)",
+           std::to_string( turns ) + " turns" + ( looped ? "" : ", no main loop after" ) +
+           ( died.load() ? ", the player died" : "" ) );
+    fp3d::set_events_enabled( false );
+    fp3d::drain_events( evs );
+}
+
 void check_death()
 {
     std::printf( "death:\n" );
@@ -2622,6 +2680,7 @@ int main( int argc, char **argv )
     }
     check_weather_cheat();
     check_resume_refusals( check_reload() );
+    check_live_grenade();
     check_death();
 
     fp3d::shutdown();
