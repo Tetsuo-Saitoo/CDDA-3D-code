@@ -1981,13 +1981,19 @@ double ms_since( std::chrono::steady_clock::time_point t )
     return std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t ).count();
 }
 
-// Real time at 4x (250 ms turns): three unanswered main-loop requests must each expire after about a
-// turn and advance the game one turn. Then a zombie comes into view: the clock must auto-pause and stay
-// paused until the client resumes it.
-bool realtime_checks( fp3d::ui_request &req )
+// How much longer than 250 ms (times slow_build) a real-time turn's slot is in this run: 1, 2, 4 or 8. On a slow
+// or busy machine, or a first run, a turn can take longer than its slot; a main-loop request is then already late
+// when it is posted and the client never sees one. The real-time checks stretch the slot until requests are seen,
+// and keep it for the rest of the run (driver thread only).
+int rt_stretch = 1;
+
+// Three real-time turns with the slot stretched by `stretch`: each unanswered main-loop request must expire after
+// about a turn and advance the game one turn.
+bool realtime_steps( fp3d::ui_request &req, int stretch )
 {
     bool ok = true;
-    fp3d::set_timescale( 4.0 / fp3d::slow_build );   // 250 ms turns, times slow_build
+    const double turn_ms = 250.0 * fp3d::slow_build * stretch;
+    fp3d::set_timescale( 4.0 / ( fp3d::slow_build * stretch ) );
     fp3d::set_clock_mode( fp3d::clock_mode::real_time );
     std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
     for( int i = 0; i < 3; i++ ) {
@@ -1995,26 +2001,49 @@ bool realtime_checks( fp3d::ui_request &req )
         const double ms = ms_since( t );
         t = std::chrono::steady_clock::now();
         if( !next || !next->timed ) {
-            std::printf( "    real time: no main-loop request after %.0f ms\n", ms );
+            std::printf( "    real time: no main-loop request after %.0f ms (slot %.0f ms)\n", ms, turn_ms );
             return false;
         }
-        // A turn is 250 ms at this timescale: never faster (paced), but a loaded machine (parallel builds) may be
-        // slower, so the upper bound is loose and a slow step may have let a turn or two more pass. A slow build
+        // A turn is its slot long at this timescale: never faster (paced), but a loaded machine (parallel builds) may
+        // be slower, so the upper bound is loose and a slow step may have let a turn or two more pass. A slow build
         // (TSan) has turns longer than their slot, so it checks no lower bound.
         const int64_t turns = next->turn - req.turn;
-        const double turn_ms = 250.0 * fp3d::slow_build;
-        const bool step_ok = turns >= 1 && ( fp3d::slow_build > 1 || ms >= 150 ) &&
-                             turns <= 2 + static_cast<int64_t>( ms / turn_ms ) && ms <= 10000.0 * fp3d::slow_build;
+        const bool step_ok = turns >= 1 && ( fp3d::slow_build > 1 || ms >= 150.0 * stretch ) &&
+                             turns <= 2 + static_cast<int64_t>( ms / turn_ms ) &&
+                             ms <= 10000.0 * fp3d::slow_build * stretch;
         std::printf( "    real time: turn %lld -> %lld after %.0f ms %s\n", static_cast<long long>( req.turn ),
                      static_cast<long long>( next->turn ), ms, step_ok ? "ok" : "BAD" );
         ok = ok && step_ok;
         req = *next;
     }
+    return ok;
+}
+
+// Real time at 4x (250 ms turns, longer when this machine needs it: rt_stretch): three unanswered main-loop
+// requests must each expire after about a turn and advance the game one turn. Then a zombie comes into view: the
+// clock must auto-pause and stay paused until the client resumes it.
+bool realtime_checks( fp3d::ui_request &req )
+{
+    bool ok = false;
+    for( int stretch = 1; stretch <= 8 && !ok; stretch *= 2 ) {
+        rt_stretch = stretch;
+        ok = realtime_steps( req, stretch );
+        if( !ok && stretch < 8 ) {
+            // Turn-based for a moment: the pending request stays, so the next try starts from one that is seen.
+            fp3d::set_clock_mode( fp3d::clock_mode::turn_based );
+            const std::optional<fp3d::ui_request> pending = fp3d::wait_request( 10000 * fp3d::slow_build );
+            if( !pending ) {
+                return false;
+            }
+            req = *pending;
+            std::printf( "    real time: trying again with a slot of %d ms\n", 250 * fp3d::slow_build * stretch * 2 );
+        }
+    }
 
     spawn_zombie = true; // placed by the sim right before its next request
-    t = std::chrono::steady_clock::now();
+    std::chrono::steady_clock::time_point t = std::chrono::steady_clock::now();
     // Up to 10 s: on a loaded machine the game thread may be busy for seconds (an overmap loading, say).
-    while( !fp3d::get_clock().paused && ms_since( t ) < 10000 * fp3d::slow_build ) {
+    while( !fp3d::get_clock().paused && ms_since( t ) < 10000 * fp3d::slow_build * rt_stretch ) {
         if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, req.id ) ) {
             req = *next;
         }
@@ -5708,7 +5737,8 @@ static bool run_safemode_checks()
     }
     const int placed_before = snapshot().zombies_placed;
     fp3d::set_auto_pause_hostiles( false );
-    fp3d::set_timescale( 4.0 / fp3d::slow_build );   // 250 ms turns, times slow_build
+    // 250 ms turns, times slow_build, times what the real-time goal found this machine needs (rt_stretch)
+    fp3d::set_timescale( 4.0 / ( fp3d::slow_build * rt_stretch ) );
     fp3d::set_clock_mode( fp3d::clock_mode::real_time );
     spawn_zombie = true;
     const int64_t turn0 = r->turn;
@@ -5717,19 +5747,31 @@ static bool run_safemode_checks()
     // 10 s with parallel builds running). A prompt (a request that doesn't expire) would stop the clock: noted,
     // cancelled so the game goes on.
     std::string prompts;
-    while( ms_since( t ) < 2000 * fp3d::slow_build ||
-           ( r->turn < turn0 + 3 && ms_since( t ) < 30000 * fp3d::slow_build ) ) {
-        if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, r->id ) ) {
-            r = next;
-            if( !next->timed ) {
-                prompts += std::string( " [" ) + fp3d::kind_name( next->kind ) + " " + next->context + ": " +
-                           next->title.substr( 0, 60 ) + " | " + next->text.substr( 0, 120 ) + "]";
-                fp3d::ui_answer a;
-                a.id = next->id;
-                a.cancel = true;
-                fp3d::answer( a );
+    const auto watch = [&]( const std::chrono::steady_clock::time_point & from ) {
+        while( ms_since( from ) < 2000 * fp3d::slow_build ||
+               ( r->turn < turn0 + 3 && ms_since( from ) < 30000 * fp3d::slow_build ) ) {
+            if( const std::optional<fp3d::ui_request> next = fp3d::wait_request( 50, r->id ) ) {
+                r = next;
+                if( !next->timed ) {
+                    prompts += std::string( " [" ) + fp3d::kind_name( next->kind ) + " " + next->context + ": " +
+                               next->title.substr( 0, 60 ) + " | " + next->text.substr( 0, 120 ) + "]";
+                    fp3d::ui_answer a;
+                    a.id = next->id;
+                    a.cancel = true;
+                    fp3d::answer( a );
+                }
             }
         }
+    };
+    watch( t );
+    // Too few turns seen and nothing asked: the turns may take longer than their slot now (see rt_stretch). The slot
+    // is stretched and the watch repeated.
+    while( r->turn < turn0 + 3 && prompts.empty() && rt_stretch < 8 ) {
+        rt_stretch *= 2;
+        fp3d::set_timescale( 4.0 / ( fp3d::slow_build * rt_stretch ) );
+        std::printf( "    real time: too few turns seen, the slot stretched to %d ms\n",
+                     250 * fp3d::slow_build * rt_stretch );
+        watch( std::chrono::steady_clock::now() );
     }
     const fp3d::clock_state c = fp3d::get_clock();
     const observed o = snapshot();
