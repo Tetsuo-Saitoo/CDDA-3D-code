@@ -5942,12 +5942,42 @@ static bool run_stairs_checks()
     check( has( m, "no stairs up" ) && same( pos_now(), start ), "wrong way refused", m );
     m = run( { start.x - 1, start.y, start.z }, -1 );
     check( has( m, "no stairs down" ) && same( pos_now(), start ), "no stairs refused", m );
+    // With only three levels wanted (as the client reads them), the snapshot follows the player down and up.
+    const auto levels_now = [&]() {
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return std::string( "none" );
+        }
+        bool here_too = false;
+        for( const auto &sm : s->submaps ) {
+            here_too = here_too || ( sm->pos.z == s->player.pos.z && sm->pos.x == s->player.pos.x / fp3d::sm_size &&
+                                     sm->pos.y == s->player.pos.y / fp3d::sm_size );
+        }
+        return std::to_string( s->z_first ) + ".." + std::to_string( s->z_last ) + ", " +
+               std::to_string( s->submaps.size() ) + " submaps" + ( here_too ? ", the player's among them" : "" );
+    };
+    const std::string three = std::to_string( 3 * MAPSIZE * MAPSIZE ) + " submaps, the player's among them";
+    fp3d::want_snapshot_levels( 1, 1 );
     m = run( stairs, -1 );
     const fp3d::ui_point below{ stairs.x, stairs.y, stairs.z - 1 };
     const bool down = same( pos_now(), below );
     check( down, "from next to them, down", str( pos_now() ) + " [" + m + "]" );
+    check( down && levels_now() == std::to_string( below.z - 1 ) + ".." + std::to_string( below.z + 1 ) + ", " + three,
+           "the three levels around the new one", levels_now() );
     m = down ? run( below, 1 ) : "<not below>";
     check( down && same( pos_now(), stairs ), "standing on them, up", str( pos_now() ) + " [" + m + "]" );
+    check( down && levels_now() == std::to_string( stairs.z - 1 ) + ".." + std::to_string( stairs.z + 1 ) + ", " + three,
+           "and around the old one again", levels_now() );
+    // Back to every level, as the other checks read them.
+    fp3d::want_all_snapshot_levels();
+    r = fp3d::wait_request( 5000 );
+    if( r && r->timed ) {
+        fp3d::queue_action( "pause" );
+        r = fp3d::wait_request( 20000, r->id );
+    }
+    const std::shared_ptr<const fp3d::snapshot> all = fp3d::latest_snapshot();
+    check( r && r->timed && all && all->submaps.size() == static_cast<size_t>( MAPSIZE ) * MAPSIZE * OVERMAP_LAYERS,
+           "every level again after a turn", levels_now() );
     return failed == 0;
 }
 
