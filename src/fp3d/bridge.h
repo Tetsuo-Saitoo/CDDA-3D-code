@@ -155,6 +155,11 @@ bool next_is_timed();
 // Sim side. True while the before-ask hook runs for a main-loop (timed) request: between turns, nothing half done.
 // A request asked from inside the hook (a popup) is never the timed one.
 bool in_timed_hook();
+// Sim side. While the game runs on by itself (an activity, sleep, a watched fill: turns pass with no request, so
+// with no before-ask hook), `hook` is called at a turn's end once neither hook has run for running_hook_gap_ms of
+// wall time, so the client still gets a snapshot now and then. Other turns cost one clock read.
+constexpr int running_hook_gap_ms = 500;
+void set_running_hook( std::function<void()> hook );
 
 // How many times longer this build runs: ThreadSanitizer slows the sim 5 to 15 times (B5's TSan run of the fork
 // tests), so wait_request and the tests' wall-clock limits stretch by this much there; 1 in every other build.

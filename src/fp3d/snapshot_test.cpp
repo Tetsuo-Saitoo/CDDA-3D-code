@@ -335,6 +335,40 @@ int main()
             check( calm->player.mood.entries.empty() && calm->player.mood.total == 0 && calm->player.mood.level == 0 &&
                    calm->player.mood.band == 0, "mood: nothing on a blank mind" );
         }
+        {
+            // Busy and asleep: the activity's id and verb while one runs; asleep only with the sleep effect.
+            double busy_ms = 0;
+            const std::shared_ptr<const fp3d::snapshot> idle = timed_capture( busy_ms );
+            std::ostringstream idle_json;
+            fp3d::write_snapshot_json( idle_json, *idle, u.posz(), u.posz() );
+            check( !idle->player.activity && !idle->player.asleep &&
+                   idle_json.str().find( "\"activity\"" ) == std::string::npos &&
+                   idle_json.str().find( "\"asleep\"" ) == std::string::npos, "activity: none and awake, not in the JSON" );
+            u.assign_activity( player_activity( activity_id( "ACT_WAIT" ), 100 * 60, 0 ) );
+            const std::shared_ptr<const fp3d::snapshot> busy = timed_capture( busy_ms );
+            check( busy->player.activity && busy->player.activity->id == "ACT_WAIT" &&
+                   busy->player.activity->verb == "waiting" && !busy->player.asleep, "activity: id and verb",
+                   busy->player.activity ? busy->player.activity->id + ", " + busy->player.activity->verb : "none" );
+            std::ostringstream busy_json;
+            fp3d::write_snapshot_json( busy_json, *busy, u.posz(), u.posz() );
+            check( busy_json.str().find( "\"activity\":{\"id\":\"ACT_WAIT\",\"verb\":\"waiting\"}" ) !=
+                   std::string::npos, "activity in the JSON" );
+            u.cancel_activity();
+            // Trying to sleep is an activity, not sleep yet.
+            u.assign_activity( player_activity( activity_id( "ACT_TRY_SLEEP" ), 100 * 60, 0 ) );
+            const std::shared_ptr<const fp3d::snapshot> trying = timed_capture( busy_ms );
+            check( trying->player.activity && trying->player.activity->id == "ACT_TRY_SLEEP" &&
+                   !trying->player.asleep, "activity: trying to sleep is not asleep",
+                   trying->player.activity ? trying->player.activity->verb : "none" );
+            u.cancel_activity();
+            u.add_effect( efftype_id( "sleep" ), 1_hours );
+            const std::shared_ptr<const fp3d::snapshot> sleeping = timed_capture( busy_ms );
+            std::ostringstream sleep_json;
+            fp3d::write_snapshot_json( sleep_json, *sleeping, u.posz(), u.posz() );
+            check( sleeping->player.asleep && !sleeping->player.activity &&
+                   sleep_json.str().find( "\"asleep\":true" ) != std::string::npos, "asleep, in the JSON too" );
+            u.remove_effect( efftype_id( "sleep" ) );
+        }
 
         // One wall 3 squares east of the player: exactly one submap's shape revision moves.
         const tripoint_bub_ms wall_at = u.pos_bub() + tripoint_rel_ms( 3, 0, 0 );

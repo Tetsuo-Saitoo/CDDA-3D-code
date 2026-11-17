@@ -49,6 +49,7 @@ struct channel {
     uint64_t next_id = 1;
     bool shut_down = false;
     std::function<void()> before_ask;
+    std::function<void()> running;       // set_running_hook
     std::deque<queued_action> actions;   // queued main-loop actions (block B5)
     std::optional<item_action> item_now; // the item action last answered as `fp3d_item`, until the sim takes it
     std::optional<stairs_action> stairs_now; // ... and the stairs action answered as `fp3d_stairs`
@@ -76,6 +77,8 @@ std::atomic<bool> bridge_active{ false };
 std::atomic<bool> interrupt_requested{ false };
 thread_local bool next_timed = false;
 thread_local bool hook_timed = false;
+// Sim thread: when the before-ask or the running hook last finished (set_running_hook).
+thread_local std::chrono::steady_clock::time_point hook_done;
 thread_local bool in_query = false;
 std::mutex poll_mutex;
 std::map<std::string, uint64_t> poll_counts;
@@ -246,6 +249,12 @@ void set_before_ask_hook( std::function<void()> hook )
     chan().before_ask = std::move( hook );
 }
 
+void set_running_hook( std::function<void()> hook )
+{
+    std::lock_guard<std::mutex> lk( chan().m );
+    chan().running = std::move( hook );
+}
+
 void set_next_timed()
 {
     next_timed = true;
@@ -298,6 +307,7 @@ ui_answer ask( ui_request req )
         }
         in_hook = false;
         hook_timed = false;
+        hook_done = std::chrono::steady_clock::now();
     }
     req.timed = timed;
     req.turn = to_turns<int64_t>( calendar::turn - calendar::turn_zero );
@@ -755,6 +765,19 @@ size_t queued_actions()
 void pace_turn( bool fast_forward, bool watched )
 {
     channel &c = chan();
+    // The game runs on by itself: no request comes this turn, so the running hook when it is due.
+    if( ( fast_forward || watched ) && std::chrono::steady_clock::now() - hook_done >=
+        std::chrono::milliseconds( running_hook_gap_ms ) ) {
+        std::function<void()> hook;
+        {
+            std::lock_guard<std::mutex> lk( c.m );
+            hook = c.shut_down ? nullptr : c.running;
+        }
+        if( hook ) {
+            hook();
+        }
+        hook_done = std::chrono::steady_clock::now();
+    }
     std::unique_lock<std::mutex> lk( c.m );
     std::optional<std::chrono::steady_clock::time_point> paced_until;
     for( ;; ) {
@@ -844,6 +867,7 @@ void reset_channel()
     c.reply.reset();
     c.shut_down = false;
     c.before_ask = nullptr;
+    c.running = nullptr;
     c.actions.clear();
     c.item_now.reset();
     c.stairs_now.reset();
@@ -866,6 +890,7 @@ void reset_sim_thread_state()
     next_timed = false;
     hook_timed = false;
     in_query = false;
+    hook_done = std::chrono::steady_clock::time_point();
 }
 
 std::string sanitize_text( const std::string &s, size_t max_len )
