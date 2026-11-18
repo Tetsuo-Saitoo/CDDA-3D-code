@@ -34,9 +34,11 @@
 #include <string>
 #include <unordered_set>
 
+class Character;
 class avatar;
 class input_context;
 class item;
+class item_location;
 
 namespace fp3d
 {
@@ -61,6 +63,31 @@ bool item_shelf( const item &it, uint8_t &shelf );
 constexpr int physics_reach = 2;
 // place, spot: how many run in one turn (they cost no time); more are refused until the next turn.
 constexpr int max_free_item_ops = 16;
+
+// Gun mods by hand (2026-11-17). Whether `mod` goes onto `gun`, as CDDA's own install menu decides it, in its
+// order and with its texts: the gun takes the mod (item::is_gunmod_compatible), the character has the skills
+// (meets_requirements; Character::can_use would log a message each time), and the chance without tools is above
+// 0. chance and risk are CDDA's odds without tools, 0..100. The snapshot gives it for every carried mod
+// (player.wielded_gun.fits); the `mod_add` action refuses on it.
+// mod_add: `item` a carried gun mod that isn't in a gun, `container` the wielded gun: Character::gunmod_add
+// without the gun and mod menus. Its own questions stay (a permanent mod; the tools menu under 100 %); the named
+// mod is the one installed. mod_remove: `item` a mod the wielded gun has: Character::gunmod_remove, after CDDA's
+// "Are you sure?" when the character couldn't put it back; refused for an irremovable mod and when the mod can't
+// be unloaded. Both start CDDA's activity and take its time, and both are refused while an earlier one waits
+// unfinished (CDDA's activity finds the mod by its place among the gun's mods).
+struct gunmod_fit {
+    bool ok = false;
+    int chance = 0;
+    int risk = 0;
+    std::string reason;   // CDDA's text when it doesn't fit, "" when it does
+};
+gunmod_fit fit_gunmod( const Character &who, const item_location &gun, const item &mod );
+// A gun mod location id as the client gets it: letters, digits, space, _ and -, up to max_gunmod_location_bytes;
+// "" for anything else (a mod's).
+constexpr size_t max_gunmod_location_bytes = 32;
+// How many slots of one kind a gun is said to have, at most (game data and mods are not trusted to stay small).
+constexpr int max_mod_slots = 16;
+std::string gunmod_location_text( const std::string &id );
 
 void register_item_actions( input_context &ctxt );
 bool is_item_action( const std::string &action );

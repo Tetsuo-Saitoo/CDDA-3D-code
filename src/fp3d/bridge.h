@@ -277,7 +277,8 @@ size_t queued_actions();
 // one next to it) is beaten out; needs something that bashes, carried or lying near. `item` stays empty (uid 0,
 // type 0). A fire anywhere else isn't put out by hand.
 enum class item_op : uint8_t {
-    take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume, cook, light, extinguish
+    take, put, drop, unload, reload, clear, throw_, pour, place, spot, hold, consume, cook, light, extinguish,
+    mod_add, mod_remove
 };
 // take, unload: where the item (take) or what comes out (unload) goes: the inventory (CDDA drops what doesn't
 // fit), wielded, the off hand.
@@ -298,6 +299,8 @@ struct item_action {
     // onto, only without `container`.
     ui_point pos;
     item_hand hand = item_hand::pack;    // take, unload
+    // mod_add, mod_remove: the wielded gun (required); `item` is the gun mod, carried (mod_add) or one the gun
+    // has (mod_remove).
     // put: the container. reload: the ammo or magazine to load (required). pour: the container poured into, or
     // empty (uid 0, type 0) to pour onto `pos`. take: the container lying on `pos` that holds `item` (one level,
     // L8), or empty for an item lying there itself.

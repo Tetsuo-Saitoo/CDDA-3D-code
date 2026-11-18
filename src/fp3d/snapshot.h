@@ -245,12 +245,42 @@ struct worn_view {
 // The wielded gun, for the client's weapon view (combat block 2).
 constexpr size_t max_gun_faults = 16;
 constexpr size_t max_fault_id_bytes = 64;
+// Gun mods by hand (2026-11-17), all on the wielded gun. A mod it has; a slot kind it has now (an installed mod
+// can add slots to the type's own, id_tables.h); and for every carried gun mod that isn't in a gun, whether it goes
+// on (item_hands.h fit_gunmod).
+constexpr uint8_t gun_mod_irremovable = 1;        // can't be taken off: CDDA's IRREMOVABLE, integral mods too
+constexpr size_t max_gun_mods = 16;
+constexpr size_t max_gun_slots = 16;
+constexpr size_t max_gun_fits = 32;
+constexpr size_t max_gun_fit_reason_bytes = 80;
+struct gun_mod_view {
+    uint64_t uid = 0;                             // the mod's item handle, as mod_remove takes it
+    uint32_t type = 0;                            // itype index
+    std::string location;                         // gunmod_location_text
+    uint8_t flags = 0;                            // gun_mod_irremovable
+};
+struct gun_slot_view {
+    std::string location;
+    uint8_t slots = 0;
+    uint8_t free = 0;
+};
+struct gun_fit_view {
+    uint64_t uid = 0;                             // a carried gun mod, as `items` lists it
+    bool ok = false;
+    uint8_t chance = 0;                           // CDDA's odds without tools, 0..100
+    uint8_t risk = 0;
+    std::string reason;                           // CDDA's text when it doesn't fit; "" when it does
+};
+
 struct gun_view {
     uint32_t type = 0;                   // itype index
     int16_t dirt = -1;                   // CDDA's fouling 0..10000; -1 for a NON_FOULING gun
     int32_t rounds = -1;                 // loaded rounds; -1 for a gun that takes no ammo
     std::vector<std::string> faults;     // fault ids it has (cap max_gun_faults, ids up to max_fault_id_bytes)
     bool suppressed = false;             // a gunmod (built-in too) lowers its report, as item::gun_noise counts it
+    std::vector<gun_mod_view> mods;      // cap max_gun_mods, CDDA's order (item::gunmods)
+    std::vector<gun_slot_view> slots;    // cap max_gun_slots
+    std::vector<gun_fit_view> fits;      // cap max_gun_fits
 };
 
 // An effect on the player, for the HUD: what CDDA's @ screen lists (effects with no display name are left out).

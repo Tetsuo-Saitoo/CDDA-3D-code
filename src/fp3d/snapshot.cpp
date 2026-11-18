@@ -824,6 +824,60 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
     for( const item_location &worn : u.top_items_loc() ) {
         list_carried( worn, 0, -1, carried_worn, 0, offhand, seen, pv.items, pv.item_states, pv.item_amounts );
     }
+    // After the list above, which gives carried items their handles.
+    if( item_location gun = u.get_wielded_item(); gun && pv.wielded_gun ) {
+        gun_view &g = *pv.wielded_gun;
+        // Gun mods by hand: what it has, the slots it has now, and which carried mods would go on.
+        for( item *mod : gun->gunmods() ) {
+            if( g.mods.size() >= max_gun_mods ) {
+                break;
+            }
+            if( mod == nullptr || !mod->is_gunmod() ) {
+                continue;
+            }
+            gun_mod_view mv;
+            mv.uid = item_handle( *mod, &seen );
+            mv.type = intern_id( id_kind::itype, mod->typeId().str() );
+            mv.location = gunmod_location_text( mod->type->gunmod->location.str() );
+            mv.flags = mod->is_irremovable() ? gun_mod_irremovable : 0;
+            g.mods.push_back( std::move( mv ) );
+        }
+        for( const std::pair<const gunmod_location, int> &slot : gun->get_mod_locations() ) {
+            if( g.slots.size() >= max_gun_slots ) {
+                break;
+            }
+            gun_slot_view sv;
+            sv.location = gunmod_location_text( slot.first.str() );
+            if( sv.location.empty() || slot.second <= 0 ) {
+                continue;
+            }
+            sv.slots = static_cast<uint8_t>( std::min( slot.second, max_mod_slots ) );
+            sv.free = static_cast<uint8_t>( std::clamp( gun->get_free_mod_locations( slot.first ), 0,
+                                            static_cast<int>( sv.slots ) ) );
+            g.slots.push_back( std::move( sv ) );
+        }
+        for( const item_location &loc : u.all_items_loc() ) {
+            if( g.fits.size() >= max_gun_fits ) {
+                break;
+            }
+            // A carried mod the item list gave a handle; not one that sits in a gun.
+            if( !loc || !loc->is_gunmod() || ( loc.has_parent() && loc.parent_item()->is_gun() ) ) {
+                continue;
+            }
+            const uint64_t uid = read_item_handle( *loc );
+            if( uid == 0 ) {
+                continue;
+            }
+            const gunmod_fit fit = fit_gunmod( u, gun, *loc );
+            gun_fit_view fv;
+            fv.uid = uid;
+            fv.ok = fit.ok;
+            fv.chance = clamp_u8( fit.chance );
+            fv.risk = clamp_u8( fit.risk );
+            fv.reason = client_text( fit.reason, max_gun_fit_reason_bytes, max_gun_fit_reason_bytes );
+            g.fits.push_back( std::move( fv ) );
+        }
+    }
 }
 
 void capture_environment( const avatar &u, environment_view &env )
@@ -1326,6 +1380,39 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         if( g.suppressed ) {
             jo.member( "suppressed", true );
         }
+        jo.member( "mods" );
+        jo.start_array();
+        for( const gun_mod_view &m : g.mods ) {
+            jo.start_array();
+            jo.write( m.uid );
+            jo.write( static_cast<int64_t>( m.type ) );
+            jo.write( m.location );
+            jo.write( static_cast<int>( m.flags ) );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "slots" );
+        jo.start_array();
+        for( const gun_slot_view &sl : g.slots ) {
+            jo.start_array();
+            jo.write( sl.location );
+            jo.write( static_cast<int>( sl.slots ) );
+            jo.write( static_cast<int>( sl.free ) );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "fits" );
+        jo.start_array();
+        for( const gun_fit_view &f : g.fits ) {
+            jo.start_array();
+            jo.write( f.uid );
+            jo.write( f.ok ? 1 : 0 );
+            jo.write( static_cast<int>( f.chance ) );
+            jo.write( static_cast<int>( f.risk ) );
+            jo.write( f.reason );
+            jo.end_array();
+        }
+        jo.end_array();
         jo.end_object();
     }
     jo.member( "mood" );

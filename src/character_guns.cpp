@@ -12,6 +12,7 @@
 #include "activity_actor_definitions.h"
 #include "calendar.h"
 #include "character.h"
+#include "fp3d/bridge.h" // FP3D:
 #include "color.h"
 #include "coordinates.h"
 #include "debug.h"
@@ -184,6 +185,9 @@ void Character::gunmod_add( item &gun, item &mod )
 
     itype_id mod_type = mod.typeId();
     std::string mod_name = mod.tname();
+    // FP3D: with the gun already in hand nothing moves, so the mod that was named is the one installed, not the
+    // first of its type the character carries (the client names one item)
+    const bool fp3d_named_mod = fp3d::active() && is_wielding( gun );
 
     if( !is_wielding( gun ) && !wield( gun ) ) {
         add_msg_if_player( _( "You can't wield the %1$s." ), gun.tname() );
@@ -201,7 +205,7 @@ void Character::gunmod_add( item &gun, item &mod )
         return;
     }
 
-    item &moved_mod = *mods.front();
+    item &moved_mod = fp3d_named_mod ? mod : *mods.front(); // FP3D:
     // any (optional) tool charges that are used during installation
     auto odds = gunmod_installation_odds( wielded_gun, moved_mod );
     int roll = odds.first;

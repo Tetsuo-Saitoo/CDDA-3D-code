@@ -1,5 +1,6 @@
 #include "fp3d/item_hands.h"
 
+#include <algorithm>
 #include <charconv>
 #include <cmath>
 #include <mutex>
@@ -54,6 +55,8 @@
 #include "units.h"
 
 static const activity_id ACT_CONSUME( "ACT_CONSUME" );
+static const activity_id ACT_GUNMOD_ADD( "ACT_GUNMOD_ADD" );
+static const activity_id ACT_GUNMOD_REMOVE( "ACT_GUNMOD_REMOVE" );
 
 static const ammotype ammo_plutonium( "plutonium" );
 
@@ -1416,6 +1419,96 @@ const firestarter_actor *firestarter_of( const item &it )
 // CDDA's fire starting (the firestarter item use: its questions, time and charges) on the square `a.pos` next to the
 // avatar, with the carried item `a.item`, or with none named the quickest carried one that works now (as examining a
 // fireplace picks it).
+// mod_add, mod_remove: the wielded gun, if it is the one the action names.
+item_location named_wielded_gun( avatar &u, const item_ref &r )
+{
+    item_location gun = u.get_wielded_item();
+    return gun && gun->is_gun() && matches( *gun, r ) ? gun : item_location();
+}
+
+// A mod job that isn't finished (running, or set aside in the backlog) finds its mod by its place among the
+// gun's mods: nothing may change those meanwhile. CDDA's two mod activities can't be resumed, so this is a guard
+// more than a case that comes up.
+bool mod_job_waiting( const avatar &u )
+{
+    const auto mod_job = []( const player_activity & act ) {
+        return act.id() == ACT_GUNMOD_ADD || act.id() == ACT_GUNMOD_REMOVE;
+    };
+    return mod_job( u.activity ) || std::any_of( u.backlog.begin(), u.backlog.end(), mod_job );
+}
+
+bool mod_add( avatar &u, const item_action &a )
+{
+    item_location gun = named_wielded_gun( u, a.container );
+    if( !gun ) {
+        return refuse( u, _( "You aren't holding that gun." ) );
+    }
+    if( mod_job_waiting( u ) ) {
+        return refuse( u, _( "Finish the work on your gun first." ) );
+    }
+    item_location mod = find_carried( u, a.item );
+    if( !mod || !mod->is_gunmod() || ( mod.has_parent() && mod.parent_item()->is_gun() ) ) {
+        return refuse( u, _( "You don't have that any more." ) );
+    }
+    const gunmod_fit fit = fit_gunmod( u, gun, *mod );
+    if( !fit.ok ) {
+        //~ %1$s: a gun's name, %2$s: why a mod doesn't go on it ("doesn't have a slot for this mod")
+        return refuse( u, string_format( _( "Your %1$s %2$s." ), gun->tname(), fit.reason ) );
+    }
+    u.gunmod_add( *gun, *mod );
+    if( u.activity.id() == ACT_GUNMOD_ADD ) {
+        return true;
+    }
+    // One of CDDA's questions was answered no; it said so itself.
+    return refuse_quietly( _( "Never mind." ) );
+}
+
+bool mod_remove( avatar &u, const item_action &a )
+{
+    item_location gun = named_wielded_gun( u, a.container );
+    if( !gun ) {
+        return refuse( u, _( "You aren't holding that gun." ) );
+    }
+    if( mod_job_waiting( u ) ) {
+        return refuse( u, _( "Finish the work on your gun first." ) );
+    }
+    const std::vector<item *> mods = gun->gunmods();
+    size_t at = mods.size();
+    for( size_t i = 0; i < mods.size(); i++ ) {
+        if( mods[i] != nullptr && matches( *mods[i], a.item ) ) {
+            if( at != mods.size() ) {
+                return refuse( u, _( "You don't have that any more." ) );
+            }
+            at = i;
+        }
+    }
+    if( at == mods.size() ) {
+        return refuse( u, _( "You don't have that any more." ) );
+    }
+    item &mod = *mods[at];
+    if( mod.is_irremovable() ) {
+        //~ %s: a gun mod's name
+        return refuse( u, string_format( _( "The %s can't be taken off." ), mod.tname() ) );
+    }
+    // CDDA's detach menu asks this first: the gun without the mod, and whether the character could put it back.
+    item gun_without( *gun );
+    const std::vector<item *> copies = gun_without.gunmods();
+    if( at < copies.size() ) {
+        gun_without.remove_item( *copies[at] );
+        if( !u.meets_requirements( mod, gun_without ) &&
+            !query_yn( _( "Are you sure?  You may be lacking the skills needed to reattach this modification." ) ) ) {
+            return refuse( u, _( "Never mind." ) );
+        }
+    }
+    const std::string name = mod.tname();
+    if( !u.gunmod_remove( *gun, mod ) ) {
+        // CDDA's unload said why in the log; the result gets a line of its own.
+        //~ %s: a gun mod's name
+        return refuse_quietly( string_format( _( "You can't unload the %s." ), name ) );
+    }
+    return true;
+}
+
 bool light( avatar &u, const item_action &a )
 {
     map &here = get_map();
@@ -1536,6 +1629,40 @@ uint64_t item_handle( item &it, std::unordered_set<uint64_t> *seen )
         seen->insert( uid );
     }
     return uid;
+}
+
+std::string gunmod_location_text( const std::string &id )
+{
+    const bool plain = !id.empty() && id.size() <= max_gunmod_location_bytes &&
+    std::all_of( id.begin(), id.end(), []( const char ch ) {
+        return ( ch >= 'A' && ch <= 'Z' ) || ( ch >= 'a' && ch <= 'z' ) || ( ch >= '0' && ch <= '9' ) ||
+               ch == ' ' || ch == '_' || ch == '-';
+    } );
+    return plain ? id : std::string();
+}
+
+gunmod_fit fit_gunmod( const Character &who, const item_location &gun, const item &mod )
+{
+    gunmod_fit fit;
+    if( !gun || !gun->is_gun() || !mod.is_gunmod() ) {
+        fit.reason = _( "is not a weapon" );
+        return fit;
+    }
+    const std::pair<int, int> odds = who.gunmod_installation_odds( gun, mod );
+    fit.chance = std::clamp( odds.first, 0, 100 );
+    fit.risk = std::clamp( odds.second, 0, 100 );
+    // The order and the texts of CDDA's install menu (game_inventory.cpp gunmod_inventory_preset).
+    const ret_val<void> takes = gun->is_gunmod_compatible( mod );
+    if( !takes.success() ) {
+        fit.reason = takes.str();
+    } else if( !who.meets_requirements( mod, *gun ) ) {
+        fit.reason = string_format( _( "requires at least %s" ), who.enumerate_unmet_requirements( mod, *gun ) );
+    } else if( odds.first <= 0 ) {
+        fit.reason = _( "is too difficult for you to modify" );
+    } else {
+        fit.ok = true;
+    }
+    return fit;
 }
 
 bool item_spot( const item &it, uint16_t &x, uint16_t &y )
@@ -1986,6 +2113,10 @@ bool run_one_item_action( avatar &u, const std::optional<item_action> &a )
             return light( u, *a );
         case item_op::extinguish:
             return extinguish( u, *a );
+        case item_op::mod_add:
+            return mod_add( u, *a );
+        case item_op::mod_remove:
+            return mod_remove( u, *a );
     }
     return false;
 }

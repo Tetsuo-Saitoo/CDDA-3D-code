@@ -4,6 +4,7 @@
 //
 // usage: fp3d-ids-test   (run from the cdda/ folder)
 #include <algorithm>
+#include <map>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -16,7 +17,9 @@
 #include "debug.h"
 #include "fp3d/boot.h"
 #include "fp3d/id_tables.h"
+#include "fp3d/item_hands.h"
 #include "fp3d/snapshot.h"
+#include "itype.h"
 #include "json.h"
 #include "json_loader.h"
 #include "mapdata.h"
@@ -109,6 +112,35 @@ int main()
                t->items[apple].phase == "solid", "item phase: water liquid, apple solid",
                water < t->items.size() ? t->items[water].phase : "water not in the table" );
 
+        // Gun mods by hand: where a gun mod goes, and a gun type's own slots.
+        const uint32_t glock = fp3d::intern_id( fp3d::id_kind::itype, "glock_19" );
+        const uint32_t laser = fp3d::intern_id( fp3d::id_kind::itype, "rail_laser_sight" );
+        const auto slots_of = [&]( uint32_t type, const std::string & where ) {
+            if( type >= t->items.size() ) {
+                return -1;
+            }
+            for( const std::pair<std::string, int> &slot : t->items[type].mod_locations ) {
+                if( slot.first == where ) {
+                    return slot.second;
+                }
+            }
+            return 0;
+        };
+        check( laser < t->items.size() && t->items[laser].gunmod_location == "rail" &&
+               t->items[laser].mod_locations.empty() && slots_of( glock, "rail" ) == 1 &&
+               slots_of( glock, "mechanism" ) == 2 && slots_of( glock, "stock mount" ) == 1 &&
+               slots_of( glock, "underbarrel" ) == 0 && t->items[glock].gunmod_location.empty() &&
+               t->items[apple].gunmod_location.empty() && t->items[apple].mod_locations.empty(),
+               "gun mods: a mod's location, a gun's slots",
+               laser < t->items.size() ? t->items[laser].gunmod_location + ", rail x" +
+               std::to_string( slots_of( glock, "rail" ) ) : "laser sight not in the table" );
+        check( fp3d::gunmod_location_text( "stock mount" ) == "stock mount" &&
+               fp3d::gunmod_location_text( "bad<id>" ).empty() && fp3d::gunmod_location_text( "" ).empty() &&
+               fp3d::gunmod_location_text( std::string( fp3d::max_gunmod_location_bytes, 'a' ) ).size() ==
+               fp3d::max_gunmod_location_bytes &&
+               fp3d::gunmod_location_text( std::string( fp3d::max_gunmod_location_bytes + 1, 'a' ) ).empty(),
+               "gun mods: only plain location ids" );
+
         // Pockets per item type: a plastic bottle has one rigid, watertight, sealable 500 ml pocket.
         const uint32_t bottle = fp3d::intern_id( fp3d::id_kind::itype, "bottle_plastic" );
         const bool bottle_ok = bottle < t->items.size() && t->items[bottle].pockets.size() == 1;
@@ -159,6 +191,10 @@ int main()
         const std::string text = os.str();
         check( text.find( "\"pockets\":[{\"volume_ml\":500,\"max_weight_g\":1250," ) != std::string::npos,
                "pockets in the JSON" );
+        check( text.find( "\"gunmod_location\":\"rail\"" ) != std::string::npos &&
+               text.find( "\"mod_locations\":[[\"barrel\",1],[\"mechanism\",2],[\"rail\",1],"
+                          "[\"sights mount\",1],[\"stock mount\",1]]" ) != std::string::npos,
+               "gun mod locations in the JSON" );
         JsonValue root = json_loader::from_string( text );
         JsonObject jo = root.get_object();
         jo.allow_omitted_members();
@@ -170,6 +206,46 @@ int main()
                tables.get_array( "itype" ).size() == items.size() &&
                jo.get_int( "generation" ) == static_cast<int>( t2->generation ),
                "JSON parses back with the same sizes", std::to_string( text.size() / 1024 ) + " KB" );
+        {
+            // Game data is not trusted to stay small (a mod's gun): more slot kinds than the cap, a slot count far
+            // beyond it, kinds with no slots and location ids that aren't plain. The tables keep the first 16 plain
+            // kinds that have slots, each with 16 slots at most.
+            // (`itype` is also a local above, the JSON array: hence `struct`.)
+            struct itype &odd = const_cast<struct itype &>( *itype_id( "glock_19" ) );
+            const std::map<gunmod_location, int> real = odd.gun->valid_mod_locations;
+            odd.gun->valid_mod_locations.clear();
+            odd.gun->valid_mod_locations[gunmod_location( "aaa big" )] = 500;
+            odd.gun->valid_mod_locations[gunmod_location( "aab<bad>" )] = 1;
+            odd.gun->valid_mod_locations[gunmod_location( "aac none" )] = 0;
+            odd.gun->valid_mod_locations[gunmod_location( std::string( 40, 'c' ) )] = 1;
+            for( int i = 0; i < 20; i++ ) {
+                odd.gun->valid_mod_locations[gunmod_location( "slot " + std::to_string( 10 + i ) )] = 1;
+            }
+            fp3d::build_id_tables();
+            const std::shared_ptr<const fp3d::id_tables> t3 = fp3d::latest_id_tables();
+            bool plain = glock < t3->items.size();
+            int most = 0;
+            size_t kinds = 0;
+            std::string first;
+            if( plain ) {
+                const std::vector<std::pair<std::string, int>> &got = t3->items[glock].mod_locations;
+                kinds = got.size();
+                first = got.empty() ? std::string() : got.front().first;
+                for( const std::pair<std::string, int> &slot : got ) {
+                    plain = plain && !slot.first.empty() && fp3d::gunmod_location_text( slot.first ) == slot.first &&
+                            slot.second >= 1;
+                    most = std::max( most, slot.second );
+                }
+            }
+            check( plain && kinds == fp3d::max_mod_locations && most == fp3d::max_mod_slots && first == "aaa big",
+                   "gun mods: a gun with oversized data is cut to the caps",
+                   std::to_string( kinds ) + " kinds, at most " + std::to_string( most ) + " slots, first " + first );
+            odd.gun->valid_mod_locations = real;
+            fp3d::build_id_tables();
+            const std::shared_ptr<const fp3d::id_tables> t4 = fp3d::latest_id_tables();
+            check( glock < t4->items.size() && t4->items[glock].mod_locations.size() == 5,
+                   "gun mods: and the real gun's slots are back" );
+        }
     } catch( const std::exception &e ) {
         std::printf( "error: %s\n", e.what() );
         return EXIT_FAILURE;
