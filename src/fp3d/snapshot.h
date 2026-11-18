@@ -190,6 +190,16 @@ struct submap_view {
     std::vector<std::pair<uint64_t, uint32_t>> inside_more;   // containers cut short: [handle, items left out]
     bool same_shape( const submap_view &o ) const;
     bool same_detail( const submap_view &o ) const;
+    // write_snapshot_json's text of this view and the ids it names, made the first time the view is written and
+    // kept: a view never changes after its capture. Only write_snapshot_json touches it (under its own mutex).
+    struct written_text {
+        std::string text;
+        std::vector<uint32_t> ter;                // each list unique and sorted
+        std::vector<uint32_t> furn;
+        std::vector<uint32_t> trap;
+        std::vector<uint32_t> field;
+    };
+    mutable std::shared_ptr<const written_text> written;
 };
 
 struct creature_view {
@@ -445,7 +455,10 @@ void publish_snapshot( std::shared_ptr<const snapshot> s );
 std::shared_ptr<const snapshot> latest_snapshot();
 
 // Writes `s` as JSON (submaps with z in [z_min, z_max] only) plus the names of the ids it uses.
-void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z_max );
+// A submap's text is made once and reused while the snapshots share the view (nearly all of them between two
+// snapshots); `reuse_submap_text` false writes every submap anew, for the check that both give the same bytes.
+void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z_max,
+                          bool reuse_submap_text = true );
 
 // Character sheet (G4): the character screen's data (CDDA's character sheet) for a character query (bridge.h).
 // Read-only; runs on the sim thread. All text is game data (mods): color tags, line breaks and control characters

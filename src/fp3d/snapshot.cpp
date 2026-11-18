@@ -1311,7 +1311,216 @@ std::shared_ptr<const snapshot> latest_snapshot()
     return latest;
 }
 
-void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z_max )
+// One submap's object in the snapshot JSON; the field types it names go to `used_field`.
+static void write_submap( JsonOut &jo, const submap_view &sm, std::set<uint32_t> &used_field )
+{
+    jo.start_object();
+    jo.member( "pos" );
+    write_point( jo, sm.pos );
+    jo.member( "revision", static_cast<int64_t>( sm.revision ) );
+    jo.member( "detail_revision", static_cast<int64_t>( sm.detail_revision ) );
+    write_array( jo, "ter", sm.ter );
+    write_array( jo, "furn", sm.furn );
+    write_array( jo, "trap", sm.trap );
+    write_array( jo, "light", sm.light );
+    write_array( jo, "vis", sm.vis );
+    write_array( jo, "flags", sm.flags );
+    jo.member( "items" );
+    jo.start_array();
+    for( const item_pile_view &p : sm.items ) {
+        jo.start_array();
+        jo.write( static_cast<int>( p.tile ) );
+        jo.write( static_cast<int>( p.count ) );
+        jo.start_array();
+        for( uint32_t t : p.top ) {
+            jo.write( static_cast<int64_t>( t ) );
+        }
+        jo.end_array();
+        if( p.corpse != 0 ) {
+            jo.write( static_cast<int64_t>( p.corpse ) );
+            jo.write( static_cast<int>( p.corpse_state ) );
+        }
+        jo.end_array();
+    }
+    jo.end_array();
+    jo.member( "handles" );
+    jo.start_array();
+    for( const item_pile_view &p : sm.items ) {
+        for( const item_handle_view &h : p.handles ) {
+            jo.start_array();
+            jo.write( static_cast<int>( p.tile ) );
+            jo.write( static_cast<int64_t>( h.uid ) );
+            jo.write( static_cast<int64_t>( h.type ) );
+            jo.write( static_cast<int>( h.spot_x ) );
+            jo.write( static_cast<int>( h.spot_y ) );
+            jo.end_array();
+        }
+    }
+    jo.end_array();
+    // How placed items lie, only for those with a stored pose: [uid, yaw, side]. Its own list, so a handle
+    // keeps its five numbers.
+    jo.member( "poses" );
+    jo.start_array();
+    for( const item_pile_view &p : sm.items ) {
+        for( const item_handle_view &h : p.handles ) {
+            if( h.yaw >= 0 ) {
+                jo.start_array();
+                jo.write( static_cast<int64_t>( h.uid ) );
+                jo.write( static_cast<int>( h.yaw ) );
+                jo.write( h.side ? 1 : 0 );
+                jo.end_array();
+            }
+        }
+    }
+    jo.end_array();
+    // The furniture shelf placed items were put on, only for those with one stored: [uid, shelf].
+    jo.member( "shelves" );
+    jo.start_array();
+    for( const item_pile_view &p : sm.items ) {
+        for( const item_handle_view &h : p.handles ) {
+            if( h.shelf >= 0 ) {
+                jo.start_array();
+                jo.write( static_cast<int64_t>( h.uid ) );
+                jo.write( static_cast<int>( h.shelf ) );
+                jo.end_array();
+            }
+        }
+    }
+    jo.end_array();
+    // L8: piles with more items than handles listed: [tile, items not listed].
+    jo.member( "more" );
+    jo.start_array();
+    for( const item_pile_view &p : sm.items ) {
+        if( p.count > p.handles.size() ) {
+            jo.start_array();
+            jo.write( static_cast<int>( p.tile ) );
+            jo.write( static_cast<int64_t>( p.count - p.handles.size() ) );
+            jo.end_array();
+        }
+    }
+    jo.end_array();
+    // L8: what lies in containers next to the player: [container, uid, type, pocket]; containers cut short:
+    // [container, items left out].
+    jo.member( "inside" );
+    jo.start_array();
+    for( const inside_view &v : sm.inside ) {
+        jo.start_array();
+        jo.write( static_cast<int64_t>( v.container ) );
+        jo.write( static_cast<int64_t>( v.uid ) );
+        jo.write( static_cast<int64_t>( v.type ) );
+        jo.write( static_cast<int>( v.pocket ) );
+        jo.end_array();
+    }
+    jo.end_array();
+    jo.member( "inside_more" );
+    jo.start_array();
+    for( const std::pair<uint64_t, uint32_t> &m : sm.inside_more ) {
+        jo.start_array();
+        jo.write( static_cast<int64_t>( m.first ) );
+        jo.write( static_cast<int64_t>( m.second ) );
+        jo.end_array();
+    }
+    jo.end_array();
+    jo.member( "fields" );
+    jo.start_array();
+    for( const field_view &f : sm.fields ) {
+        used_field.insert( f.type );
+        jo.start_array();
+        jo.write( static_cast<int>( f.tile ) );
+        jo.write( static_cast<int64_t>( f.type ) );
+        jo.write( static_cast<int>( f.intensity ) );
+        jo.write( static_cast<int>( f.age_turns ) );
+        jo.end_array();
+    }
+    jo.end_array();
+    // C6: [tile, luminance, kind (0 terrain/furniture, 1 item, 2 field)]
+    jo.member( "lights" );
+    jo.start_array();
+    for( const light_view &l : sm.lights ) {
+        jo.start_array();
+        jo.write( static_cast<int>( l.tile ) );
+        jo.write( static_cast<int>( l.luminance ) );
+        jo.write( static_cast<int>( l.kind ) );
+        jo.end_array();
+    }
+    jo.end_array();
+    // L9: [tile, source, tool, fire, charges, lit (0/1)]
+    jo.member( "heat" );
+    jo.start_array();
+    for( const heat_view &h : sm.heat ) {
+        jo.start_array();
+        jo.write( static_cast<int>( h.tile ) );
+        jo.write( static_cast<int>( h.source ) );
+        jo.write( static_cast<int64_t>( h.tool ) );
+        jo.write( static_cast<int>( h.fire ) );
+        jo.write( static_cast<int64_t>( h.charges ) );
+        jo.write( h.lit ? 1 : 0 );
+        jo.end_array();
+    }
+    jo.end_array();
+    jo.member( "cookware" );
+    jo.start_array();
+    for( const cookware_view &cw : sm.cookware ) {
+        jo.start_object();
+        jo.member( "tile", static_cast<int>( cw.tile ) );
+        jo.member( "uid", static_cast<int64_t>( cw.uid ) );
+        jo.member( "type", static_cast<int64_t>( cw.type ) );
+        jo.member( "contents" );
+        jo.start_array();
+        for( const cookware_item_view &c : cw.contents ) {
+            jo.start_array();
+            jo.write( static_cast<int64_t>( c.uid ) );
+            jo.write( static_cast<int64_t>( c.type ) );
+            jo.write( static_cast<int64_t>( c.count ) );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "craft_result", static_cast<int64_t>( cw.craft_result ) );
+        jo.member( "craft_recipe", cw.craft_recipe );
+        jo.member( "craft_progress", static_cast<int>( cw.craft_progress ) );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.end_object();
+}
+
+// The same text made once per view and kept with it (submap_view::written): a view never changes after its
+// capture, and nearly all of a snapshot's submaps are the views the snapshot before had, so writing one is mostly
+// copying. Any thread.
+static std::shared_ptr<const submap_view::written_text> written_submap( const submap_view &sm )
+{
+    static std::mutex written_mutex;
+    {
+        std::lock_guard<std::mutex> lk( written_mutex );
+        if( sm.written ) {
+            return sm.written;
+        }
+    }
+    auto made = std::make_shared<submap_view::written_text>();
+    std::set<uint32_t> fields;
+    std::ostringstream text;
+    JsonOut jo( text );
+    write_submap( jo, sm, fields );
+    made->text = text.str();
+    const auto unique = []( const std::array<uint32_t, sm_tiles> &ids ) {
+        std::vector<uint32_t> out( ids.begin(), ids.end() );
+        std::sort( out.begin(), out.end() );
+        out.erase( std::unique( out.begin(), out.end() ), out.end() );
+        return out;
+    };
+    made->ter = unique( sm.ter );
+    made->furn = unique( sm.furn );
+    made->trap = unique( sm.trap );
+    made->field.assign( fields.begin(), fields.end() );
+    std::lock_guard<std::mutex> lk( written_mutex );
+    if( !sm.written ) {
+        sm.written = made;
+    }
+    return sm.written;
+}
+
+void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z_max,
+                          bool reuse_submap_text )
 {
     std::set<uint32_t> used_ter;
     std::set<uint32_t> used_furn;
@@ -1537,177 +1746,24 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
         if( sm.pos.z < z_min || sm.pos.z > z_max ) {
             continue;
         }
-        used_ter.insert( sm.ter.begin(), sm.ter.end() );
-        used_furn.insert( sm.furn.begin(), sm.furn.end() );
-        used_trap.insert( sm.trap.begin(), sm.trap.end() );
-        jo.start_object();
-        jo.member( "pos" );
-        write_point( jo, sm.pos );
-        jo.member( "revision", static_cast<int64_t>( sm.revision ) );
-        jo.member( "detail_revision", static_cast<int64_t>( sm.detail_revision ) );
-        write_array( jo, "ter", sm.ter );
-        write_array( jo, "furn", sm.furn );
-        write_array( jo, "trap", sm.trap );
-        write_array( jo, "light", sm.light );
-        write_array( jo, "vis", sm.vis );
-        write_array( jo, "flags", sm.flags );
-        jo.member( "items" );
-        jo.start_array();
-        for( const item_pile_view &p : sm.items ) {
-            jo.start_array();
-            jo.write( static_cast<int>( p.tile ) );
-            jo.write( static_cast<int>( p.count ) );
-            jo.start_array();
-            for( uint32_t t : p.top ) {
-                jo.write( static_cast<int64_t>( t ) );
-            }
-            jo.end_array();
-            if( p.corpse != 0 ) {
-                jo.write( static_cast<int64_t>( p.corpse ) );
-                jo.write( static_cast<int>( p.corpse_state ) );
-            }
-            jo.end_array();
+        if( !reuse_submap_text ) {
+            used_ter.insert( sm.ter.begin(), sm.ter.end() );
+            used_furn.insert( sm.furn.begin(), sm.furn.end() );
+            used_trap.insert( sm.trap.begin(), sm.trap.end() );
+            write_submap( jo, sm, used_field );
+            continue;
         }
-        jo.end_array();
-        jo.member( "handles" );
-        jo.start_array();
-        for( const item_pile_view &p : sm.items ) {
-            for( const item_handle_view &h : p.handles ) {
-                jo.start_array();
-                jo.write( static_cast<int>( p.tile ) );
-                jo.write( static_cast<int64_t>( h.uid ) );
-                jo.write( static_cast<int64_t>( h.type ) );
-                jo.write( static_cast<int>( h.spot_x ) );
-                jo.write( static_cast<int>( h.spot_y ) );
-                jo.end_array();
-            }
+        const std::shared_ptr<const submap_view::written_text> kept = written_submap( sm );
+        used_ter.insert( kept->ter.begin(), kept->ter.end() );
+        used_furn.insert( kept->furn.begin(), kept->furn.end() );
+        used_trap.insert( kept->trap.begin(), kept->trap.end() );
+        used_field.insert( kept->field.begin(), kept->field.end() );
+        // The object's text as write_submap gave it, between the writer's own separators.
+        if( jo.get_need_separator() ) {
+            jo.write_separator();
         }
-        jo.end_array();
-        // How placed items lie, only for those with a stored pose: [uid, yaw, side]. Its own list, so a handle
-        // keeps its five numbers.
-        jo.member( "poses" );
-        jo.start_array();
-        for( const item_pile_view &p : sm.items ) {
-            for( const item_handle_view &h : p.handles ) {
-                if( h.yaw >= 0 ) {
-                    jo.start_array();
-                    jo.write( static_cast<int64_t>( h.uid ) );
-                    jo.write( static_cast<int>( h.yaw ) );
-                    jo.write( h.side ? 1 : 0 );
-                    jo.end_array();
-                }
-            }
-        }
-        jo.end_array();
-        // The furniture shelf placed items were put on, only for those with one stored: [uid, shelf].
-        jo.member( "shelves" );
-        jo.start_array();
-        for( const item_pile_view &p : sm.items ) {
-            for( const item_handle_view &h : p.handles ) {
-                if( h.shelf >= 0 ) {
-                    jo.start_array();
-                    jo.write( static_cast<int64_t>( h.uid ) );
-                    jo.write( static_cast<int>( h.shelf ) );
-                    jo.end_array();
-                }
-            }
-        }
-        jo.end_array();
-        // L8: piles with more items than handles listed: [tile, items not listed].
-        jo.member( "more" );
-        jo.start_array();
-        for( const item_pile_view &p : sm.items ) {
-            if( p.count > p.handles.size() ) {
-                jo.start_array();
-                jo.write( static_cast<int>( p.tile ) );
-                jo.write( static_cast<int64_t>( p.count - p.handles.size() ) );
-                jo.end_array();
-            }
-        }
-        jo.end_array();
-        // L8: what lies in containers next to the player: [container, uid, type, pocket]; containers cut short:
-        // [container, items left out].
-        jo.member( "inside" );
-        jo.start_array();
-        for( const inside_view &v : sm.inside ) {
-            jo.start_array();
-            jo.write( static_cast<int64_t>( v.container ) );
-            jo.write( static_cast<int64_t>( v.uid ) );
-            jo.write( static_cast<int64_t>( v.type ) );
-            jo.write( static_cast<int>( v.pocket ) );
-            jo.end_array();
-        }
-        jo.end_array();
-        jo.member( "inside_more" );
-        jo.start_array();
-        for( const std::pair<uint64_t, uint32_t> &m : sm.inside_more ) {
-            jo.start_array();
-            jo.write( static_cast<int64_t>( m.first ) );
-            jo.write( static_cast<int64_t>( m.second ) );
-            jo.end_array();
-        }
-        jo.end_array();
-        jo.member( "fields" );
-        jo.start_array();
-        for( const field_view &f : sm.fields ) {
-            used_field.insert( f.type );
-            jo.start_array();
-            jo.write( static_cast<int>( f.tile ) );
-            jo.write( static_cast<int64_t>( f.type ) );
-            jo.write( static_cast<int>( f.intensity ) );
-            jo.write( static_cast<int>( f.age_turns ) );
-            jo.end_array();
-        }
-        jo.end_array();
-        // C6: [tile, luminance, kind (0 terrain/furniture, 1 item, 2 field)]
-        jo.member( "lights" );
-        jo.start_array();
-        for( const light_view &l : sm.lights ) {
-            jo.start_array();
-            jo.write( static_cast<int>( l.tile ) );
-            jo.write( static_cast<int>( l.luminance ) );
-            jo.write( static_cast<int>( l.kind ) );
-            jo.end_array();
-        }
-        jo.end_array();
-        // L9: [tile, source, tool, fire, charges, lit (0/1)]
-        jo.member( "heat" );
-        jo.start_array();
-        for( const heat_view &h : sm.heat ) {
-            jo.start_array();
-            jo.write( static_cast<int>( h.tile ) );
-            jo.write( static_cast<int>( h.source ) );
-            jo.write( static_cast<int64_t>( h.tool ) );
-            jo.write( static_cast<int>( h.fire ) );
-            jo.write( static_cast<int64_t>( h.charges ) );
-            jo.write( h.lit ? 1 : 0 );
-            jo.end_array();
-        }
-        jo.end_array();
-        jo.member( "cookware" );
-        jo.start_array();
-        for( const cookware_view &cw : sm.cookware ) {
-            jo.start_object();
-            jo.member( "tile", static_cast<int>( cw.tile ) );
-            jo.member( "uid", static_cast<int64_t>( cw.uid ) );
-            jo.member( "type", static_cast<int64_t>( cw.type ) );
-            jo.member( "contents" );
-            jo.start_array();
-            for( const cookware_item_view &c : cw.contents ) {
-                jo.start_array();
-                jo.write( static_cast<int64_t>( c.uid ) );
-                jo.write( static_cast<int64_t>( c.type ) );
-                jo.write( static_cast<int64_t>( c.count ) );
-                jo.end_array();
-            }
-            jo.end_array();
-            jo.member( "craft_result", static_cast<int64_t>( cw.craft_result ) );
-            jo.member( "craft_recipe", cw.craft_recipe );
-            jo.member( "craft_progress", static_cast<int>( cw.craft_progress ) );
-            jo.end_object();
-        }
-        jo.end_array();
-        jo.end_object();
+        *jo.get_stream() << kept->text;
+        jo.set_need_separator();
     }
     jo.end_array();
 
