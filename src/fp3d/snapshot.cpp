@@ -917,6 +917,10 @@ void capture_vehicles( map &here, snapshot &s, std::vector<uint8_t> &vehicle_til
             pv.vpart = intern_id( id_kind::vpart, vp.info().id.str() );
             pv.hp_frac = clamp_u8( 255.0 * part.health_percent() );
             pv.state = ( part.open ? 1 : 0 ) | ( part.is_broken() ? 2 : 0 ) | ( part.enabled ? 4 : 0 );
+            const tripoint_rel_ms offset = vp.pos_bub( here ) - wv.pos;
+            pv.dx = static_cast<int8_t>( std::clamp( offset.x(), -max_part_offset, max_part_offset ) );
+            pv.dy = static_cast<int8_t>( std::clamp( offset.y(), -max_part_offset, max_part_offset ) );
+            pv.dz = static_cast<int8_t>( std::clamp( offset.z(), -max_part_offset, max_part_offset ) );
             vv.parts.push_back( pv );
         }
         s.vehicles.push_back( std::move( vv ) );
@@ -1634,6 +1638,9 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
             jo.write( static_cast<int64_t>( p.vpart ) );
             jo.write( static_cast<int>( p.hp_frac ) );
             jo.write( static_cast<int>( p.state ) );
+            jo.write( static_cast<int>( p.dx ) );
+            jo.write( static_cast<int>( p.dy ) );
+            jo.write( static_cast<int>( p.dz ) );
             jo.end_array();
         }
         jo.end_array();

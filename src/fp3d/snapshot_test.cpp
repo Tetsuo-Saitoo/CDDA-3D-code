@@ -4,6 +4,7 @@
 //
 // usage: fp3d-snapshot-test   (run from the cdda/ folder)
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <climits>
 #include <cmath>
@@ -46,6 +47,8 @@
 #include "type_id.h"
 #include "units.h"
 #include "vehicle.h"
+#include "vpart_position.h"
+#include "vpart_range.h"
 #include "weather.h"
 #include "weather_type.h"
 
@@ -924,6 +927,106 @@ int main()
             }
             guy->die( &here, nullptr );
             g->cleanup_dead();
+        }
+        {
+            // Where a vehicle's parts are: an L of four frames facing 0, 90 and 45 degrees. Each row's (dx, dy, dz)
+            // is the part's square from the vehicle's position as CDDA has it, and the map finds this vehicle on
+            // that square. (The client can't turn the mounts itself: CDDA steps along a ray around a pivot.)
+            const std::array<point_rel_ms, 4> mounts = { { point_rel_ms( 0, 0 ), point_rel_ms( 1, 0 ), point_rel_ms( 2, 0 ), point_rel_ms( 0, 1 ) } };
+            struct test_car {
+                const char *name;
+                units::angle dir;
+                tripoint_rel_ms at;
+                vehicle *veh = nullptr;
+            };
+            std::array<test_car, 3> cars = { {
+                    { "fp3d car 0", 0_degrees, tripoint_rel_ms( 9, 9, 0 ) },
+                    { "fp3d car 90", 90_degrees, tripoint_rel_ms( 9, -9, 0 ) },
+                    { "fp3d car 45", 45_degrees, tripoint_rel_ms( -9, 9, 0 ) }
+                }
+            };
+            for( test_car &c : cars ) {
+                const tripoint_bub_ms mid = u.pos_bub() + c.at;
+                for( int dx = -4; dx <= 4; dx++ ) {
+                    for( int dy = -4; dy <= 4; dy++ ) {
+                        const tripoint_bub_ms q = mid + tripoint_rel_ms( dx, dy, 0 );
+                        here.furn_set( q, furn_str_id::NULL_ID() );
+                        here.ter_set( q, ter_t_floor );
+                        here.i_clear( q );
+                    }
+                }
+                c.veh = here.add_vehicle( vehicle_prototype_none, mid, c.dir, 0, 0 );
+                if( c.veh != nullptr ) {
+                    for( const point_rel_ms &m : mounts ) {
+                        c.veh->install_part( here, m, vpart_frame );
+                    }
+                    c.veh->name = c.name;
+                    here.add_vehicle_to_cache( c.veh );
+                }
+            }
+            refresh_caches();
+            const std::shared_ptr<const fp3d::snapshot> parked = timed_capture( ms );
+            std::ostringstream parked_json;
+            fp3d::write_snapshot_json( parked_json, *parked, u.posz(), u.posz() );
+            for( const test_car &c : cars ) {
+                const fp3d::vehicle_view *view = nullptr;
+                for( const fp3d::vehicle_view &v : parked->vehicles ) {
+                    if( v.name == c.name ) {
+                        view = &v;
+                    }
+                }
+                std::string rows;
+                int right = 0;
+                int found_by_map = 0;
+                std::set<std::tuple<int, int, int>> squares;
+                size_t real_parts = 0;
+                if( view != nullptr && c.veh != nullptr ) {
+                    const tripoint_bub_ms origin = c.veh->pos_bub( here );
+                    for( const vpart_reference &vp : c.veh->get_all_parts() ) {
+                        if( real_parts < view->parts.size() ) {
+                            const fp3d::vehicle_part_view &row = view->parts[real_parts];
+                            const tripoint_rel_ms want = vp.pos_bub( here ) - origin;
+                            right += row.mount_x == vp.part().mount.x() && row.mount_y == vp.part().mount.y() &&
+                                     row.dx == want.x() && row.dy == want.y() && row.dz == want.z() ? 1 : 0;
+                            const optional_vpart_position there = here.veh_at( origin + tripoint_rel_ms( row.dx, row.dy,
+                                    row.dz ) );
+                            found_by_map += there && &there->vehicle() == c.veh ? 1 : 0;
+                            squares.emplace( row.dx, row.dy, row.dz );
+                            rows += " [" + std::to_string( row.mount_x ) + "," + std::to_string( row.mount_y ) + " -> " +
+                                    std::to_string( row.dx ) + "," + std::to_string( row.dy ) + "," +
+                                    std::to_string( row.dz ) + "]";
+                        }
+                        real_parts++;
+                    }
+                }
+                check( view != nullptr && real_parts == mounts.size() && view->parts.size() == real_parts &&
+                       right == static_cast<int>( real_parts ) && found_by_map == right &&
+                       squares.size() == real_parts, ( std::string( c.name ) + ": each part's square" ).c_str(),
+                       view == nullptr ? "vehicle not seen" : "face " + std::to_string( static_cast<int>( std::lround(
+                                   view->face_deg ) ) ) + " deg, mount -> dx,dy,dz:" + rows + "; " +
+                       std::to_string( found_by_map ) + " found there by the map" );
+            }
+            // The JSON row: the five fields older bridges sent, then dx, dy, dz.
+            bool row_written = false;
+            for( const fp3d::vehicle_view &v : parked->vehicles ) {
+                if( v.name == "fp3d car 45" && !v.parts.empty() ) {
+                    const fp3d::vehicle_part_view &row = v.parts.back();
+                    const std::string want = "[" + std::to_string( row.mount_x ) + "," + std::to_string( row.mount_y ) +
+                                             "," + std::to_string( row.vpart ) + "," + std::to_string( row.hp_frac ) +
+                                             "," + std::to_string( row.state ) + "," + std::to_string( row.dx ) + "," +
+                                             std::to_string( row.dy ) + "," + std::to_string( row.dz ) + "]";
+                    const size_t named_at = parked_json.str().find( "\"name\":\"fp3d car 45\"" );
+                    row_written = named_at != std::string::npos &&
+                                  parked_json.str().find( want, named_at ) != std::string::npos;
+                }
+            }
+            check( row_written, "a part's JSON row: mount, vpart, hp, state, then dx, dy, dz" );
+            for( const test_car &c : cars ) {
+                if( c.veh != nullptr ) {
+                    here.destroy_vehicle( c.veh );
+                }
+            }
+            refresh_caches();
         }
     } catch( const std::exception &e ) {
         std::printf( "error: %s\n", e.what() );
