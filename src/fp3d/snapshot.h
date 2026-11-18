@@ -194,6 +194,7 @@ struct submap_view {
     // kept: a view never changes after its capture. Only write_snapshot_json touches it (under its own mutex).
     struct written_text {
         std::string text;
+        uint32_t hash = 0;                        // 32-bit FNV-1a of `text`
         std::vector<uint32_t> ter;                // each list unique and sorted
         std::vector<uint32_t> furn;
         std::vector<uint32_t> trap;
@@ -459,6 +460,29 @@ std::shared_ptr<const snapshot> latest_snapshot();
 // snapshots); `reuse_submap_text` false writes every submap anew, for the check that both give the same bytes.
 void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z_max,
                           bool reuse_submap_text = true );
+
+// For a host whose client keeps the snapshot it read last and wants only what changed since. Writes the newest
+// snapshot for the levels `z_below` / `z_above` around the player (clamped; the captures are told as with
+// want_snapshot_levels) as write_snapshot_json does, with one more member before "submaps":
+//   "submap_keys": [[x, y, z, revision, detail_revision, hash], ...], a row for every submap of those levels in
+//   the snapshot's order; hash is the 32-bit FNV-1a of the bytes of that submap's object in "submaps".
+// `since` is the seq of the snapshot the client holds (0 = none). It is only ever looked up among the last
+// `served_snapshots_kept` snapshots this call wrote. When it is one of them, written for the same levels, with
+// the same bubble origin and the player on the same level, the JSON is a delta:
+//   "base": since, before "submap_keys"; and "submaps" has only the objects whose bytes differ from the base's
+//   object at that position, or that the base has none for, and always the ones holding the player's square
+//   or one next to it, now and in the base.
+// Otherwise it is a full snapshot: no "base", every object. Everything outside "submaps" is whole each time.
+// False (nothing written) before the first publish. Any thread.
+constexpr size_t served_snapshots_kept = 4;
+struct client_snapshot_info {
+    uint64_t seq = 0;                             // the snapshot written
+    uint64_t base = 0;                            // the one it is a delta against; 0 = a full snapshot
+    int submaps = 0;                              // key rows
+    int bodies = 0;                               // objects in "submaps"
+};
+bool write_client_snapshot_json( std::ostream &out, int z_below, int z_above, uint64_t since,
+                                 client_snapshot_info &info );
 
 // Character sheet (G4): the character screen's data (CDDA's character sheet) for a character query (bridge.h).
 // Read-only; runs on the sim thread. All text is game data (mods): color tags, line breaks and control characters
