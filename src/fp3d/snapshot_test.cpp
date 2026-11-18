@@ -18,6 +18,8 @@
 #include <sstream>
 #include <string>
 #include <tuple>
+#include <utility>
+#include <vector>
 
 #include "avatar.h"
 #include "cached_options.h"
@@ -178,6 +180,399 @@ void refresh_caches()
         here.set_outside_cache_dirty( z );
     }
     here.build_map_cache( get_avatar().posz() );
+}
+
+// ---- write_client_snapshot_json, read the way a client would ----
+
+// A snapshot JSON cut at its "submaps" array: the text before it, each object's text, the text from its "]" on.
+struct cut_json {
+    bool ok = false;
+    std::string before;
+    std::vector<std::string> bodies;
+    std::string after;
+};
+
+cut_json cut_at_submaps( const std::string &j )
+{
+    cut_json out;
+    const std::string tag = "\"submaps\":[";
+    const size_t at = j.find( tag );
+    if( at == std::string::npos ) {
+        return out;
+    }
+    size_t i = at + tag.size();
+    while( i < j.size() && j[i] != ']' ) {
+        if( j[i] == ',' ) {
+            i++;
+            continue;
+        }
+        if( j[i] != '{' ) {
+            return out;
+        }
+        const size_t start = i;
+        int depth = 0;
+        bool in_string = false;
+        for( ; i < j.size(); i++ ) {
+            const char c = j[i];
+            if( in_string ) {
+                if( c == '\\' ) {
+                    i++;
+                } else if( c == '"' ) {
+                    in_string = false;
+                }
+            } else if( c == '"' ) {
+                in_string = true;
+            } else if( c == '{' || c == '[' ) {
+                depth++;
+            } else if( ( c == '}' || c == ']' ) && --depth == 0 ) {
+                i++;
+                break;
+            }
+        }
+        out.bodies.push_back( j.substr( start, i - start ) );
+    }
+    out.ok = i < j.size();
+    out.before = j.substr( 0, at );
+    out.after = j.substr( std::min( i, j.size() ) );
+    return out;
+}
+
+uint32_t fnv1a( const std::string &text )
+{
+    uint32_t hash = 2166136261u;
+    for( const char c : text ) {
+        hash = ( hash ^ static_cast<uint8_t>( c ) ) * 16777619u;
+    }
+    return hash;
+}
+
+using key_row = std::array<long long, 6>;         // x, y, z, revision, detail_revision, hash
+
+// The first five numbers of a submap object's text: its position and revisions.
+bool body_head( const std::string &body, key &pos, long long &revision, long long &detail )
+{
+    int x = 0;
+    int y = 0;
+    int z = 0;
+    if( std::sscanf( body.c_str(), "{\"pos\":[%d,%d,%d],\"revision\":%lld,\"detail_revision\":%lld", &x, &y, &z,
+                     &revision, &detail ) != 5 ) {
+        return false;
+    }
+    pos = key{ x, y, z };
+    return true;
+}
+
+// What write_client_snapshot_json wrote, taken apart.
+struct client_json {
+    bool ok = false;
+    long long base = -1;                          // -1: no "base", a full snapshot
+    std::vector<key_row> rows;
+    cut_json cut;
+    std::string head;                             // cut.before without "base" and "submap_keys"
+};
+
+client_json read_client_json( const std::string &j )
+{
+    client_json out;
+    out.cut = cut_at_submaps( j );
+    const std::string keys_tag = "\"submap_keys\":[";
+    const size_t keys_at = out.cut.before.rfind( keys_tag );
+    if( !out.cut.ok || keys_at == std::string::npos ) {
+        return out;
+    }
+    size_t head_end = keys_at;
+    const std::string base_tag = "\"base\":";
+    const size_t base_at = out.cut.before.rfind( base_tag, keys_at );
+    if( base_at != std::string::npos ) {
+        // Only a "base" member right before the key rows counts: digits, then the comma.
+        const std::string number = out.cut.before.substr( base_at + base_tag.size(),
+                                   keys_at - base_at - base_tag.size() );
+        if( number.size() >= 2 && number.size() <= 19 && number.back() == ',' &&
+            number.find_first_not_of( "0123456789" ) == number.size() - 1 ) {
+            out.base = std::atoll( number.c_str() );
+            head_end = base_at;
+        }
+    }
+    out.head = out.cut.before.substr( 0, head_end );
+    const std::string list = out.cut.before.substr( keys_at + keys_tag.size() );
+    std::vector<long long> numbers;
+    for( size_t i = 0; i < list.size(); ) {
+        const char c = list[i];
+        if( c == '-' || ( c >= '0' && c <= '9' ) ) {
+            char *end = nullptr;
+            numbers.push_back( std::strtoll( list.c_str() + i, &end, 10 ) );
+            i = static_cast<size_t>( end - list.c_str() );
+        } else if( c == '[' || c == ']' || c == ',' ) {
+            i++;
+        } else {
+            return out;
+        }
+    }
+    if( numbers.size() % 6 != 0 ) {
+        return out;
+    }
+    for( size_t n = 0; n < numbers.size(); n += 6 ) {
+        out.rows.push_back( key_row{ numbers[n], numbers[n + 1], numbers[n + 2], numbers[n + 3], numbers[n + 4],
+                                     numbers[n + 5] } );
+    }
+    out.ok = true;
+    return out;
+}
+
+// A client that keeps the last snapshot's submap objects and puts the next one together from a delta, with the
+// checks a real one makes. `why` says what didn't add up.
+struct test_client {
+    uint64_t seq = 0;
+    std::map<key, std::pair<std::string, key_row>> held;
+
+    bool take( const client_json &j, uint64_t new_seq, std::vector<std::string> &bodies, std::string &why ) {
+        bodies.clear();
+        if( !j.ok ) {
+            why = "not the expected JSON";
+            return false;
+        }
+        if( j.base >= 0 && ( seq == 0 || static_cast<uint64_t>( j.base ) != seq ) ) {
+            why = "base " + std::to_string( j.base ) + " is not the held seq " + std::to_string( seq );
+            return false;
+        }
+        std::map<key, const std::string *> sent;
+        for( const std::string &body : j.cut.bodies ) {
+            key pos;
+            long long revision = 0;
+            long long detail = 0;
+            if( !body_head( body, pos, revision, detail ) || !sent.emplace( pos, &body ).second ) {
+                why = "a body without a position, or a position twice";
+                return false;
+            }
+        }
+        std::map<key, std::pair<std::string, key_row>> next;
+        size_t used = 0;
+        for( const key_row &row : j.rows ) {
+            const key pos{ static_cast<int>( row[0] ), static_cast<int>( row[1] ), static_cast<int>( row[2] ) };
+            if( next.count( pos ) != 0 || row[5] < 0 || row[5] > 0xffffffffLL ) {
+                why = "a key row twice, or a hash out of range";
+                return false;
+            }
+            const auto body = sent.find( pos );
+            if( body != sent.end() ) {
+                key at;
+                long long revision = 0;
+                long long detail = 0;
+                body_head( *body->second, at, revision, detail );
+                if( revision != row[3] || detail != row[4] || fnv1a( *body->second ) != row[5] ) {
+                    why = "a body's revisions or hash differ from its key row";
+                    return false;
+                }
+                next.emplace( pos, std::make_pair( *body->second, row ) );
+                used++;
+            } else {
+                const auto old = held.find( pos );
+                if( j.base < 0 || old == held.end() || old->second.second != row ) {
+                    why = "no body, and the held one is missing or has another key row";
+                    return false;
+                }
+                next.emplace( pos, old->second );
+            }
+            bodies.push_back( next.at( pos ).first );
+        }
+        if( used != sent.size() ) {
+            why = "a body without a key row";
+            return false;
+        }
+        held = std::move( next );
+        seq = new_seq;
+        return true;
+    }
+};
+
+// write_client_snapshot_json over a short walk through what changes between snapshots: whatever it leaves out,
+// the client ends up with exactly the full snapshot.
+void check_client_snapshots()
+{
+    map &here = get_map();
+    avatar &u = get_avatar();
+    test_client client;
+    struct round_result {
+        bool ok = false;                          // written, taken by the client, and equal to the full JSON
+        fp3d::client_snapshot_info info;
+        std::string why;
+        size_t bytes = 0;
+        size_t full_bytes = 0;
+        std::set<key> sent;                       // positions of the bodies in the JSON
+    };
+    // Asks as a client holding `since`, takes the answer and compares with write_snapshot_json's text.
+    const auto ask = [&]( uint64_t since ) {
+        round_result r;
+        std::ostringstream out;
+        if( !fp3d::write_client_snapshot_json( out, 1, 1, since, r.info ) ) {
+            r.why = "nothing written";
+            return r;
+        }
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        const int pz = s->player.pos.z;
+        std::ostringstream full_out;
+        fp3d::write_snapshot_json( full_out, *s, std::max( -OVERMAP_DEPTH, pz - 1 ), std::min( OVERMAP_HEIGHT,
+                                   pz + 1 ) );
+        const cut_json full = cut_at_submaps( full_out.str() );
+        const client_json got = read_client_json( out.str() );
+        r.bytes = out.str().size();
+        r.full_bytes = full_out.str().size();
+        for( const std::string &body : got.cut.bodies ) {
+            key pos;
+            long long revision = 0;
+            long long detail = 0;
+            if( body_head( body, pos, revision, detail ) ) {
+                r.sent.insert( pos );
+            }
+        }
+        std::vector<std::string> bodies;
+        if( s->seq != r.info.seq || static_cast<int>( got.rows.size() ) != r.info.submaps ||
+            static_cast<int>( got.cut.bodies.size() ) != r.info.bodies ||
+            got.base != ( r.info.base == 0 ? -1 : static_cast<long long>( r.info.base ) ) ) {
+            r.why = "the counts or the base differ from what the call reported";
+        } else if( !client.take( got, s->seq, bodies, r.why ) ) {
+            // r.why is set
+        } else if( !full.ok || bodies != full.bodies ) {
+            r.why = "the submaps put together differ from the full snapshot's";
+        } else if( got.head != full.before || got.cut.after != full.after ) {
+            r.why = "the rest of the JSON differs from the full snapshot's";
+        } else {
+            r.ok = true;
+        }
+        return r;
+    };
+    const auto capture = [&]() {
+        refresh_caches();
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::capture_snapshot();
+        fp3d::publish_snapshot( s );
+        return s;
+    };
+    const auto told = []( const round_result & r ) {
+        return ( r.why.empty() ? std::string() : r.why + "; " ) + ( r.info.base == 0 ? "full" : "delta" ) + ", " +
+               std::to_string( r.info.bodies ) + " of " + std::to_string( r.info.submaps ) + " submaps, " +
+               std::to_string( r.bytes / 1024 ) + " of " + std::to_string( r.full_bytes / 1024 ) + " KB";
+    };
+    const auto submap_of = []( int square ) {
+        return square >= 0 ? square / fp3d::sm_size : -( ( fp3d::sm_size - 1 - square ) / fp3d::sm_size );
+    };
+    // The submaps that hold the squares on and around the player's.
+    const auto around = [&]( const fp3d::snapshot & s, std::set<key> &out ) {
+        for( int dy = -1; dy <= 1; dy++ ) {
+            for( int dx = -1; dx <= 1; dx++ ) {
+                out.insert( key{ submap_of( s.player.pos.x + dx ), submap_of( s.player.pos.y + dy ),
+                                 s.player.pos.z } );
+            }
+        }
+    };
+
+    fp3d::publish_snapshot( nullptr );
+    fp3d::client_snapshot_info none;
+    std::ostringstream nothing;
+    const bool refused = !fp3d::write_client_snapshot_json( nothing, 1, 1, 0, none ) && nothing.str().empty();
+    check( refused, "client snapshot: nothing before the first publish" );
+
+    // Nothing held: a full snapshot, with a key row for every submap.
+    const std::shared_ptr<const fp3d::snapshot> first = capture();
+    const round_result full = ask( 0 );
+    check( full.ok && full.info.base == 0 && full.info.submaps > 0 && full.info.bodies == full.info.submaps,
+           "client snapshot: nothing held, a full one with key rows", told( full ) );
+
+    // The same snapshot again: a delta with only the submaps around the player.
+    const round_result same = ask( first->seq );
+    std::set<key> surroundings;
+    around( *first, surroundings );
+    check( same.ok && same.info.base == first->seq && same.sent == surroundings && same.info.submaps == full.info.submaps,
+           "client snapshot: nothing changed, only the player's surroundings", told( same ) );
+
+    // A wall changes a few submaps away: its submap comes, most others don't.
+    const tripoint_bub_ms away = u.pos_bub() + tripoint_rel_ms( 3 * SEEX, 0, 0 );
+    const ter_id was = here.ter( away );
+    here.ter_set( away, was == ter_t_wall.id() ? ter_t_floor.id() : ter_t_wall.id() );
+    const tripoint_abs_sm away_sm = project_to<coords::sm>( here.get_abs( away ) );
+    const std::shared_ptr<const fp3d::snapshot> walled = capture();
+    const round_result wall = ask( client.seq );
+    check( wall.ok && wall.info.base == first->seq &&
+           wall.sent.count( key{ away_sm.x(), away_sm.y(), away_sm.z() } ) == 1 &&
+           wall.info.bodies < wall.info.submaps, "client snapshot: a changed submap comes with the delta",
+           told( wall ) );
+
+    // A step: the submaps around the player before and after it come, changed or not.
+    u.setpos( here, u.pos_bub() + tripoint_rel_ms( 1, 0, 0 ) );
+    const std::shared_ptr<const fp3d::snapshot> stepped = capture();
+    const round_result step = ask( client.seq );
+    std::set<key> both;
+    around( *walled, both );
+    around( *stepped, both );
+    bool both_sent = true;
+    for( const key &k : both ) {
+        both_sent = both_sent && step.sent.count( k ) == 1;
+    }
+    check( step.ok && step.info.base == walled->seq && both_sent,
+           "client snapshot: a step, the player's surroundings before and after", told( step ) );
+
+    // Half a day later: whatever the light and the clock changed, the client still ends up right.
+    calendar::turn += 12_hours;
+    capture();
+    const round_result night = ask( client.seq );
+    check( night.ok && night.info.base == stepped->seq, "client snapshot: half a day later", told( night ) );
+
+    // A seq the client can't hold: one never written here, one made up, one written too long ago.
+    const std::shared_ptr<const fp3d::snapshot> unseen = capture();
+    capture();
+    const round_result never = ask( unseen->seq );
+    const round_result made_up = ask( fp3d::latest_snapshot()->seq + 1000 );
+    check( never.ok && never.info.base == 0 && made_up.ok && made_up.info.base == 0,
+           "client snapshot: an unknown seq gets a full one", told( never ) );
+    for( size_t i = 0; i < fp3d::served_snapshots_kept; i++ ) {
+        capture();
+        ask( client.seq );
+    }
+    const uint64_t held_seq = client.seq;
+    const round_result stale = ask( first->seq );
+    const round_result current = ask( held_seq );
+    check( stale.ok && stale.info.base == 0 && current.ok && current.info.base == held_seq,
+           "client snapshot: an old seq gets a full one, the held one a delta", told( stale ) );
+
+    // Other levels asked for than the held snapshot was written with: a full one.
+    std::ostringstream wide_out;
+    fp3d::client_snapshot_info wide;
+    const bool wide_written = fp3d::write_client_snapshot_json( wide_out, 2, 1, client.seq, wide );
+    check( wide_written && wide.base == 0 && wide.submaps > 0 && wide.bodies == wide.submaps,
+           "client snapshot: other levels than before get a full one",
+           std::to_string( wide.bodies ) + " of " + std::to_string( wide.submaps ) );
+
+    // A map shift: a full one, and deltas again after it.
+    ask( 0 );
+    u.setpos( here, u.pos_bub() + tripoint_rel_ms( 2 * SEEX, 0, 0 ) );
+    g->update_map( u );
+    const std::shared_ptr<const fp3d::snapshot> shifted = capture();
+    const round_result shift = ask( client.seq );
+    capture();
+    const round_result after_shift = ask( client.seq );
+    check( shift.ok && shift.info.base == 0 && shift.info.bodies == shift.info.submaps && after_shift.ok &&
+           after_shift.info.base == shifted->seq && after_shift.info.bodies < after_shift.info.submaps,
+           "client snapshot: a map shift gets a full one, then deltas again", told( shift ) + "; then " +
+           told( after_shift ) );
+
+    // The player on another level: a full one.
+    const int level_before = u.posz();
+    g->vertical_shift( level_before + 1 );
+    const std::shared_ptr<const fp3d::snapshot> upstairs = capture();
+    const round_result level = ask( client.seq );
+    check( upstairs->player.pos.z == level_before + 1 && level.ok && level.info.base == 0 &&
+           level.info.bodies == level.info.submaps, "client snapshot: another level gets a full one",
+           told( level ) );
+    g->vertical_shift( level_before );
+    capture();
+
+    // After the snapshots were cleared nothing from before is a base.
+    const uint64_t before_clear = client.seq;
+    fp3d::publish_snapshot( nullptr );
+    capture();
+    const round_result cleared = ask( before_clear );
+    check( cleared.ok && cleared.info.base == 0, "client snapshot: nothing from before a clear is a base",
+           told( cleared ) );
+    fp3d::want_all_snapshot_levels();
 }
 
 const fp3d::creature_view *find_monster( const fp3d::snapshot &s, uint32_t type )
@@ -1203,6 +1598,7 @@ int main()
             }
             refresh_caches();
         }
+        check_client_snapshots();
     } catch( const std::exception &e ) {
         std::printf( "error: %s\n", e.what() );
         return EXIT_FAILURE;

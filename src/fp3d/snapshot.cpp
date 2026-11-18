@@ -5,6 +5,7 @@
 #include <climits>
 #include <cmath>
 #include <cstdint>
+#include <deque>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -116,6 +117,13 @@ capture_state state;
 
 std::mutex latest_mutex;
 std::shared_ptr<const snapshot> latest;
+// What write_client_snapshot_json wrote last, oldest first, each with the levels it was written for.
+struct served_snapshot {
+    std::shared_ptr<const snapshot> s;
+    int z_min = 0;
+    int z_max = 0;
+};
+std::deque<served_snapshot> served;
 
 // want_snapshot_levels: levels below and above the player's that a capture takes; -1 = all of them.
 std::atomic<int> want_below{ -1 };
@@ -1302,6 +1310,9 @@ void publish_snapshot( std::shared_ptr<const snapshot> s )
     if( s && latest && s->seq < latest->seq ) {
         return;
     }
+    if( !s ) {
+        served.clear();
+    }
     latest = std::move( s );
 }
 
@@ -1502,6 +1513,11 @@ static std::shared_ptr<const submap_view::written_text> written_submap( const su
     JsonOut jo( text );
     write_submap( jo, sm, fields );
     made->text = text.str();
+    uint32_t hash = 2166136261u;
+    for( const char c : made->text ) {
+        hash = ( hash ^ static_cast<uint8_t>( c ) ) * 16777619u;
+    }
+    made->hash = hash;
     const auto unique = []( const std::array<uint32_t, sm_tiles> &ids ) {
         std::vector<uint32_t> out( ids.begin(), ids.end() );
         std::sort( out.begin(), out.end() );
@@ -1519,8 +1535,10 @@ static std::shared_ptr<const submap_view::written_text> written_submap( const su
     return sm.written;
 }
 
-void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z_max,
-                          bool reuse_submap_text )
+// write_snapshot_json's work. `keys` adds "submap_keys"; with `base` the JSON is a delta against that snapshot
+// (the rules are with write_client_snapshot_json in snapshot.h). `info`, when given, gets the counts.
+static void write_snapshot( std::ostream &out, const snapshot &s, int z_min, int z_max, bool reuse_submap_text,
+                            bool keys, const snapshot *base, client_snapshot_info *info )
 {
     std::set<uint32_t> used_ter;
     std::set<uint32_t> used_furn;
@@ -1739,6 +1757,51 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     jo.member( "sheltered", env.sheltered );
     jo.end_object();
 
+    // A delta leaves out the objects its base has with the same bytes. The ones holding the player's square or
+    // one next to it, now and in the base, always go: what a submap lists near the player depends on where the
+    // player stands.
+    std::map<sm_key, const submap_view *> base_views;
+    std::set<sm_key> by_player;
+    if( base != nullptr ) {
+        for( const std::shared_ptr<const submap_view> &smp : base->submaps ) {
+            base_views[sm_key{ smp->pos.x, smp->pos.y, smp->pos.z }] = smp.get();
+        }
+        const auto submap_of = []( int square ) {
+            return square >= 0 ? square / sm_size : -( ( sm_size - 1 - square ) / sm_size );
+        };
+        for( const ui_point &at : { s.player.pos, base->player.pos } ) {
+            for( int dy = -1; dy <= 1; dy++ ) {
+                for( int dx = -1; dx <= 1; dx++ ) {
+                    by_player.insert( sm_key{ submap_of( at.x + dx ), submap_of( at.y + dy ), at.z } );
+                }
+            }
+        }
+    }
+    int rows = 0;
+    int bodies = 0;
+    if( keys ) {
+        if( base != nullptr ) {
+            jo.member( "base", static_cast<int64_t>( base->seq ) );
+        }
+        jo.member( "submap_keys" );
+        jo.start_array();
+        for( const std::shared_ptr<const submap_view> &smp : s.submaps ) {
+            const submap_view &sm = *smp;
+            if( sm.pos.z < z_min || sm.pos.z > z_max ) {
+                continue;
+            }
+            jo.start_array();
+            jo.write( sm.pos.x );
+            jo.write( sm.pos.y );
+            jo.write( sm.pos.z );
+            jo.write( static_cast<int64_t>( sm.revision ) );
+            jo.write( static_cast<int64_t>( sm.detail_revision ) );
+            jo.write( static_cast<int64_t>( written_submap( sm )->hash ) );
+            jo.end_array();
+            rows++;
+        }
+        jo.end_array();
+    }
     jo.member( "submaps" );
     jo.start_array();
     for( const std::shared_ptr<const submap_view> &smp : s.submaps ) {
@@ -1751,13 +1814,24 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
             used_furn.insert( sm.furn.begin(), sm.furn.end() );
             used_trap.insert( sm.trap.begin(), sm.trap.end() );
             write_submap( jo, sm, used_field );
+            bodies++;
             continue;
         }
         const std::shared_ptr<const submap_view::written_text> kept = written_submap( sm );
+        // The id names are for every submap of the levels, also the ones a delta leaves out.
         used_ter.insert( kept->ter.begin(), kept->ter.end() );
         used_furn.insert( kept->furn.begin(), kept->furn.end() );
         used_trap.insert( kept->trap.begin(), kept->trap.end() );
         used_field.insert( kept->field.begin(), kept->field.end() );
+        const sm_key at{ sm.pos.x, sm.pos.y, sm.pos.z };
+        if( base != nullptr && by_player.count( at ) == 0 ) {
+            const auto had = base_views.find( at );
+            if( had != base_views.end() &&
+                ( had->second == &sm || written_submap( *had->second )->text == kept->text ) ) {
+                continue;
+            }
+        }
+        bodies++;
         // The object's text as write_submap gave it, between the writer's own separators.
         if( jo.get_need_separator() ) {
             jo.write_separator();
@@ -1835,6 +1909,60 @@ void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z
     }
     jo.end_object();
     jo.end_object();
+    if( info != nullptr ) {
+        info->submaps = rows;
+        info->bodies = bodies;
+    }
+}
+
+void write_snapshot_json( std::ostream &out, const snapshot &s, int z_min, int z_max,
+                          bool reuse_submap_text )
+{
+    write_snapshot( out, s, z_min, z_max, reuse_submap_text, false, nullptr, nullptr );
+}
+
+bool write_client_snapshot_json( std::ostream &out, int z_below, int z_above, uint64_t since,
+                                 client_snapshot_info &info )
+{
+    info = client_snapshot_info();
+    const int levels = OVERMAP_DEPTH + OVERMAP_HEIGHT;
+    z_below = std::clamp( z_below, 0, levels );
+    z_above = std::clamp( z_above, 0, levels );
+    want_snapshot_levels( z_below, z_above );
+    std::shared_ptr<const snapshot> s;
+    std::shared_ptr<const snapshot> base;
+    int z_min = 0;
+    int z_max = 0;
+    {
+        std::lock_guard<std::mutex> lk( latest_mutex );
+        s = latest;
+        if( !s ) {
+            return false;
+        }
+        const int pz = s->player.pos.z;
+        z_min = std::max( -OVERMAP_DEPTH, pz - z_below );
+        z_max = std::min( OVERMAP_HEIGHT, pz + z_above );
+        // `since` is the client's word. It only picks one of the snapshots written here before, and that one is
+        // used only when the client can hold exactly its submaps for these levels.
+        for( const served_snapshot &old : served ) {
+            if( since != 0 && old.s->seq == since && old.s->seq <= s->seq && old.z_min == z_min &&
+                old.z_max == z_max && old.s->bubble_origin.x == s->bubble_origin.x &&
+                old.s->bubble_origin.y == s->bubble_origin.y && old.s->player.pos.z == pz ) {
+                base = old.s;
+            }
+        }
+        for( auto it = served.begin(); it != served.end(); ) {
+            it = it->s == s ? served.erase( it ) : std::next( it );
+        }
+        served.push_back( served_snapshot{ s, z_min, z_max } );
+        while( served.size() > served_snapshots_kept ) {
+            served.pop_front();
+        }
+    }
+    info.seq = s->seq;
+    info.base = base ? base->seq : 0;
+    write_snapshot( out, *s, z_min, z_max, true, true, base.get(), &info );
+    return true;
 }
 
 
