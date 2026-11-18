@@ -1470,6 +1470,39 @@ void observe()
             }
             break;
         }
+        case 37: {
+            // Gun mods, part 2: a red dot sight and an underbarrel shotgun put straight into the gun (CDDA's put_in,
+            // no skill or slot check), the shotgun loaded and marked as one that can't be unloaded; and no skill
+            // left, so the character couldn't put the sight back.
+            avatar &u = get_avatar();
+            if( item_location gun = u.get_wielded_item(); gun && gun->is_gun() ) {
+                gun->put_in( item( itype_id( "red_dot_sight" ) ), pocket_type::MOD );
+                item launcher( itype_id( "u_shotgun" ) );
+                launcher.ammo_set( launcher.ammo_default(), 2 );
+                launcher.set_flag( flag_NO_UNLOAD );
+                gun->put_in( launcher, pocket_type::MOD );
+            }
+            for( const char *skill : { "pistol", "gun", "shotgun" } ) {
+                u.set_skill_level( skill_id( skill ), 0 );
+                u.set_knowledge_level( skill_id( skill ), 0 );
+            }
+            break;
+        }
+        case 38: {
+            // Gun mods, part 2: the skills back, and a mod job set aside unfinished.
+            avatar &u = get_avatar();
+            for( const char *skill : { "pistol", "gun", "shotgun" } ) {
+                u.set_skill_level( skill_id( skill ), 6 );
+                u.set_knowledge_level( skill_id( skill ), 6 );
+            }
+            u.backlog.push_front( player_activity( gunmod_add_activity_actor( 100, "x" ) ) );
+            break;
+        }
+        case 39: {
+            // Gun mods, part 2: that job is gone.
+            get_avatar().backlog.clear();
+            break;
+        }
         case 35: {
             // Menus: three with the caller's choice on a disabled entry, on an enabled one, and with nothing
             // enabled. The driver reads each request's `selected` and cancels it.
@@ -3988,6 +4021,66 @@ static bool run_gunmod_checks()
     check( res.back && res.popups == 1 && res.menus == 1 && has( res.asked, "Attach your" ) && res.answers == 1 &&
            !res.done && has( res.why, "Never mind" ) && gun_now().mods.size() == 1,
            "a difficult mod: CDDA's tools menu, cancelled", show( res ) );
+    // Part 2. Scenes on the sim thread between the actions.
+    const auto scene = [&]( int number ) {
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return false;
+        }
+        hand_setup = number;
+        fp3d::queue_action( "no_such_action" );
+        at = fp3d::wait_request( 20000, at->id );
+        return at && at->timed;
+    };
+    const auto mod_on_gun = [&]( const std::string & type ) {
+        fp3d::item_ref found{ 0, 0 };
+        for( const fp3d::gun_mod_view &m : gun_now().mods ) {
+            if( fp3d::id_name( fp3d::id_kind::itype, m.type ) == type ) {
+                found = fp3d::item_ref{ m.uid, m.type };
+            }
+        }
+        return found;
+    };
+    if( !scene( 37 ) ) {
+        check( false, "scene 37", "" );
+        return false;
+    }
+    const fp3d::item_ref sight = mod_on_gun( "red_dot_sight" );
+    const fp3d::item_ref launcher = mod_on_gun( "u_shotgun" );
+    check( sight.uid != 0 && launcher.uid != 0 && gun_now().mods.size() == 3, "scene 37: a sight and a launcher on the gun",
+           std::to_string( gun_now().mods.size() ) + " mods" );
+    // The character couldn't put the sight back: CDDA asks first. No: it stays.
+    res = run( fp3d::item_op::mod_remove, sight, gun, false, -1 );
+    check( res.back && res.popups == 1 && has( res.asked, "lacking the skills needed to reattach" ) &&
+           res.answers == 1 && !res.done && has( res.why, "Never mind" ) && res.turns == 0 &&
+           mod_on_gun( "red_dot_sight" ).uid == sight.uid, "taking off a mod you couldn't put back: CDDA asks; no",
+           show( res ) );
+    // A loaded mod that can't be unloaded stays on, with a reason.
+    res = run( fp3d::item_op::mod_remove, launcher, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && has( res.why, "can't unload" ) && res.turns == 0 &&
+           mod_on_gun( "u_shotgun" ).uid == launcher.uid, "a mod that can't be unloaded is not taken off",
+           show( res ) );
+    // An unfinished mod job: nothing else is done to the gun's mods.
+    if( !scene( 38 ) ) {
+        check( false, "scene 38", "" );
+        return false;
+    }
+    res = run( fp3d::item_op::mod_remove, sight, gun, true, -1 );
+    const result waiting_add = run( fp3d::item_op::mod_add, laser_a, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && has( res.why, "Finish the work" ) && res.popups == 0 &&
+           waiting_add.back && !waiting_add.done && has( waiting_add.why, "Finish the work" ) &&
+           gun_now().mods.size() == 3, "refused while a mod job is unfinished", show( res ) );
+    // That job gone and the skills back: no question, off in CDDA's time, into the pack.
+    if( !scene( 39 ) ) {
+        check( false, "scene 39", "" );
+        return false;
+    }
+    res = run( fp3d::item_op::mod_remove, sight, gun, true, -1 );
+    const std::vector<uint64_t> sights = carried_of( "red_dot_sight" );
+    check( res.back && res.answers == 1 && res.done && res.popups == 0 && res.turns >= 140 &&
+           mod_on_gun( "red_dot_sight" ).uid == 0 && gun_now().mods.size() == 2 &&
+           std::find( sights.begin(), sights.end(), sight.uid ) != sights.end(),
+           "with the skills, no question: taken off", show( res ) );
     return failed == 0;
 }
 

@@ -1426,13 +1426,15 @@ item_location named_wielded_gun( avatar &u, const item_ref &r )
     return gun && gun->is_gun() && matches( *gun, r ) ? gun : item_location();
 }
 
-// An earlier mod job that was interrupted waits in the backlog and finds its mod by its place among the gun's
-// mods: nothing may change those meanwhile.
+// A mod job that isn't finished (running, or set aside in the backlog) finds its mod by its place among the
+// gun's mods: nothing may change those meanwhile. CDDA's two mod activities can't be resumed, so this is a guard
+// more than a case that comes up.
 bool mod_job_waiting( const avatar &u )
 {
-    return std::any_of( u.backlog.begin(), u.backlog.end(), []( const player_activity & act ) {
+    const auto mod_job = []( const player_activity & act ) {
         return act.id() == ACT_GUNMOD_ADD || act.id() == ACT_GUNMOD_REMOVE;
-    } );
+    };
+    return mod_job( u.activity ) || std::any_of( u.backlog.begin(), u.backlog.end(), mod_job );
 }
 
 bool mod_add( avatar &u, const item_action &a )
@@ -1500,8 +1502,9 @@ bool mod_remove( avatar &u, const item_action &a )
     }
     const std::string name = mod.tname();
     if( !u.gunmod_remove( *gun, mod ) ) {
+        // CDDA's unload said why in the log; the result gets a line of its own.
         //~ %s: a gun mod's name
-        return refuse( u, string_format( _( "You can't unload the %s." ), name ) );
+        return refuse_quietly( string_format( _( "You can't unload the %s." ), name ) );
     }
     return true;
 }
