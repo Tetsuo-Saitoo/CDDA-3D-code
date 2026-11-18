@@ -24,6 +24,8 @@
 #include "debug.h"
 #include "enums.h"
 #include "flag.h"
+#include "fp3d/bridge.h" // FP3D:
+#include "fp3d/cheats.h" // FP3D:
 #include "game.h"
 #include "game_constants.h"
 #include "game_inventory.h"
@@ -369,6 +371,10 @@ bool avatar_action::move( avatar &you, map &m, const tripoint_rel_ms &d )
     if( creatures.creature_at( dest_loc ) ) {
         attacking = true;
     }
+    // FP3D: pushing past with the Unstoppable cheat (fp3d/cheats.h) is a step, not an attack
+    if( attacking && fp3d::active() && fp3d::pushes_past( you, dest_loc ) ) {
+        attacking = false;
+    }
 
     if( !you.move_effects( attacking ) ) {
         // move_effects determined we could not move, waste all moves
@@ -376,9 +382,16 @@ bool avatar_action::move( avatar &you, map &m, const tripoint_rel_ms &d )
         return false;
     }
 
+    // FP3D: the Unstoppable cheat (fp3d/cheats.h push_past): a hostile monster or enemy NPC in the way is pushed
+    // past instead of attacked.
+    const fp3d::push_result fp3d_push = fp3d::active() ? fp3d::push_past( you, dest_loc ) : fp3d::push_result::none;
+    if( fp3d_push == fp3d::push_result::refused || fp3d_push == fp3d::push_result::done ) { // FP3D:
+        return fp3d_push == fp3d::push_result::done; // FP3D:
+    } // FP3D:
+
     if( monster *const mon_ptr = creatures.creature_at<monster>( dest_loc, true ) ) {
         monster &critter = *mon_ptr;
-        if( critter.friendly == 0 &&
+        if( critter.friendly == 0 && fp3d_push == fp3d::push_result::none && // FP3D: not while pushing past
             !critter.has_effect( effect_pet ) ) {
             if( you.is_auto_moving() ) {
                 add_msg( m_warning, _( "Monster in the way.  Auto move canceled." ) );
@@ -414,8 +427,9 @@ bool avatar_action::move( avatar &you, map &m, const tripoint_rel_ms &d )
             }
             g->draw_hit_mon( dest_loc, critter, critter.is_dead() );
             return false;
-        } else if( critter.has_flag( mon_flag_IMMOBILE ) || critter.has_effect( effect_harnessed ) ||
-                   critter.has_effect( effect_ridden ) || critter.has_flag( json_flag_CANNOT_MOVE ) ) {
+        } else if( fp3d_push == fp3d::push_result::none && // FP3D: a hostile being pushed past is no pet
+                   ( critter.has_flag( mon_flag_IMMOBILE ) || critter.has_effect( effect_harnessed ) ||
+                     critter.has_effect( effect_ridden ) || critter.has_flag( json_flag_CANNOT_MOVE ) ) ) {
             add_msg( m_info, _( "You can't displace your %s." ), critter.name() );
             return false;
         }

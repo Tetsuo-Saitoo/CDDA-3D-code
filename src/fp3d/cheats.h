@@ -13,6 +13,9 @@
 //   stamina          DEBUG_STAMINA + DEBUG_CARDIO
 //   no_temperature   DEBUG_NOTEMP
 //   night_vision     DEBUG_NIGHTVISION (also reveals the map)
+//   unstoppable      avatar var `fp3d_cheat_unstoppable`: no grab holds the player once they act (break_grabs at the
+//                    start of every action, unstoppable_acts), and walking into a hostile monster or enemy NPC
+//                    pushes past it instead of attacking (push_past); attacks need the attack actions then
 // The test kit: a big backpack worn, a loaded pistol, shotgun and rifle with spare magazines and ammo, a machete,
 // tools, bandages, food and water; what doesn't fit lands at the avatar's feet.
 // Requests are applied in the main loop between turns (bridge.h job_action), also while paused.
@@ -23,14 +26,16 @@
 #include <string>
 #include <vector>
 
+#include "coordinates.h"
 #include "fp3d/bridge.h"
 
 class avatar;
+class Character;
 
 namespace fp3d
 {
 enum class cheat : uint8_t {
-    invincible, no_needs, no_weight_limit, unlimited_ammo, stamina, no_temperature, night_vision, count
+    invincible, no_needs, no_weight_limit, unlimited_ammo, stamina, no_temperature, night_vision, unstoppable, count
 };
 constexpr size_t cheat_count = static_cast<size_t>( cheat::count );
 const char *cheat_name( cheat c );
@@ -59,8 +64,11 @@ bool request_test_kit();
 // clear sky, test_range.h keep_range_weather). `wind` holds the wind speed (mph, 0..max_cheat_wind); -1 lets the
 // game decide (a range game holds it still). The temperature is never touched. Refused in a world whose weather
 // never changes (CDDA's ETERNAL_WEATHER option). CDDA saves neither: a loaded game decides again.
+// break_grabs is the one-shot "Break all grabs", in any game while cheats are allowed (the unstoppable cheat on or
+// off): every grab on the player and their mount lets go (break_grabs below); done also when nothing held them.
 enum class range_op_kind : uint8_t {
-    spawn_item, spawn_monster, teleport, time_of_day, advance, ai_frozen, heal, rebuild_zone, point_teleport, weather
+    spawn_item, spawn_monster, teleport, time_of_day, advance, ai_frozen, heal, rebuild_zone, point_teleport, weather,
+    break_grabs
 };
 constexpr size_t max_weather_id = 64;
 constexpr int max_cheat_wind = 100;    // mph, about 45 m/s
@@ -107,6 +115,29 @@ void cheats_turn( avatar &u );
 // Sim side: copies the cheat state for the client (publish_held calls it: before every request and once per turn).
 void publish_cheats( const avatar &u );
 bool cheat_on( const avatar &u, cheat c );
+
+// Sim side: every grab on `u` lets go the way CDDA's own break-free lets go when its roll is won
+// (Character::try_remove_grab): the grabber next to them drops that body part (monster::remove_grab) and the
+// grabbed effect goes; a grab with no grabber next to them just goes, as do the grabs on their mount. Returns how
+// many went.
+int break_grabs( Character &u );
+// Sim side, at the start of each action the player takes (handle_action; not a timeout): break_grabs while
+// unstoppable is on.
+void unstoppable_acts( avatar &u );
+// Sim side, from avatar_action::move as the player steps into `dest` (next to them). With unstoppable on, a
+// hostile monster or an enemy NPC there is pushed past: the player takes its square at a normal step's cost and
+// it takes the square they left, else the nearest free square next to it; no attack.
+enum class push_result : uint8_t {
+    none,      // unstoppable off, or nothing hostile there: CDDA's own step (a bump attack on a hostile)
+    refused,   // it can't be pushed (ridden, no room, the step failed): said why
+    clear,     // the step goes on without attacking: CDDA's displacement takes the monster to the square left,
+               // or it was moved aside already
+    done       // the player swapped places with the NPC already (game::swap_critters, a normal step)
+};
+push_result push_past( avatar &u, const tripoint_bub_ms &dest );
+// Whether push_past would try (unstoppable on, a step on one level, a hostile monster or enemy NPC there); changes
+// nothing. avatar_action::move asks it to treat the step as a move, not an attack (move_effects).
+bool pushes_past( const avatar &u, const tripoint_bub_ms &dest );
 } // namespace fp3d
 
 #endif // CATA_SRC_FP3D_CHEATS_H

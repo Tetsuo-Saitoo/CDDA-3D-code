@@ -11,6 +11,7 @@
 
 #include "action.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/cheats.h" // FP3D:
 #include "fp3d/gun_faults.h" // FP3D:
 #include "fp3d/hands.h" // FP3D:
 #include "fp3d/held.h" // FP3D:
@@ -3142,6 +3143,10 @@ bool game::handle_action()
         ctxt = get_player_input( action );
     }
 
+    // FP3D: the Unstoppable cheat (fp3d/cheats.h): no grab holds the player once they act
+    if( fp3d::active() && ( fp3d::is_hand_action( action ) || fp3d::is_held_action( action ) ) ) {
+        fp3d::unstoppable_acts( player_character );
+    }
     // FP3D: hand attacks from first person / VR (fp3d/hands.h)
     if( fp3d::active() && fp3d::is_hand_action( action ) ) {
         return fp3d::hand_attack( player_character, action ) && !player_character.is_dead_state();
@@ -3293,6 +3298,11 @@ bool game::handle_action()
             }
         }
         return false;
+    }
+
+    // FP3D: the Unstoppable cheat (fp3d/cheats.h): no grab holds the player once they act
+    if( fp3d::active() && act != ACTION_TIMEOUT ) {
+        fp3d::unstoppable_acts( player_character );
     }
 
     // This has no action unless we're in a special game mode.
