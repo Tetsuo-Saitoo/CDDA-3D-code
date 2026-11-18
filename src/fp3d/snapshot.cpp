@@ -890,10 +890,19 @@ void capture_vehicles( map &here, snapshot &s, std::vector<uint8_t> &vehicle_til
         // CDDA computes "inside" lazily (only enclosed_at() does), so the outside cache can lack
         // vehicle roofs; refresh it and set the roof flag from the parts directly.
         v->refresh_insides();
-        for( const vpart_reference &vp : v->get_all_parts() ) {
+        // Its own parts and CDDA's active gap fillers (part_gap_filler): the game treats both as the vehicle. A
+        // filler is under a roof when the part it copies is.
+        for( const vpart_reference &vp : v->get_all_parts_with_fakes() ) {
             const tripoint_bub_ms p = vp.pos_bub( here );
             if( here.inbounds( p ) ) {
-                vehicle_tiles[bubble_index( p )] |= 1 | ( vp.is_inside() ? 2 : 0 );
+                const vehicle_part &part = vp.part();
+                bool inside = false;
+                if( !part.is_fake ) {
+                    inside = vp.is_inside();
+                } else if( part.fake_part_to >= 0 && part.fake_part_to < v->part_count() ) {
+                    inside = vpart_position( *v, static_cast<size_t>( part.fake_part_to ) ).is_inside();
+                }
+                vehicle_tiles[bubble_index( p )] |= 1 | ( inside ? 2 : 0 );
             }
         }
         if( s.vehicles.size() >= max_vehicles ) {
@@ -906,21 +915,38 @@ void capture_vehicles( map &here, snapshot &s, std::vector<uint8_t> &vehicle_til
         vv.turn_deg = static_cast<float>( units::to_degrees( v->turn_dir ) );
         vv.velocity = static_cast<float>( v->velocity / 100.0 * 0.44704 );   // vmiph (mph * 100) -> m/s
         vv.name = client_text( v->name, max_vehicle_name_columns, 4 * max_vehicle_name_columns );
+        // What `part` is, on the square `at`.
+        const auto row_of = [&]( const vehicle_part & part, const tripoint_bub_ms & at ) {
+            vehicle_part_view pv;
+            pv.mount_x = part.mount.x();
+            pv.mount_y = part.mount.y();
+            pv.vpart = intern_id( id_kind::vpart, part.info().id.str() );
+            pv.hp_frac = clamp_u8( 255.0 * part.health_percent() );
+            pv.state = ( part.open ? 1 : 0 ) | ( part.is_broken() ? 2 : 0 ) | ( part.enabled ? 4 : 0 );
+            const tripoint_rel_ms offset = at - wv.pos;
+            pv.dx = static_cast<int8_t>( std::clamp( offset.x(), -max_part_offset, max_part_offset ) );
+            pv.dy = static_cast<int8_t>( std::clamp( offset.y(), -max_part_offset, max_part_offset ) );
+            pv.dz = static_cast<int8_t>( std::clamp( offset.z(), -max_part_offset, max_part_offset ) );
+            return pv;
+        };
         for( const vpart_reference &vp : v->get_all_parts() ) {
             if( vv.parts.size() >= max_vehicle_parts ) {
                 break;
             }
-            const vehicle_part &part = vp.part();
-            vehicle_part_view pv;
-            pv.mount_x = part.mount.x();
-            pv.mount_y = part.mount.y();
-            pv.vpart = intern_id( id_kind::vpart, vp.info().id.str() );
-            pv.hp_frac = clamp_u8( 255.0 * part.health_percent() );
-            pv.state = ( part.open ? 1 : 0 ) | ( part.is_broken() ? 2 : 0 ) | ( part.enabled ? 4 : 0 );
-            const tripoint_rel_ms offset = vp.pos_bub( here ) - wv.pos;
-            pv.dx = static_cast<int8_t>( std::clamp( offset.x(), -max_part_offset, max_part_offset ) );
-            pv.dy = static_cast<int8_t>( std::clamp( offset.y(), -max_part_offset, max_part_offset ) );
-            pv.dz = static_cast<int8_t>( std::clamp( offset.z(), -max_part_offset, max_part_offset ) );
+            vv.parts.push_back( row_of( vp.part(), vp.pos_bub( here ) ) );
+        }
+        // Then the active gap fillers, each as the part it copies (CDDA keeps hp and damage on that one), on its
+        // own square.
+        for( const vpart_reference &vp : v->get_all_parts_with_fakes() ) {
+            if( vv.parts.size() >= max_vehicle_parts ) {
+                break;
+            }
+            const vehicle_part &fake = vp.part();
+            if( !fake.is_fake || fake.fake_part_to < 0 || fake.fake_part_to >= v->part_count() ) {
+                continue;
+            }
+            vehicle_part_view pv = row_of( v->part( fake.fake_part_to ), vp.pos_bub( here ) );
+            pv.state |= part_gap_filler;
             vv.parts.push_back( pv );
         }
         s.vehicles.push_back( std::move( vv ) );

@@ -210,7 +210,7 @@ struct vehicle_part_view {
     int mount_y = 0;
     uint32_t vpart = 0;
     uint8_t hp_frac = 0;
-    uint8_t state = 0;                            // bit0 open, bit1 broken, bit2 enabled
+    uint8_t state = 0;                            // bit0 open, bit1 broken, bit2 enabled, bit3 gap filler
     // The square the part is on, from the vehicle's `pos`: CDDA turns the mount by its own stepped rotation around
     // a pivot the client doesn't have, so the client can't work it out. dz: a vehicle on a ramp can have parts a
     // level up or down. Each -max_part_offset..max_part_offset (a vehicle is far smaller).
@@ -219,6 +219,10 @@ struct vehicle_part_view {
     int8_t dz = 0;
 };
 constexpr int max_part_offset = 127;
+// A gap filler: while a vehicle stands at an angle CDDA puts a copy of an edge part (a board, a door) on the
+// square the diagonal step would leave open, and the game blocks that square like the part itself. Listed after
+// the vehicle's own parts, with the copied part's mount, vpart, hp and state, and its own square.
+constexpr uint8_t part_gap_filler = 8;
 
 struct vehicle_view {
     uint64_t uid = 0;
