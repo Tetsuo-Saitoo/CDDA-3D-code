@@ -626,6 +626,27 @@ int main()
                 return j;
             };
             const std::string all_json = json_of( *all );
+            {
+                // A submap's JSON text is kept with its view and reused: the same bytes as writing every submap
+                // anew, the first time (texts made) and the second (texts reused), and far less work.
+                const auto timed_json = [&]( const fp3d::snapshot & s, bool reuse, double & took ) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    std::ostringstream out;
+                    fp3d::write_snapshot_json( out, s, pz - 1, pz + 1, reuse );
+                    took = std::chrono::duration<double, std::milli>( std::chrono::steady_clock::now() - t0 ).count();
+                    return out.str();
+                };
+                double plain_ms = 0;
+                double first_ms = 0;
+                double again_ms = 0;
+                const std::string plain = timed_json( *few, false, plain_ms );
+                const std::string first_reuse = timed_json( *few, true, first_ms );
+                const std::string again_reuse = timed_json( *few, true, again_ms );
+                check( plain.size() > 100000 && plain == first_reuse && plain == again_reuse,
+                       "submap text kept and reused: the same JSON, byte for byte",
+                       std::to_string( plain.size() / 1024 ) + " KB" );
+                std::printf( "  JSON for 3 levels: %.0f ms written anew, %.0f ms with the kept texts\n", plain_ms, again_ms );
+            }
             check( all_json == json_of( *few ) && all_json.size() > 1000, "wanted levels: the same JSON for them",
                    std::to_string( all_json.size() ) + " bytes" );
             // A wall two levels up, where no capture looks now; then that level is wanted: its submap's revision
