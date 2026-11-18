@@ -572,6 +572,17 @@ int main()
             const std::shared_ptr<const fp3d::snapshot> back = timed_capture( all_ms );
             check( back->submaps.size() == per_level * OVERMAP_LAYERS && back->z_first == -OVERMAP_DEPTH &&
                    back->z_last == OVERMAP_HEIGHT, "wanted levels: all of them again" );
+            // Published in the order they were captured: an earlier capture never replaces a later one.
+            const std::shared_ptr<const fp3d::snapshot> later = timed_capture( all_ms );
+            fp3d::publish_snapshot( later );
+            fp3d::publish_snapshot( back );
+            const bool kept_later = fp3d::latest_snapshot() == later;
+            fp3d::publish_snapshot( nullptr );
+            const bool cleared = fp3d::latest_snapshot() == nullptr;
+            fp3d::publish_snapshot( back );
+            check( later->seq > back->seq && kept_later && cleared && fp3d::latest_snapshot() == back,
+                   "publish: never back to an earlier capture; nullptr clears" );
+            fp3d::publish_snapshot( later );
         }
 
         // A zombie in view shows up with its type and keeps its uid. A tamed dog comes along for the attitudes.

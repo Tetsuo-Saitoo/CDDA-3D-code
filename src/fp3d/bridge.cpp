@@ -79,6 +79,9 @@ thread_local bool next_timed = false;
 thread_local bool hook_timed = false;
 // Sim thread: when the before-ask or the running hook last finished (set_running_hook).
 thread_local std::chrono::steady_clock::time_point hook_done;
+// Sim thread: one of the two hooks is running. A request asked from inside it (CDDA's debug message prompt, say)
+// gets no hook of its own: the hook's work, a snapshot, is under way and would be done a second time inside itself.
+thread_local bool in_hook = false;
 thread_local bool in_query = false;
 std::mutex poll_mutex;
 std::map<std::string, uint64_t> poll_counts;
@@ -291,10 +294,9 @@ ui_answer ask( ui_request req )
     }
     // Taken before the hook, so a request asked inside it isn't posted as the main loop's.
     const bool timed = std::exchange( next_timed, false );
-    // Not again from a request asked inside the hook itself (CDDA's debug message prompt, say). A shot request
+    // Not again from a request asked inside a hook, this one or the running one (in_hook). A shot request
     // skips it too: the client flies the shot against the figures it already shows, and a burst asks once per
     // round while the game waits. So does a swing request (the strike lands on what the client shows).
-    static thread_local bool in_hook = false;
     if( hook && !in_hook && req.kind != request_kind::shot && req.kind != request_kind::swing ) {
         in_hook = true;
         hook_timed = timed;
@@ -773,8 +775,15 @@ void pace_turn( bool fast_forward, bool watched )
             std::lock_guard<std::mutex> lk( c.m );
             hook = c.shut_down ? nullptr : c.running;
         }
-        if( hook ) {
-            hook();
+        if( hook && !in_hook ) {
+            in_hook = true;
+            try {
+                hook();
+            } catch( ... ) {
+                in_hook = false;
+                throw;
+            }
+            in_hook = false;
         }
         hook_done = std::chrono::steady_clock::now();
     }
@@ -890,6 +899,7 @@ void reset_sim_thread_state()
     next_timed = false;
     hook_timed = false;
     in_query = false;
+    in_hook = false;
     hook_done = std::chrono::steady_clock::time_point();
 }
 
