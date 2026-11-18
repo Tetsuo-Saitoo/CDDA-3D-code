@@ -89,7 +89,8 @@ struct item_def {
     std::string gun;        // skill a gun uses (pistol, rifle, archery, launcher, ...), "" if not a gun
     // Gun mods by hand: where a gun mod goes (CDDA's location id: "sights", "underbarrel", "stock mount"; see
     // gunmod_location_text in item_hands.h), "" if not a gun mod; and a gun type's own slots, [location id,
-    // how many] (cap max_mod_locations; an installed mod can add more, which the snapshot's wielded gun lists).
+    // how many, 1..max_mod_slots] (cap max_mod_locations; an installed mod can add more, which the snapshot's
+    // wielded gun lists). Never present with an empty id or no slots.
     std::string gunmod_location;
     std::vector<std::pair<std::string, int>> mod_locations;
     int volume_ml = 0;

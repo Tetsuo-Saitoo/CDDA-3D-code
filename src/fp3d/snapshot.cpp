@@ -851,8 +851,9 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
             if( sv.location.empty() || slot.second <= 0 ) {
                 continue;
             }
-            sv.slots = clamp_u8( slot.second );
-            sv.free = clamp_u8( gun->get_free_mod_locations( slot.first ) );
+            sv.slots = static_cast<uint8_t>( std::min( slot.second, max_mod_slots ) );
+            sv.free = static_cast<uint8_t>( std::clamp( gun->get_free_mod_locations( slot.first ), 0,
+                                            static_cast<int>( sv.slots ) ) );
             g.slots.push_back( std::move( sv ) );
         }
         for( const item_location &loc : u.all_items_loc() ) {

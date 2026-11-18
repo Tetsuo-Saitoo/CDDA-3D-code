@@ -85,6 +85,8 @@ gunmod_fit fit_gunmod( const Character &who, const item_location &gun, const ite
 // A gun mod location id as the client gets it: letters, digits, space, _ and -, up to max_gunmod_location_bytes;
 // "" for anything else (a mod's).
 constexpr size_t max_gunmod_location_bytes = 32;
+// How many slots of one kind a gun is said to have, at most (game data and mods are not trusted to stay small).
+constexpr int max_mod_slots = 16;
 std::string gunmod_location_text( const std::string &id );
 
 void register_item_actions( input_context &ctxt );

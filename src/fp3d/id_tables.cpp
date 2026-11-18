@@ -279,7 +279,7 @@ void build_id_tables()
                 }
                 const std::string where = gunmod_location_text( slot.first.str() );
                 if( !where.empty() && slot.second > 0 ) {
-                    d.mod_locations.emplace_back( where, std::min( slot.second, 255 ) );
+                    d.mod_locations.emplace_back( where, std::min( slot.second, max_mod_slots ) );
                 }
             }
         }
