@@ -34,6 +34,8 @@
 #include <string>
 #include <unordered_set>
 
+#include "type_id.h"
+
 class Character;
 class avatar;
 class input_context;
@@ -88,6 +90,14 @@ constexpr size_t max_gunmod_location_bytes = 32;
 // How many slots of one kind a gun is said to have, at most (game data and mods are not trusted to stay small).
 constexpr int max_mod_slots = 16;
 std::string gunmod_location_text( const std::string &id );
+
+// First aid on the body part the client named (a consume action's `part`, bridge.h). While that action runs,
+// CDDA's body part menu (Character::body_window) doesn't show: it asks take_first_aid_part for each part it lists,
+// saying whether the menu would let the player pick it, and takes the one that answers true. None does when the
+// named part can't be picked, is a bionic limb, or was given once already (CDDA asks again only after it turned
+// the part down); that is as if the player picked nothing, and the action is refused with the reason.
+bool first_aid_part_named();
+bool take_first_aid_part( const Character &who, const bodypart_id &part, bool allowed );
 
 void register_item_actions( input_context &ctxt );
 bool is_item_action( const std::string &action );

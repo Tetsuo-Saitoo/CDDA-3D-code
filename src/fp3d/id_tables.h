@@ -57,6 +57,14 @@ struct field_def {
 // at run time (attached pouches); those come after these.
 constexpr size_t max_itype_pockets = 32;
 constexpr size_t max_mod_locations = 16;
+// item_def::heal: the item bandages a hurt part, disinfects it, stops bleeding, treats a bite, treats an infection,
+// gives hit points back.
+constexpr int heal_bandages = 1;
+constexpr int heal_disinfects = 2;
+constexpr int heal_stops_bleeding = 4;
+constexpr int heal_treats_bite = 8;
+constexpr int heal_treats_infection = 16;
+constexpr int heal_restores_hp = 32;
 constexpr size_t max_pocket_name_columns = 40;
 enum pocket_flag : uint16_t {
     pocket_rigid = 1,          // size doesn't change with contents
@@ -93,6 +101,9 @@ struct item_def {
     // wielded gun lists). Never present with an empty id or no slots.
     std::string gunmod_location;
     std::vector<std::pair<std::string, int>> mod_locations;
+    // First aid: -1 for an item without CDDA's heal use (the field is left out). Else what the item does to a
+    // body part, a sum of the heal_* bits (0 when it has the use and none of them).
+    int heal = -1;
     int volume_ml = 0;
     int weight_g = 0;
     std::vector<pocket_def> pockets;   // cap max_itype_pockets

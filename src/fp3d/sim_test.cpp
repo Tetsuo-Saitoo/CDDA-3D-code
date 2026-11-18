@@ -109,6 +109,7 @@ namespace
 {
 const itype_id itype_apple( "apple" );
 const itype_id itype_backpack( "backpack" );
+const itype_id itype_bandages( "bandages" );
 const itype_id itype_rock( "rock" );
 const mtype_id mon_zombie( "mon_zombie" );
 const mtype_id mon_horse( "mon_horse" );
@@ -162,6 +163,9 @@ const trait_id trait_NIGHTVISION( "NIGHTVISION" );
 const bionic_id bio_flashlight( "bio_flashlight" );
 const efftype_id effect_winded( "winded" );
 const efftype_id effect_grabbed( "grabbed" );
+const efftype_id effect_bandaged( "bandaged" );
+const efftype_id effect_bleed( "bleed" );
+const efftype_id effect_disinfected( "disinfected" );
 const flag_id json_flag_GRAB( "GRAB" );
 
 // Game state the driver checks; copied on the sim thread right before every request.
@@ -300,6 +304,11 @@ std::atomic<uint64_t> cs_rock_uid{ 0 };         // a carried rock
 std::atomic<uint64_t> cs_west_apple_uid{ 0 };   // an apple west
 std::atomic<uint64_t> cs_far_apple_uid{ 0 };    // an apple 2 squares east
 std::atomic<uint64_t> cs_spilt_uid{ 0 };        // clean water spilt north
+// First aid checks (scene 50): three carried bandages and an apple.
+std::atomic<uint64_t> fa_bandage_a_uid{ 0 };
+std::atomic<uint64_t> fa_bandage_b_uid{ 0 };
+std::atomic<uint64_t> fa_bandage_c_uid{ 0 };
+std::atomic<uint64_t> fa_apple_uid{ 0 };
 // The lying-container checks' scene (hand_setup 22).
 std::atomic<uint64_t> lc_pack_uid{ 0 };         // a backpack west holding a rock and 2 empty bottles
 std::atomic<uint64_t> lc_rock_uid{ 0 };         // the rock
@@ -1664,6 +1673,57 @@ void observe()
                 u.set_knowledge_level( skill_id( skill ), 6 );
             }
             u.backlog.push_front( player_activity( gunmod_add_activity_actor( 100, "x" ) ) );
+            break;
+        }
+        case 50: {
+            // First aid: floor 3 squares around, nothing lying there, no monsters; a backpack worn, nothing held.
+            // Carried: three bandages and an apple. The left arm is hurt, the right arm bleeds at full health, the
+            // right leg is broken; the torso and the rest are whole.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -3; dx <= 3; dx++ ) {
+                for( int dy = -3; dy <= 3; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_floor );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            u.clear_worn();
+            u.inv->clear();
+            u.remove_weapon();
+            u.wear_item( item( itype_backpack ), false );
+            u.healall( 100 );
+            u.remove_effect( effect_bleed );
+            u.remove_effect( effect_bandaged );
+            u.remove_effect( effect_disinfected );
+            const bodypart_id arm_l( "arm_l" );
+            const bodypart_id arm_r( "arm_r" );
+            const bodypart_id leg_r( "leg_r" );
+            u.set_part_hp_cur( arm_l, u.get_part_hp_max( arm_l ) - 10 );
+            u.set_part_hp_cur( leg_r, 0 );
+            u.add_effect( effect_bleed, 1_hours, arm_r, false, 10 );
+            const auto handle = []( item_location loc ) {
+                return loc ? fp3d::item_handle( *loc ) : 0;
+            };
+            fa_bandage_a_uid = handle( u.i_add( item( itype_bandages ) ) );
+            fa_bandage_b_uid = handle( u.i_add( item( itype_bandages ) ) );
+            fa_bandage_c_uid = handle( u.i_add( item( itype_bandages ) ) );
+            fa_apple_uid = handle( u.i_add( item( itype_apple ) ) );
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 51: {
+            // First aid, after: whole again, nothing bleeding or bandaged.
+            avatar &u = get_avatar();
+            u.healall( 100 );
+            u.remove_effect( effect_bleed );
+            u.remove_effect( effect_bandaged );
+            u.remove_effect( effect_disinfected );
             break;
         }
         case 39: {
@@ -8020,6 +8080,215 @@ static bool run_consume_checks()
     return failed == 0;
 }
 
+// First aid by hand: consume with the body part named takes CDDA's heal use without its body part menu, and is
+// refused with a reason where that menu wouldn't let the part be picked (lead-vr, 2026-11-18).
+static bool run_first_aid_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  first aid: %-46s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct result {
+        bool queued = false;
+        bool back = false;        // in the main loop again
+        int prompts = 0;          // CDDA's questions on the way
+        std::string asked;        // their texts
+        int answers = 0;          // item_result events for the action's tag
+        bool done = false;
+        std::string why;          // the result's text
+        std::string msgs;         // the messages, " | " between them
+        int spent = 0;            // moves
+    };
+    struct part_state {
+        int hp = -1;
+        int hp_max = -1;
+        int bleed = 0;
+        int bandaged = 0;
+    };
+    uint32_t next_tag = 700;
+    // Consume `uid` with `part` ("" = none named). CDDA's questions: NO when it can be said, else cancelled.
+    const auto run = [&]( uint64_t uid, uint32_t type, const fp3d::ui_point & pos, const std::string & part ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+        if( !r || !r->timed ) {
+            return res;
+        }
+        const observed o0 = snapshot();
+        fp3d::drain_events( evs );
+        evs.clear();
+        fp3d::item_action ia;
+        ia.op = fp3d::item_op::consume;
+        ia.item = fp3d::item_ref{ uid, type };
+        ia.pos = pos;
+        ia.part = part;
+        ia.tag = ++next_tag;
+        res.queued = fp3d::queue_item_action( ia );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = r->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 60000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( r->timed ) {
+                if( r->id != before ) {
+                    res.back = true;
+                    break;
+                }
+                continue;
+            }
+            res.prompts++;
+            res.asked += ( res.asked.empty() ? "" : " | " ) + ( r->text.empty() ? r->title : r->text );
+            fp3d::ui_answer a;
+            a.id = r->id;
+            if( std::find( r->actions.begin(), r->actions.end(), "NO" ) != r->actions.end() ) {
+                a.action = "NO";
+            } else {
+                a.cancel = true;
+            }
+            fp3d::answer( a );
+        }
+        fp3d::drain_events( evs );
+        const observed o1 = snapshot();
+        res.spent = static_cast<int>( o1.turn - o0.turn ) * o0.speed + o0.moves - o1.moves;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msgs += ( res.msgs.empty() ? "" : " | " ) + e.text;
+            } else if( e.kind == fp3d::event_kind::item_result && e.detail == ia.tag ) {
+                res.answers++;
+                res.done = e.amount == 1;
+                res.why = e.text;
+            }
+        }
+        return res;
+    };
+    const auto has = []( const std::string & str, const char *part ) {
+        return str.find( part ) != std::string::npos;
+    };
+    const auto show = []( const result & r ) {
+        return std::string( r.queued ? "" : "not queued " ) + ( r.done ? "done" : "not done" ) + " [" + r.why +
+               "] asked [" + r.asked + "] " + std::to_string( r.prompts ) + " prompts, " +
+               std::to_string( r.spent ) + " moves, " + std::to_string( r.answers ) + " answers";
+    };
+    const auto carried_has = []( uint64_t uid ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.uid == uid ) {
+                return true;
+            }
+        }
+        return false;
+    };
+    // What the newest snapshot says of one body part.
+    const auto state_of = []( const char *id ) {
+        part_state out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        const uint32_t want = fp3d::intern_id( fp3d::id_kind::body_part, id );
+        if( !s ) {
+            return out;
+        }
+        const fp3d::player_view &pv = s->player;
+        for( size_t i = 0; i < pv.body_parts.size(); i++ ) {
+            if( pv.body_parts[i] == want && i < pv.hp.size() && i < pv.hp_max.size() && i < pv.bleed.size() &&
+                i < pv.bandaged.size() ) {
+                out.hp = pv.hp[i];
+                out.hp_max = pv.hp_max[i];
+                out.bleed = pv.bleed[i];
+                out.bandaged = pv.bandaged[i];
+            }
+        }
+        return out;
+    };
+    const auto scene = [&]( int number ) {
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return false;
+        }
+        hand_setup = number;
+        fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+        at = fp3d::wait_request( 20000, at->id );
+        return at && at->timed;
+    };
+
+    const std::shared_ptr<const fp3d::snapshot> s0 = scene( 50 ) ? fp3d::latest_snapshot() : nullptr;
+    const part_state arm_l0 = state_of( "arm_l" );
+    const part_state arm_r0 = state_of( "arm_r" );
+    const part_state leg_r0 = state_of( "leg_r" );
+    const part_state torso0 = state_of( "torso" );
+    if( !s0 || fa_bandage_a_uid == 0 || fa_bandage_b_uid == 0 || fa_bandage_c_uid == 0 || fa_apple_uid == 0 ||
+        arm_l0.hp <= 0 || arm_l0.hp >= arm_l0.hp_max || arm_r0.bleed == 0 || arm_r0.hp != arm_r0.hp_max ||
+        leg_r0.hp != 0 || torso0.hp != torso0.hp_max || torso0.bleed != 0 ) {
+        check( false, "scene", "arm_l " + std::to_string( arm_l0.hp ) + "/" + std::to_string( arm_l0.hp_max ) +
+               ", arm_r bleed " + std::to_string( arm_r0.bleed ) + ", leg_r " + std::to_string( leg_r0.hp ) );
+        return false;
+    }
+    const fp3d::ui_point here = s0->player.pos;
+    const uint32_t t_bandage = fp3d::intern_id( fp3d::id_kind::itype, "bandages" );
+    const uint32_t t_apple = fp3d::intern_id( fp3d::id_kind::itype, "apple" );
+    const uint64_t a_uid = fa_bandage_a_uid;
+    const uint64_t b_uid = fa_bandage_b_uid;
+    const uint64_t c_uid = fa_bandage_c_uid;
+
+    // What the queue takes: a plain id of a bounded length, and only with consume.
+    fp3d::item_action shaped;
+    shaped.op = fp3d::item_op::consume;
+    shaped.item = fp3d::item_ref{ a_uid, t_bandage };
+    shaped.pos = here;
+    bool odd_refused = true;
+    for( const std::string &odd : { std::string( "arm l" ), std::string( "arm-l" ), std::string( "arm_l\"" ),
+                                    std::string( fp3d::max_item_part_bytes + 1, 'a' ), std::string( "\xc3\xa4rm" )
+                                  } ) {
+        shaped.part = odd;
+        odd_refused = odd_refused && !fp3d::queue_item_action( shaped );
+    }
+    shaped.part = "arm_l";
+    shaped.op = fp3d::item_op::drop;
+    check( odd_refused && !fp3d::queue_item_action( shaped ), "part: only a plain id, only with consume", "" );
+
+    // A part the avatar doesn't have, and one that is no main part: refused, nothing asked.
+    result res = run( a_uid, t_bandage, here, "tentacle_9" );
+    const result eyes = run( a_uid, t_bandage, here, "eyes" );
+    check( res.back && res.answers == 1 && !res.done && has( res.why, "no such body part" ) && res.prompts == 0 &&
+           res.spent == 0 && eyes.back && !eyes.done && has( eyes.why, "no such body part" ) &&
+           eyes.prompts == 0 && carried_has( a_uid ), "a part you don't have: refused", show( res ) );
+    // A whole part: CDDA's menu wouldn't let it be picked; refused with its words, no menu.
+    res = run( a_uid, t_bandage, here, "torso" );
+    check( res.back && res.answers == 1 && !res.done && has( res.why, "expect any effect" ) && res.prompts == 0 &&
+           res.spent == 0 && carried_has( a_uid ), "a whole part: refused, no menu", show( res ) );
+    // A broken leg with nothing else wrong.
+    res = run( a_uid, t_bandage, here, "leg_r" );
+    check( res.back && res.answers == 1 && !res.done && has( res.why, "leg is broken" ) && res.prompts == 0 &&
+           res.spent == 0 && carried_has( a_uid ), "a broken leg: refused, no menu", show( res ) );
+    // The hurt arm: no menu, CDDA's first aid runs its time, the arm is bandaged and the bandage used up.
+    res = run( a_uid, t_bandage, here, "arm_l" );
+    const part_state arm_l1 = state_of( "arm_l" );
+    check( res.back && res.answers == 1 && res.done && res.why.empty() && res.prompts == 0 && res.spent > 0 &&
+           arm_l1.bandaged > 0 && arm_l0.bandaged == 0 && state_of( "arm_r" ).bandaged == 0 &&
+           !carried_has( a_uid ), "the hurt arm: bandaged, no menu",
+           show( res ) + ", bandaged " + std::to_string( arm_l1.bandaged ) );
+    // The bleeding arm at full health: the bandage stops bleeding, so it may be picked.
+    res = run( b_uid, t_bandage, here, "arm_r" );
+    const part_state arm_r1 = state_of( "arm_r" );
+    check( res.back && res.answers == 1 && res.done && res.prompts == 0 && res.spent > 0 &&
+           arm_r1.bleed < arm_r0.bleed && !carried_has( b_uid ), "the bleeding arm: treated, no menu",
+           show( res ) + ", bleed " + std::to_string( arm_r0.bleed ) + " -> " + std::to_string( arm_r1.bleed ) );
+    // No part named: CDDA's menu comes as before (here: cancelled), also right after actions that named one.
+    res = run( c_uid, t_bandage, here, "" );
+    check( res.back && res.answers == 1 && !res.done && res.prompts >= 1 && has( res.asked, "Select a body part" ) &&
+           carried_has( c_uid ), "no part named: CDDA's menu, cancelled", show( res ) );
+    // Food ignores the part.
+    res = run( fa_apple_uid, t_apple, here, "torso" );
+    check( res.back && res.answers == 1 && res.done && res.spent > 0 && !carried_has( fa_apple_uid ),
+           "an apple with a part named: eaten", show( res ) );
+    check( scene( 51 ), "after: whole again", "" );
+    return failed == 0;
+}
+
 // The off hand lets go of an item that has grown too heavy for one hand (here: filled up); it stays in its pocket
 // (lead-ui, 2026-11-15).
 static bool run_offhand_weight_checks()
@@ -9421,7 +9690,8 @@ int main()
     const bool number_ok = peek_ok && run_number_checks();
     const bool actions_ok = number_ok && run_action_checks();
     const bool gunmods_ok = actions_ok && run_gunmod_checks();
-    const bool names_ok = gunmods_ok && run_name_checks();
+    const bool first_aid_ok = gunmods_ok && run_first_aid_checks();
+    const bool names_ok = first_aid_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -9484,6 +9754,7 @@ int main()
     std::printf( "number requests: %s\n", number_ok ? "ok" : "BAD" );
     std::printf( "actions: %s\n", actions_ok ? "ok" : "BAD" );
     std::printf( "gun mods: %s\n", gunmods_ok ? "ok" : "BAD" );
+    std::printf( "first aid: %s\n", first_aid_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
     // the game's turns got slower.
@@ -9500,6 +9771,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok ?
+           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

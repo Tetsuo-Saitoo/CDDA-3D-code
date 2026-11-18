@@ -19,6 +19,8 @@
 #include "fp3d/bridge.h"
 #include "item_factory.h"
 #include "item_pocket.h"
+#include "iuse.h"
+#include "iuse_actor.h"
 #include "iexamine.h"
 #include "itype.h"
 #include "json.h"
@@ -286,6 +288,18 @@ void build_id_tables()
         if( it.gunmod ) {
             d.gunmod_location = gunmod_location_text( it.gunmod->location.str() );
         }
+        if( const use_function *use = it.get_use( "heal" ) ) {
+            d.heal = 0;
+            if( const heal_actor *heal = dynamic_cast<const heal_actor *>( use->get_actor_ptr() ) ) {
+                d.heal = ( heal->bandages_power > 0 ? heal_bandages : 0 ) |
+                         ( heal->disinfectant_power > 0 ? heal_disinfects : 0 ) |
+                         ( heal->bleed > 0 ? heal_stops_bleeding : 0 ) |
+                         ( heal->bite > 0 ? heal_treats_bite : 0 ) |
+                         ( heal->infect > 0 ? heal_treats_infection : 0 ) |
+                         ( heal->limb_power > 0 || heal->head_power > 0 || heal->torso_power > 0 ?
+                           heal_restores_hp : 0 );
+            }
+        }
         d.volume_ml = static_cast<int>( units::to_milliliter( it.volume ) );
         d.weight_g = static_cast<int>( units::to_gram( it.weight ) );
         for( const pocket_data &p : it.pockets ) {
@@ -435,6 +449,9 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
                 jo.end_array();
             }
             jo.end_array();
+        }
+        if( d.heal >= 0 ) {
+            jo.member( "heal", d.heal );
         }
         jo.member( "volume_ml", d.volume_ml );
         jo.member( "weight_g", d.weight_g );
