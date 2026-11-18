@@ -211,7 +211,14 @@ struct vehicle_part_view {
     uint32_t vpart = 0;
     uint8_t hp_frac = 0;
     uint8_t state = 0;                            // bit0 open, bit1 broken, bit2 enabled
+    // The square the part is on, from the vehicle's `pos`: CDDA turns the mount by its own stepped rotation around
+    // a pivot the client doesn't have, so the client can't work it out. dz: a vehicle on a ramp can have parts a
+    // level up or down. Each -max_part_offset..max_part_offset (a vehicle is far smaller).
+    int8_t dx = 0;
+    int8_t dy = 0;
+    int8_t dz = 0;
 };
+constexpr int max_part_offset = 127;
 
 struct vehicle_view {
     uint64_t uid = 0;
