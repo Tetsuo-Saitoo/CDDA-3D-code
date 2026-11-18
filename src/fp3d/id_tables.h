@@ -56,6 +56,7 @@ struct field_def {
 // An item type's own container pockets, in the order item actions number them (`pocket`). An item can gain more
 // at run time (attached pouches); those come after these.
 constexpr size_t max_itype_pockets = 32;
+constexpr size_t max_mod_locations = 16;
 constexpr size_t max_pocket_name_columns = 40;
 enum pocket_flag : uint16_t {
     pocket_rigid = 1,          // size doesn't change with contents
@@ -86,6 +87,11 @@ struct item_def {
     std::string phase;      // CDDA's phase of the type: "solid", "liquid", "gas", "plasma"; "" = none set
     std::string gun_ammo;   // a gun's first ammo type (9mm, 223, shot, arrow, ...), "" if not a gun
     std::string gun;        // skill a gun uses (pistol, rifle, archery, launcher, ...), "" if not a gun
+    // Gun mods by hand: where a gun mod goes (CDDA's location id: "sights", "underbarrel", "stock mount"; see
+    // gunmod_location_text in item_hands.h), "" if not a gun mod; and a gun type's own slots, [location id,
+    // how many] (cap max_mod_locations; an installed mod can add more, which the snapshot's wielded gun lists).
+    std::string gunmod_location;
+    std::vector<std::pair<std::string, int>> mod_locations;
     int volume_ml = 0;
     int weight_g = 0;
     std::vector<pocket_def> pockets;   // cap max_itype_pockets

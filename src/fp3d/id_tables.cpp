@@ -14,6 +14,7 @@
 #include "damage.h"
 #include "enums.h"
 #include "field_type.h"
+#include "fp3d/item_hands.h"
 #include "fp3d/snapshot.h"
 #include "fp3d/bridge.h"
 #include "item_factory.h"
@@ -272,6 +273,18 @@ void build_id_tables()
             if( !it.gun->ammo.empty() ) {
                 d.gun_ammo = it.gun->ammo.begin()->str();
             }
+            for( const std::pair<const gunmod_location, int> &slot : it.gun->valid_mod_locations ) {
+                if( d.mod_locations.size() >= max_mod_locations ) {
+                    break;
+                }
+                const std::string where = gunmod_location_text( slot.first.str() );
+                if( !where.empty() && slot.second > 0 ) {
+                    d.mod_locations.emplace_back( where, std::min( slot.second, 255 ) );
+                }
+            }
+        }
+        if( it.gunmod ) {
+            d.gunmod_location = gunmod_location_text( it.gunmod->location.str() );
         }
         d.volume_ml = static_cast<int>( units::to_milliliter( it.volume ) );
         d.weight_g = static_cast<int>( units::to_gram( it.weight ) );
@@ -408,6 +421,20 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         if( !d.gun.empty() ) {
             jo.member( "gun", d.gun );
             jo.member( "gun_ammo", d.gun_ammo );
+        }
+        if( !d.gunmod_location.empty() ) {
+            jo.member( "gunmod_location", d.gunmod_location );
+        }
+        if( !d.mod_locations.empty() ) {
+            jo.member( "mod_locations" );
+            jo.start_array();
+            for( const std::pair<std::string, int> &slot : d.mod_locations ) {
+                jo.start_array();
+                jo.write( slot.first );
+                jo.write( slot.second );
+                jo.end_array();
+            }
+            jo.end_array();
         }
         jo.member( "volume_ml", d.volume_ml );
         jo.member( "weight_g", d.weight_g );

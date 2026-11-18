@@ -336,9 +336,107 @@ int main()
             const std::optional<fp3d::gun_view> &g3 = quiet->player.wielded_gun;
             std::ostringstream quiet_json;
             fp3d::write_snapshot_json( quiet_json, *quiet, u.posz(), u.posz() );
-            check( g3 && g3->suppressed && quiet_json.str().find( "],\"suppressed\":true}" ) != std::string::npos,
-                   "an integral suppressor: suppressed, and in the JSON" );
+            check( g3 && g3->suppressed && quiet_json.str().find( "],\"suppressed\":true,\"mods\":[[" ) !=
+                   std::string::npos, "an integral suppressor: suppressed, and in the JSON" );
+            bool integral = false;
+            for( const fp3d::gun_mod_view &m : g3 ? g3->mods : std::vector<fp3d::gun_mod_view>() ) {
+                integral = integral || ( ( m.flags & fp3d::gun_mod_irremovable ) != 0 && m.uid != 0 );
+            }
+            check( integral, "gun mods: an integral mod is listed as one that can't be taken off" );
             u.remove_weapon();
+        }
+        {
+            // Gun mods by hand: what the wielded gun has, its slots as they are now, and which carried mods go on.
+            const skill_id pistol( "pistol" );
+            const skill_id marksmanship( "gun" );
+            const int pistol_was = static_cast<int>( u.get_skill_level( pistol ) );
+            const int marksmanship_was = static_cast<int>( u.get_skill_level( marksmanship ) );
+            u.set_skill_level( pistol, 5 );
+            u.set_skill_level( marksmanship, 5 );
+            u.set_wielded_item( item( itype_id( "glock_19" ) ) );
+            item_location laser = u.i_add( item( itype_id( "rail_laser_sight" ) ) );
+            item_location dot = u.i_add( item( itype_id( "red_dot_sight" ) ) );
+            double mod_ms = 0;
+            const auto fit_of = []( const std::optional<fp3d::gun_view> &gv, uint64_t uid ) {
+                const fp3d::gun_fit_view *found = nullptr;
+                for( const fp3d::gun_fit_view &f : gv ? gv->fits : std::vector<fp3d::gun_fit_view>() ) {
+                    if( f.uid == uid && gv ) {
+                        for( const fp3d::gun_fit_view &real : gv->fits ) {
+                            if( real.uid == uid ) {
+                                found = &real;
+                            }
+                        }
+                    }
+                }
+                return found;
+            };
+            const auto slot_of = []( const std::optional<fp3d::gun_view> &gv, const std::string & where ) {
+                const fp3d::gun_slot_view *found = nullptr;
+                if( gv ) {
+                    for( const fp3d::gun_slot_view &sl : gv->slots ) {
+                        if( sl.location == where ) {
+                            found = &sl;
+                        }
+                    }
+                }
+                return found;
+            };
+            const std::shared_ptr<const fp3d::snapshot> bare = timed_capture( mod_ms );
+            const std::optional<fp3d::gun_view> &gb = bare->player.wielded_gun;
+            const uint64_t laser_uid = laser ? fp3d::read_item_handle( *laser ) : 0;
+            const uint64_t dot_uid = dot ? fp3d::read_item_handle( *dot ) : 0;
+            const fp3d::gun_fit_view *laser_fit = fit_of( gb, laser_uid );
+            const fp3d::gun_fit_view *dot_fit = fit_of( gb, dot_uid );
+            check( gb && gb->mods.empty() && laser_uid != 0 && dot_uid != 0 && gb->fits.size() == 2 && laser_fit &&
+                   laser_fit->ok && laser_fit->chance == 100 && laser_fit->risk == 0 && laser_fit->reason.empty() &&
+                   dot_fit && !dot_fit->ok && !dot_fit->reason.empty() &&
+                   dot_fit->reason.size() <= fp3d::max_gun_fit_reason_bytes,
+                   "gun mods: a carried mod that fits and one that doesn't", dot_fit ? dot_fit->reason : "no fit rows" );
+            check( slot_of( gb, "rail" ) && slot_of( gb, "rail" )->slots == 1 && slot_of( gb, "rail" )->free == 1 &&
+                   slot_of( gb, "mechanism" ) && slot_of( gb, "mechanism" )->slots == 2 &&
+                   !slot_of( gb, "bayonet lug" ), "gun mods: the gun's slots, all free" );
+            // Too little skill (CDDA counts what the character knows as well as what they can do): its own words.
+            const int knowledge_was = u.get_knowledge_level( pistol );
+            u.set_skill_level( pistol, 0 );
+            u.set_knowledge_level( pistol, 0 );
+            const std::shared_ptr<const fp3d::snapshot> unskilled = timed_capture( mod_ms );
+            const fp3d::gun_fit_view *clumsy = fit_of( unskilled->player.wielded_gun, laser_uid );
+            check( clumsy && !clumsy->ok && clumsy->reason.rfind( "requires at least", 0 ) == 0,
+                   "gun mods: too little skill, in CDDA's words", clumsy ? clumsy->reason : "no fit row" );
+            u.set_skill_level( pistol, 5 );
+            u.set_knowledge_level( pistol, std::max( knowledge_was, 5 ) );
+            // A lug rail on the gun (CDDA's own put_in): listed with its location, the rail is taken, the lug adds a
+            // slot of its own, the laser has no room now, and a mod in a gun is not a carried one.
+            item lug( itype_id( "rail_bayonet_lug" ) );
+            u.get_wielded_item()->put_in( lug, pocket_type::MOD );
+            const std::shared_ptr<const fp3d::snapshot> fitted = timed_capture( mod_ms );
+            const std::optional<fp3d::gun_view> &gf = fitted->player.wielded_gun;
+            const fp3d::gun_fit_view *crowded = fit_of( gf, laser_uid );
+            check( gf && gf->mods.size() == 1 && gf->mods[0].location == "rail" && gf->mods[0].uid != 0 &&
+                   gf->mods[0].flags == 0 &&
+                   gf->mods[0].type == fp3d::intern_id( fp3d::id_kind::itype, "rail_bayonet_lug" ) &&
+                   slot_of( gf, "rail" ) && slot_of( gf, "rail" )->free == 0 && slot_of( gf, "bayonet lug" ) &&
+                   slot_of( gf, "bayonet lug" )->slots == 1 && slot_of( gf, "bayonet lug" )->free == 1 &&
+                   gf->fits.size() == 2 && crowded && !crowded->ok && !crowded->reason.empty(),
+                   "gun mods: an installed mod, the slot it takes and the slot it adds",
+                   crowded ? crowded->reason : "no fit row" );
+            std::ostringstream mods_json;
+            fp3d::write_snapshot_json( mods_json, *fitted, u.posz(), u.posz() );
+            const std::string mj = mods_json.str();
+            check( gf && !gf->mods.empty() &&
+                   mj.find( "\"mods\":[[" + std::to_string( gf->mods[0].uid ) + "," +
+                            std::to_string( gf->mods[0].type ) + ",\"rail\",0]]" ) != std::string::npos &&
+                   mj.find( "\"slots\":[[\"barrel\",1,1]," ) != std::string::npos &&
+                   mj.find( "\"fits\":[[" ) != std::string::npos, "gun mods in the JSON" );
+            if( laser ) {
+                laser.remove_item();
+            }
+            if( dot ) {
+                dot.remove_item();
+            }
+            u.remove_weapon();
+            u.set_skill_level( pistol, pistol_was );
+            u.set_skill_level( marksmanship, marksmanship_was );
         }
         {
             // Effects on the player: id, display name, body part (0 = whole body), rating, time left.

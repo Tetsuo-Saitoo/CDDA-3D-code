@@ -1454,6 +1454,22 @@ void observe()
             here.add_field( fire_at, fd_fire, 2 );
             break;
         }
+        case 36: {
+            // Gun mods by hand: a Glock 19 in hand, the skills its mods ask for, and in the pack two laser sights,
+            // a red dot sight (the pistol has no slot for it), a ported barrel (permanent) and a pistol sight mount
+            // (permanent and difficult).
+            avatar &u = get_avatar();
+            u.set_skill_level( skill_id( "pistol" ), 6 );
+            u.set_skill_level( skill_id( "gun" ), 6 );
+            u.remove_weapon();
+            u.set_wielded_item( item( itype_id( "glock_19" ) ) );
+            for( const char *mod : { "rail_laser_sight", "rail_laser_sight", "red_dot_sight", "barrel_ported",
+                                     "sights_mount_pistol"
+                                   } ) {
+                u.i_add( item( itype_id( mod ) ) );
+            }
+            break;
+        }
         case 35: {
             // Menus: three with the caller's choice on a disabled entry, on an enabled one, and with nothing
             // enabled. The driver reads each request's `selected` and cancels it.
@@ -3739,6 +3755,242 @@ static bool run_action_checks()
 }
 
 // Input validation for names in play (fp3d/chargen.h): scene 33 on the sim thread. Run last on this game.
+// Gun mods by hand (scene 36): mod_add and mod_remove on the wielded gun, with CDDA's own questions and time.
+static bool run_gunmod_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  gun mods: %-46s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    hand_setup = 36;
+    fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+    r = fp3d::wait_request( 20000, r->id );
+    if( !r || !r->timed ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    struct result {
+        bool queued = false;
+        bool back = false;
+        int popups = 0;
+        int menus = 0;
+        std::string asked;        // the questions' texts
+        int answers = 0;
+        bool done = false;
+        std::string why;
+        int64_t turns = 0;
+    };
+    uint32_t next_tag = 700;
+    // One mod action on the gun; popups answered yes or no, a menu with `menu_entry` (-1 cancels it).
+    const auto run = [&]( fp3d::item_op op, const fp3d::item_ref & mod, const fp3d::item_ref & gun, bool yes,
+    int menu_entry ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return res;
+        }
+        const int64_t turn0 = at->turn;
+        fp3d::drain_events( evs );
+        evs.clear();
+        fp3d::item_action ia;
+        ia.op = op;
+        ia.item = mod;
+        ia.container = gun;
+        ia.tag = ++next_tag;
+        res.queued = fp3d::queue_item_action( ia );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = at->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 120000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, at->id );
+            if( !next ) {
+                continue;
+            }
+            at = next;
+            if( at->timed ) {
+                if( at->id != before ) {
+                    res.back = true;
+                    res.turns = at->turn - turn0;
+                    break;
+                }
+                continue;
+            }
+            res.asked += ( res.asked.empty() ? "" : " | " ) + ( at->text.empty() ? at->title : at->text );
+            fp3d::ui_answer a;
+            a.id = at->id;
+            if( at->kind == fp3d::request_kind::menu ) {
+                res.menus++;
+                if( menu_entry < 0 ) {
+                    a.cancel = true;
+                } else {
+                    a.entry = menu_entry;
+                }
+            } else {
+                res.popups++;
+                const bool offers_yes = std::find( at->actions.begin(), at->actions.end(), "YES" ) != at->actions.end();
+                const bool offers_no = std::find( at->actions.begin(), at->actions.end(), "NO" ) != at->actions.end();
+                if( yes && offers_yes ) {
+                    a.action = "YES";
+                } else if( offers_no ) {
+                    a.action = "NO";
+                } else {
+                    a.cancel = true;
+                }
+            }
+            fp3d::answer( a );
+        }
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::item_result && e.detail == ia.tag ) {
+                res.answers++;
+                res.done = e.amount == 1;
+                res.why = e.text;
+            }
+        }
+        return res;
+    };
+    const auto show = []( const result & res ) {
+        return std::string( res.queued ? "" : "not queued " ) + ( res.done ? "done" : "not done" ) + " [" + res.why +
+               "] asked [" + res.asked + "] " + std::to_string( res.turns ) + " turns, " +
+               std::to_string( res.answers ) + " answers";
+    };
+    const auto has = []( const std::string & str, const char *part ) {
+        return str.find( part ) != std::string::npos;
+    };
+    // The newest snapshot's view of the gun and the pack.
+    const auto gun_now = []() {
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        return s && s->player.wielded_gun ? *s->player.wielded_gun : fp3d::gun_view();
+    };
+    const auto carried_of = []( const std::string & type ) {
+        std::vector<uint64_t> uids;
+        if( const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot() ) {
+            for( const fp3d::carried_view &c : s->player.items ) {
+                if( fp3d::id_name( fp3d::id_kind::itype, c.type ) == type ) {
+                    uids.push_back( c.uid );
+                }
+            }
+        }
+        return uids;
+    };
+    const auto type_of = []( const std::string & type ) {
+        uint32_t index = 0;
+        if( const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot() ) {
+            for( const fp3d::carried_view &c : s->player.items ) {
+                if( fp3d::id_name( fp3d::id_kind::itype, c.type ) == type ) {
+                    index = c.type;
+                }
+            }
+            if( s->player.wielded_gun ) {
+                for( const fp3d::gun_mod_view &m : s->player.wielded_gun->mods ) {
+                    if( fp3d::id_name( fp3d::id_kind::itype, m.type ) == type ) {
+                        index = m.type;
+                    }
+                }
+            }
+        }
+        return index;
+    };
+    const auto fit_of = [&]( uint64_t uid ) {
+        fp3d::gun_fit_view found;
+        for( const fp3d::gun_fit_view &f : gun_now().fits ) {
+            if( f.uid == uid ) {
+                found = f;
+            }
+        }
+        return found;
+    };
+    const std::vector<uint64_t> guns = carried_of( "glock_19" );
+    const std::vector<uint64_t> lasers = carried_of( "rail_laser_sight" );
+    const std::vector<uint64_t> dots = carried_of( "red_dot_sight" );
+    const std::vector<uint64_t> barrels = carried_of( "barrel_ported" );
+    const std::vector<uint64_t> mounts = carried_of( "sights_mount_pistol" );
+    if( guns.size() != 1 || lasers.size() != 2 || dots.size() != 1 || barrels.size() != 1 || mounts.size() != 1 ) {
+        check( false, "the scene's gun and mods are carried", std::to_string( guns.size() ) + " guns, " +
+               std::to_string( lasers.size() ) + " lasers" );
+        return false;
+    }
+    const fp3d::item_ref gun{ guns[0], type_of( "glock_19" ) };
+    const fp3d::item_ref laser_a{ lasers[0], type_of( "rail_laser_sight" ) };
+    const fp3d::item_ref laser_b{ lasers[1], type_of( "rail_laser_sight" ) };
+    const fp3d::item_ref dot{ dots[0], type_of( "red_dot_sight" ) };
+    const fp3d::item_ref barrel{ barrels[0], type_of( "barrel_ported" ) };
+    const fp3d::item_ref mount{ mounts[0], type_of( "sights_mount_pistol" ) };
+    const fp3d::gun_fit_view mount_fit = fit_of( mount.uid );
+    check( gun_now().mods.empty() && gun_now().fits.size() == 5 && fit_of( laser_a.uid ).ok &&
+           fit_of( laser_b.uid ).ok && fit_of( laser_b.uid ).chance == 100 && !fit_of( dot.uid ).ok &&
+           !fit_of( dot.uid ).reason.empty() && fit_of( barrel.uid ).ok && mount_fit.ok && mount_fit.chance > 0 &&
+           mount_fit.chance < 100, "the snapshot says which carried mods go on",
+           "red dot: " + fit_of( dot.uid ).reason + "; mount " + std::to_string( mount_fit.chance ) + "% risk " +
+           std::to_string( mount_fit.risk ) + "%" );
+    // Malformed: never queued.
+    fp3d::item_action bad;
+    bad.op = fp3d::item_op::mod_add;
+    bad.item = laser_a;
+    const bool no_gun_given = !fp3d::queue_item_action( bad );
+    bad.op = fp3d::item_op::mod_remove;
+    bad.container = fp3d::item_ref{ 0, gun.type };
+    check( no_gun_given && !fp3d::queue_item_action( bad ), "an action without the gun is never queued", "" );
+    // Refused: another gun than the one in hand; a mod the gun has no slot for; a mod that isn't carried.
+    result res = run( fp3d::item_op::mod_add, laser_a, fp3d::item_ref{ gun.uid + 1, gun.type }, true, -1 );
+    check( res.queued && res.back && res.answers == 1 && !res.done && has( res.why, "aren't holding that gun" ) &&
+           res.turns == 0, "another gun than the one in hand is refused", show( res ) );
+    res = run( fp3d::item_op::mod_add, dot, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && has( res.why, fit_of( dot.uid ).reason.c_str() ) &&
+           res.turns == 0 && gun_now().mods.empty(), "a mod the gun has no slot for is refused in CDDA's words",
+           show( res ) );
+    res = run( fp3d::item_op::mod_add, fp3d::item_ref{ laser_b.uid + 77, laser_b.type }, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && res.turns == 0, "a mod that isn't carried is refused",
+           show( res ) );
+    // The second of two alike: that one is installed, not the first of its type, and it takes CDDA's time.
+    res = run( fp3d::item_op::mod_add, laser_b, gun, true, -1 );
+    fp3d::gun_view g = gun_now();
+    check( res.back && res.answers == 1 && res.done && res.popups == 0 && res.menus == 0 && res.turns >= 290 &&
+           g.mods.size() == 1 && g.mods[0].uid == laser_b.uid && g.mods[0].location == "rail" &&
+           g.mods[0].flags == 0 && carried_of( "rail_laser_sight" ) == std::vector<uint64_t> { laser_a.uid } &&
+           !fit_of( laser_a.uid ).ok, "the named mod is installed, in CDDA's time",
+           show( res ) + ", " + std::to_string( g.mods.size() ) + " mods" );
+    // Off again: back in the pack with its handle.
+    res = run( fp3d::item_op::mod_remove, laser_b, gun, true, -1 );
+    g = gun_now();
+    const std::vector<uint64_t> back_in_pack = carried_of( "rail_laser_sight" );
+    check( res.back && res.answers == 1 && res.done && res.turns >= 140 && g.mods.empty() &&
+           back_in_pack.size() == 2 &&
+           std::find( back_in_pack.begin(), back_in_pack.end(), laser_b.uid ) != back_in_pack.end() &&
+           fit_of( laser_b.uid ).ok, "taken off again: back in the pack with its handle", show( res ) );
+    res = run( fp3d::item_op::mod_remove, laser_b, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && res.turns == 0, "a mod the gun doesn't have is refused",
+           show( res ) );
+    // A permanent mod: CDDA asks first. No: nothing happens. Yes: on, and it can't be taken off.
+    res = run( fp3d::item_op::mod_add, barrel, gun, false, -1 );
+    check( res.back && res.popups == 1 && has( res.asked, "Permanently install" ) && res.answers == 1 && !res.done &&
+           has( res.why, "Never mind" ) && gun_now().mods.empty(), "a permanent mod: CDDA's question, answered no",
+           show( res ) );
+    res = run( fp3d::item_op::mod_add, barrel, gun, true, -1 );
+    g = gun_now();
+    check( res.back && res.popups == 1 && res.answers == 1 && res.done && g.mods.size() == 1 &&
+           g.mods[0].uid == barrel.uid && ( g.mods[0].flags & fp3d::gun_mod_irremovable ) != 0,
+           "answered yes: installed, marked as one that can't be taken off", show( res ) );
+    res = run( fp3d::item_op::mod_remove, barrel, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && has( res.why, "can't be taken off" ) && res.turns == 0 &&
+           gun_now().mods.size() == 1, "a permanent mod is not taken off", show( res ) );
+    // A difficult mod: CDDA's tools menu comes as a request; cancelled, nothing happens.
+    res = run( fp3d::item_op::mod_add, mount, gun, true, -1 );
+    check( res.back && res.popups == 1 && res.menus == 1 && has( res.asked, "Attach your" ) && res.answers == 1 &&
+           !res.done && has( res.why, "Never mind" ) && gun_now().mods.size() == 1,
+           "a difficult mod: CDDA's tools menu, cancelled", show( res ) );
+    return failed == 0;
+}
+
 static bool run_name_checks()
 {
     int failed = 0;
@@ -8685,7 +8937,8 @@ int main()
     const bool peek_ok = character_ok && run_peek_checks();
     const bool number_ok = peek_ok && run_number_checks();
     const bool actions_ok = number_ok && run_action_checks();
-    const bool names_ok = actions_ok && run_name_checks();
+    const bool gunmods_ok = actions_ok && run_gunmod_checks();
+    const bool names_ok = gunmods_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -8747,6 +9000,7 @@ int main()
     std::printf( "peek: %s\n", peek_ok ? "ok" : "BAD" );
     std::printf( "number requests: %s\n", number_ok ? "ok" : "BAD" );
     std::printf( "actions: %s\n", actions_ok ? "ok" : "BAD" );
+    std::printf( "gun mods: %s\n", gunmods_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
     // the game's turns got slower.
@@ -8763,6 +9017,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok && actions_ok && names_ok && running_ok ?
+           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

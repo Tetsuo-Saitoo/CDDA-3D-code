@@ -16,6 +16,7 @@
 #include "debug.h"
 #include "fp3d/boot.h"
 #include "fp3d/id_tables.h"
+#include "fp3d/item_hands.h"
 #include "fp3d/snapshot.h"
 #include "json.h"
 #include "json_loader.h"
@@ -109,6 +110,35 @@ int main()
                t->items[apple].phase == "solid", "item phase: water liquid, apple solid",
                water < t->items.size() ? t->items[water].phase : "water not in the table" );
 
+        // Gun mods by hand: where a gun mod goes, and a gun type's own slots.
+        const uint32_t glock = fp3d::intern_id( fp3d::id_kind::itype, "glock_19" );
+        const uint32_t laser = fp3d::intern_id( fp3d::id_kind::itype, "rail_laser_sight" );
+        const auto slots_of = [&]( uint32_t type, const std::string & where ) {
+            if( type >= t->items.size() ) {
+                return -1;
+            }
+            for( const std::pair<std::string, int> &slot : t->items[type].mod_locations ) {
+                if( slot.first == where ) {
+                    return slot.second;
+                }
+            }
+            return 0;
+        };
+        check( laser < t->items.size() && t->items[laser].gunmod_location == "rail" &&
+               t->items[laser].mod_locations.empty() && slots_of( glock, "rail" ) == 1 &&
+               slots_of( glock, "mechanism" ) == 2 && slots_of( glock, "stock mount" ) == 1 &&
+               slots_of( glock, "underbarrel" ) == 0 && t->items[glock].gunmod_location.empty() &&
+               t->items[apple].gunmod_location.empty() && t->items[apple].mod_locations.empty(),
+               "gun mods: a mod's location, a gun's slots",
+               laser < t->items.size() ? t->items[laser].gunmod_location + ", rail x" +
+               std::to_string( slots_of( glock, "rail" ) ) : "laser sight not in the table" );
+        check( fp3d::gunmod_location_text( "stock mount" ) == "stock mount" &&
+               fp3d::gunmod_location_text( "bad<id>" ).empty() && fp3d::gunmod_location_text( "" ).empty() &&
+               fp3d::gunmod_location_text( std::string( fp3d::max_gunmod_location_bytes, 'a' ) ).size() ==
+               fp3d::max_gunmod_location_bytes &&
+               fp3d::gunmod_location_text( std::string( fp3d::max_gunmod_location_bytes + 1, 'a' ) ).empty(),
+               "gun mods: only plain location ids" );
+
         // Pockets per item type: a plastic bottle has one rigid, watertight, sealable 500 ml pocket.
         const uint32_t bottle = fp3d::intern_id( fp3d::id_kind::itype, "bottle_plastic" );
         const bool bottle_ok = bottle < t->items.size() && t->items[bottle].pockets.size() == 1;
@@ -159,6 +189,10 @@ int main()
         const std::string text = os.str();
         check( text.find( "\"pockets\":[{\"volume_ml\":500,\"max_weight_g\":1250," ) != std::string::npos,
                "pockets in the JSON" );
+        check( text.find( "\"gunmod_location\":\"rail\"" ) != std::string::npos &&
+               text.find( "\"mod_locations\":[[\"barrel\",1],[\"mechanism\",2],[\"rail\",1],"
+                          "[\"sights mount\",1],[\"stock mount\",1]]" ) != std::string::npos,
+               "gun mod locations in the JSON" );
         JsonValue root = json_loader::from_string( text );
         JsonObject jo = root.get_object();
         jo.allow_omitted_members();

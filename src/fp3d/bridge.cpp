@@ -580,7 +580,8 @@ bool queue_item_action( const item_action &a )
                        a.op == item_op::unload || a.op == item_op::reload || a.op == item_op::clear ||
                        a.op == item_op::throw_ || a.op == item_op::pour || a.op == item_op::place ||
                        a.op == item_op::spot || a.op == item_op::hold || a.op == item_op::consume ||
-                       a.op == item_op::cook || a.op == item_op::light || a.op == item_op::extinguish;
+                       a.op == item_op::cook || a.op == item_op::light || a.op == item_op::extinguish ||
+                       a.op == item_op::mod_add || a.op == item_op::mod_remove;
     // light: the firestarter, or none at all (uid 0, type 0). extinguish: none. Every other op: a whole ref.
     const bool no_item = a.item.uid == 0 && a.item.type == 0;
     const bool item_ok = a.op == item_op::extinguish ? no_item :
@@ -602,7 +603,8 @@ bool queue_item_action( const item_action &a )
                          ( no_container ? a.pocket == -1 : ref_ok( a.container ) && no_pos );
     if( !op_ok || !cook_ok || !hand_ok || !item_ok || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
         !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket || !pour_ok ||
-        ( ( a.op == item_op::put || a.op == item_op::reload ) && !ref_ok( a.container ) ) ||
+        ( ( a.op == item_op::put || a.op == item_op::reload || a.op == item_op::mod_add ||
+            a.op == item_op::mod_remove ) && !ref_ok( a.container ) ) ||
         ( a.op == item_op::take && !no_container && !ref_ok( a.container ) ) ||
         ( a.has_spot && ( a.spot_x >= spot_scale || a.spot_y >= spot_scale ) ) ||
         !coord_ok( a.to.x ) || !coord_ok( a.to.y ) || !coord_ok( a.to.z ) ||
