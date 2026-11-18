@@ -126,16 +126,20 @@ int break_grabs( Character &u );
 void unstoppable_acts( avatar &u );
 // Sim side, from avatar_action::move as the player steps into `dest` (next to them). With unstoppable on, a
 // hostile monster or an enemy NPC there is pushed past: the player takes its square at a normal step's cost and
-// it takes the square they left, else the nearest free square next to it; no attack.
+// it takes the square they left (a swim into deep water: the nearest free square next to it, which is also where
+// it goes when the square left won't take it); no attack. Not pushed, so CDDA's bump (an attack): a monster CDDA
+// never displaces (IMMOBILE, CANNOT_MOVE, harnessed, ridden), an enemy NPC when either stands on a vehicle part or
+// either is mounted, anything while the player can't move or rides a fast vehicle.
 enum class push_result : uint8_t {
-    none,      // unstoppable off, or nothing hostile there: CDDA's own step (a bump attack on a hostile)
-    refused,   // it can't be pushed (ridden, no room, the step failed): said why
+    none,      // unstoppable off, nothing hostile there, or nothing it may push: CDDA's own step (a bump attack)
+    refused,   // no room to push it aside, or the swap's step failed: said why
     clear,     // the step goes on without attacking: CDDA's displacement takes the monster to the square left,
                // or it was moved aside already
     done       // the player swapped places with the NPC already (game::swap_critters, a normal step)
 };
 push_result push_past( avatar &u, const tripoint_bub_ms &dest );
-// Whether push_past would try (unstoppable on, a step on one level, a hostile monster or enemy NPC there); changes
+// Whether push_past would try (unstoppable on, a step on one level, a hostile monster or enemy NPC there that it may
+// push, as above); changes
 // nothing. avatar_action::move asks it to treat the step as a move, not an attack (move_effects).
 bool pushes_past( const avatar &u, const tripoint_bub_ms &dest );
 } // namespace fp3d

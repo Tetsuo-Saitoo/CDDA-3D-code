@@ -28,12 +28,16 @@
 #include "itype.h"
 #include "map.h"
 #include "map_scale_constants.h"
+#include "mapdata.h"
 #include "messages.h"
 #include "monster.h"
+#include "mtype.h"
 #include "npc.h"
 #include "options.h"
 #include "translations.h"
 #include "type_id.h"
+#include "vehicle.h"
+#include "vpart_position.h"
 #include "weather.h"
 #include "weather_type.h"
 
@@ -55,10 +59,14 @@ static const itype_id itype_scar_l( "scar_l" );
 static const itype_id itype_screwdriver_set( "screwdriver_set" );
 static const itype_id itype_water_clean( "water_clean" );
 
+static const efftype_id effect_harnessed( "harnessed" );
 static const efftype_id effect_pet( "pet" );
 static const efftype_id effect_ridden( "ridden" );
 
 static const flag_id json_flag_GRAB( "GRAB" );
+
+static const json_character_flag json_flag_CANNOT_MOVE( "CANNOT_MOVE" );
+static const json_character_flag json_flag_WATERWALKING( "WATERWALKING" );
 
 static const trait_id trait_DEBUG_CARDIO( "DEBUG_CARDIO" );
 static const trait_id trait_DEBUG_LS( "DEBUG_LS" );
@@ -531,6 +539,9 @@ std::string run_range_op( const range_op &op )
             if( !cheats_allowed() ) {
                 return "Cheats aren't allowed.";
             }
+            if( g->uquit != QUIT_NO || get_avatar().is_dead_state() ) {
+                return "Not now.";
+            }
             no_achievements();
             break_grabs( get_avatar() );
             return "";
@@ -683,21 +694,46 @@ void unstoppable_acts( avatar &u )
 
 bool pushes_past( const avatar &u, const tripoint_bub_ms &dest )
 {
-    if( !cheat_on( u, cheat::unstoppable ) ) {
+    // A player who can't move steps (and bumps) as CDDA has it.
+    if( !cheat_on( u, cheat::unstoppable ) || u.has_flag( json_flag_CANNOT_MOVE ) ) {
         return false;
     }
-    const tripoint_bub_ms from = u.pos_bub( get_map() );
+    map &here = get_map();
+    const tripoint_bub_ms from = u.pos_bub( here );
     // A step on one level only; stairs and ramps stay CDDA's.
     if( dest.z() != from.z() || rl_dist( from, dest ) != 1 ) {
+        return false;
+    }
+    // On a fast vehicle CDDA asks about diving off first: its bump.
+    const vehicle *const veh0 = veh_pointer_or_null( here.veh_at( from ) );
+    if( veh0 != nullptr && std::abs( veh0->velocity ) > 100 ) {
         return false;
     }
     // Hostile as avatar_action::move judges it for its bump attack.
     creature_tracker &creatures = get_creature_tracker();
     if( const monster *const m = creatures.creature_at<monster>( dest, true ) ) {
+        // One CDDA never displaces (a turret, a fungal tower, harnessed, ridden) is bumped as without the cheat.
+        if( m->has_flag( mon_flag_IMMOBILE ) || m->has_flag( json_flag_CANNOT_MOVE ) ||
+            m->has_effect( effect_harnessed ) || m->has_effect( effect_ridden ) ) {
+            return false;
+        }
         return m->friendly == 0 && !m->has_effect( effect_pet );
     }
     const npc *const np = creatures.creature_at<npc>( dest );
-    return np != nullptr && np->is_enemy();
+    if( np == nullptr || !np->is_enemy() ) {
+        return false;
+    }
+    // CDDA's swap unboards both and boards them again, which a refused step would leave wrong: on a vehicle part
+    // (or mounted) an enemy NPC is bumped as without the cheat.
+    return !u.is_mounted() && !np->is_mounted() && !here.veh_at( from ) && !here.veh_at( dest );
+}
+
+// The step into `dest` will be avatar_action::move's swim (deep water, no boat): no displacement then.
+static bool step_swims( const avatar &u, const map &here, const tripoint_bub_ms &dest )
+{
+    return here.has_flag( ter_furn_flag::TFLAG_SWIMMABLE, dest ) &&
+           here.has_flag( ter_furn_flag::TFLAG_DEEP_WATER, dest ) && !here.has_flag_furn( "BRIDGE", dest ) &&
+           !here.veh_at( dest ) && !u.has_flag( json_flag_WATERWALKING );
 }
 
 push_result push_past( avatar &u, const tripoint_bub_ms &dest )
@@ -714,15 +750,13 @@ push_result push_past( avatar &u, const tripoint_bub_ms &dest )
             m->die( &here, &u );
             return push_result::clear;
         }
-        if( m->has_effect( effect_ridden ) ) {
-            add_msg( m_info, _( "You can't push past the %s." ), m->name() );
-            return push_result::refused;
-        }
-        // CDDA's displacement in game::place_player moves it to the square left (a mount pushes it aside).
-        if( u.is_mounted() || m->can_move_to( from ) ) {
+        // CDDA's displacement in game::place_player moves it to the square left (a mount pushes it aside). A swim
+        // never gets there.
+        if( !step_swims( u, here, dest ) && ( u.is_mounted() || m->can_move_to( from ) ) ) {
             return push_result::clear;
         }
-        // The square left won't take it (deep water, a ledge): the nearest free square next to it.
+        // The square left won't take it (deep water, a ledge), or the step is a swim: the nearest free square next
+        // to it.
         for( const tripoint_bub_ms &p : here.points_in_radius( dest, 1, 0 ) ) {
             if( p != dest && p != from && g->is_empty( p ) && m->can_move_to( p ) && m->move_to( p ) ) {
                 add_msg( _( "You push the %s aside." ), m->name() );
@@ -735,10 +769,6 @@ push_result push_past( avatar &u, const tripoint_bub_ms &dest )
     npc *const np = creatures.creature_at<npc>( dest );
     if( np == nullptr ) {
         return push_result::none;
-    }
-    if( u.is_mounted() || np->is_mounted() ) {
-        add_msg( m_info, _( "You can't push past %s." ), np->get_name() );
-        return push_result::refused;
     }
     // CDDA's swap with a follower: the NPC takes the square left and the player walks (game::walk_move, a normal
     // step's cost). The walk may refuse and the map may shift, so absolute squares are compared.

@@ -112,6 +112,7 @@ const itype_id itype_backpack( "backpack" );
 const itype_id itype_rock( "rock" );
 const mtype_id mon_zombie( "mon_zombie" );
 const mtype_id mon_horse( "mon_horse" );
+const mtype_id mon_fungaloid_tower( "mon_fungaloid_tower" );
 const itype_id itype_2h_flail_steel( "2h_flail_steel" );
 const itype_id itype_gasoline( "gasoline" );
 const itype_id itype_hose( "hose" );
@@ -136,6 +137,7 @@ const ter_str_id ter_t_dirt( "t_dirt" );
 const itype_id itype_bottle_twoliter( "bottle_twoliter" );
 const ter_str_id ter_t_open_air( "t_open_air" );
 const ter_str_id ter_t_water_sh( "t_water_sh" );
+const ter_str_id ter_t_water_dp( "t_water_dp" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
 const vpart_id vpart_tank_small( "tank_small" );
@@ -243,6 +245,8 @@ struct unstop_look_t {
     std::atomic<int> dx{ 0 };             // the player from the start square
     std::atomic<int> dy{ 0 };
     std::atomic<int> origin{ 0 };         // on the start square: 0 nobody (or the player), 1 a monster, 2 an NPC
+    std::atomic<int> east{ 0 };           // the same for the square east of it
+    std::atomic<int> under{ 0 };          // monsters on the player's own square
     std::atomic<int> turn{ 0 };
 };
 unstop_look_t unstop_view;
@@ -784,8 +788,9 @@ static void fresh_cook_water( map &here, const tripoint_bub_ms &fire_at )
 
 // The unstoppable checks' scenes (run_unstoppable_checks; sim thread). Each starts from flat dirt around the player
 // with no zombie, NPC or grab left: 42 a zombie east holding the torso, 43 zombies on all eight squares around, four
-// of them holding on (the user's case: no way out while the no-damage cheat keeps you alive), 46 a hostile NPC east;
-// none of them gets a move. 44 only clears up.
+// of them holding on (the user's case: no way out while the no-damage cheat keeps you alive), 46 a hostile NPC east,
+// 47 deep water around the player (3 by 3) and a zombie east in it, 48 a fungaloid tower (IMMOBILE) east, 49 a hostile
+// NPC east on a vehicle seat; none of them gets a move. 44 only clears up (dirt again, no vehicle).
 void unstop_scene( int scene )
 {
     avatar &u = get_avatar();
@@ -798,28 +803,48 @@ void unstop_scene( int scene )
         unstop_npc.reset();
     }
     u.remove_effect( effect_grabbed );
-    if( scene == 44 ) {
-        return;
-    }
+    // Scene 47's swim may sink a heavy swimmer (and wets what they carry: CDDA's water_affect_items); each scene
+    // starts on dry land, above water.
+    u.set_underwater( false );
     for( int dx = -2; dx <= 2; dx++ ) {
         for( int dy = -2; dy <= 2; dy++ ) {
             const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+            if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                here.destroy_vehicle( &vp->vehicle() );
+            }
             here.i_clear( q );
             here.furn_set( q, furn_str_id::NULL_ID() );
-            here.ter_set( q, ter_t_dirt );
+            here.ter_set( q, scene == 47 && std::abs( dx ) <= 1 && std::abs( dy ) <= 1 ? ter_t_water_dp : ter_t_dirt );
         }
     }
     unstop_origin = u.pos_abs();
-    if( scene == 46 ) {
+    if( scene == 44 ) {
+        here.invalidate_map_cache( p.z() );
+        here.build_map_cache( p.z() );
+        return;
+    }
+    const tripoint_bub_ms east = p + tripoint_rel_ms( 1, 0, 0 );
+    if( scene == 46 || scene == 49 ) {
+        if( scene == 49 ) {
+            if( vehicle *veh = here.add_vehicle( vehicle_prototype_none, east, 0_degrees, 0, 0 ) ) {
+                veh->install_part( here, point_rel_ms::zero, vpart_frame );
+                veh->install_part( here, point_rel_ms::zero, vpart_seat );
+                here.add_vehicle_to_cache( veh );
+            }
+        }
         shared_ptr_fast<npc> guy = make_shared_fast<npc>();
         guy->normalize();
         guy->randomize();
-        guy->spawn_at_precise( here.get_abs( p + tripoint_rel_ms( 1, 0, 0 ) ) );
+        guy->spawn_at_precise( here.get_abs( east ) );
         overmap_buffer.insert_npc( guy );
         g->load_npcs();
         guy->set_attitude( NPCATT_KILL );
         guy->set_moves( -1000000 );
         unstop_npc = guy->getID();
+    } else if( scene == 47 || scene == 48 ) {
+        if( monster *const z = g->place_critter_at( scene == 47 ? mon_zombie : mon_fungaloid_tower, east ) ) {
+            z->set_moves( -1000000 );
+        }
     } else {
         for( int dx = -1; dx <= 1; dx++ ) {
             for( int dy = -1; dy <= 1; dy++ ) {
@@ -864,7 +889,15 @@ void unstop_look()
         }
     }
     const tripoint_rel_ms d = u.pos_abs() - unstop_origin;
-    const Creature *at_origin = get_creature_tracker().creature_at( here.get_bub( unstop_origin ) );
+    creature_tracker &creatures = get_creature_tracker();
+    const Creature *at_origin = creatures.creature_at( here.get_bub( unstop_origin ) );
+    const Creature *at_east = creatures.creature_at( here.get_bub( unstop_origin ) + tripoint_rel_ms( 1, 0, 0 ) );
+    int under = 0;
+    for( monster &z : g->all_monsters() ) {
+        under += z.pos_abs() == u.pos_abs() ? 1 : 0;
+    }
+    unstop_view.under = under;
+    unstop_view.east = at_east == nullptr || at_east->is_avatar() ? 0 : at_east->is_npc() ? 2 : 1;
     unstop_view.grabbed = static_cast<int>( u.get_effects_with_flag( json_flag_GRAB ).size() );
     unstop_view.grabbing = grabbing;
     unstop_view.zombies = zombies;
@@ -949,6 +982,15 @@ void observe()
             break;
         case 46:
             unstop_scene( 46 );
+            break;
+        case 47:
+            unstop_scene( 47 );
+            break;
+        case 48:
+            unstop_scene( 48 );
+            break;
+        case 49:
+            unstop_scene( 49 );
             break;
         case 45:
             unstop_look();
@@ -5909,7 +5951,8 @@ static bool run_smash_checks()
 // holding the torso keeps holding when the player bumps it (CDDA's bump attack, no step), and zombies all around
 // stop a step. On: the next action breaks the grab the way CDDA's won break-free does (both sides cleared), and a
 // step into a zombie swaps places with it at a normal step's cost, with no attack; a hostile NPC is pushed past
-// too. The one-shot breaks a grab with the cheat off.
+// too. A swim pushes a zombie aside (never under the player); an IMMOBILE monster and an NPC on a vehicle part are
+// bumped as without the cheat. The one-shot breaks a grab with the cheat off.
 static bool run_unstoppable_checks()
 {
     int failed = 0;
@@ -5973,6 +6016,8 @@ static bool run_unstoppable_checks()
         int dx = 0;
         int dy = 0;
         int origin = 0;
+        int east = 0;
+        int under = 0;
         int turn = 0;
     };
     const auto look_now = [&]() {
@@ -5988,12 +6033,15 @@ static bool run_unstoppable_checks()
         l.dx = unstop_view.dx.load();
         l.dy = unstop_view.dy.load();
         l.origin = unstop_view.origin.load();
+        l.east = unstop_view.east.load();
+        l.under = unstop_view.under.load();
         l.turn = unstop_view.turn.load();
         return l;
     };
     const auto describe = []( const look & l ) {
-        return string_format( "grabbed %d grabbing %d, %d zombies %d hp, at %+d,%+d, start square %d, turn %d",
-                              l.grabbed, l.grabbing, l.zombies, l.hp, l.dx, l.dy, l.origin, l.turn );
+        return string_format( "grabbed %d grabbing %d, %d zombies %d hp, at %+d,%+d, start square %d, east %d, "
+                              "under %d, turn %d", l.grabbed, l.grabbing, l.zombies, l.hp, l.dx, l.dy, l.origin,
+                              l.east, l.under, l.turn );
     };
     const auto has = []( const std::string & str, const char *part ) {
         return str.find( part ) != std::string::npos;
@@ -6060,6 +6108,35 @@ static bool run_unstoppable_checks()
     l = look_now();
     check( l.dx == 1 && l.dy == 0 && l.origin == 2, "on: a step into a hostile NPC swaps places",
            describe( l ) + " [" + m + "]" );
+
+    // On, both in deep water: the step is CDDA's swim, which moves nobody aside, so the zombie goes to a free
+    // square next to it first, never under the player.
+    check( scene( 47 ), "scene: deep water, a zombie east in it", "" );
+    l = look_now();
+    const bool zombie_east = l.east == 1;
+    m = act( "RIGHT" );
+    l = look_now();
+    check( zombie_east && l.dx == 1 && l.dy == 0 && l.zombies == 1 && l.under == 0 && l.origin == 0 &&
+           has( m, "aside" ), "on: a swim into a zombie pushes it aside, not under you",
+           describe( l ) + " [" + m + "]" );
+
+    // On: one CDDA never displaces (a fungaloid tower, IMMOBILE) is bumped as without the cheat: no step.
+    check( scene( 48 ), "scene: a fungaloid tower east", "" );
+    l = look_now();
+    const bool tower_east = l.east == 1;
+    m = act( "RIGHT" );
+    l = look_now();
+    check( tower_east && l.dx == 0 && l.dy == 0 && l.origin == 0 && l.under == 0,
+           "on: an immobile one isn't moved", describe( l ) + " [" + m + "]" );
+
+    // On: a hostile NPC on a vehicle part is bumped as without the cheat (CDDA's swap boards and unboards both).
+    check( scene( 49 ), "scene: a hostile NPC east on a seat", "" );
+    l = look_now();
+    const bool npc_east = l.east == 2;
+    m = act( "RIGHT" );
+    l = look_now();
+    check( npc_east && l.dx == 0 && l.dy == 0 && l.origin == 0 && l.east == 2,
+           "on: a hostile NPC on a vehicle isn't swapped", describe( l ) + " [" + m + "]" );
 
     // Off again: surrounded and held, the step is CDDA's bump attack and every grab holds.
     check( set_unstoppable( false ), "turned off", "" );
