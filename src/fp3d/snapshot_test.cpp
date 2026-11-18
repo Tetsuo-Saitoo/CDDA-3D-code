@@ -46,6 +46,7 @@
 #include "trap.h"
 #include "type_id.h"
 #include "units.h"
+#include "veh_type.h"
 #include "vehicle.h"
 #include "vpart_position.h"
 #include "vpart_range.h"
@@ -929,20 +930,26 @@ int main()
             g->cleanup_dead();
         }
         {
-            // Where a vehicle's parts are: an L of four frames facing 0, 90 and 45 degrees. Each row's (dx, dy, dz)
+            // Where a vehicle's parts are. An L of four frames facing 0, 90 and 45 degrees: each row's (dx, dy, dz)
             // is the part's square from the vehicle's position as CDDA has it, and the map finds this vehicle on
             // that square. (The client can't turn the mounts itself: CDDA steps along a ray around a pivot.)
-            const std::array<point_rel_ms, 4> mounts = { { point_rel_ms( 0, 0 ), point_rel_ms( 1, 0 ), point_rel_ms( 2, 0 ), point_rel_ms( 0, 1 ) } };
+            // A wall of three boards at 0 and 45 degrees: at an angle CDDA fills the diagonal gaps with copies of
+            // the boards, which come as extra rows (part_gap_filler) and carry the vehicle flag on their tiles.
+            const std::vector<point_rel_ms> ell = { point_rel_ms( 0, 0 ), point_rel_ms( 1, 0 ), point_rel_ms( 2, 0 ), point_rel_ms( 0, 1 ) };
+            const std::vector<point_rel_ms> line = { point_rel_ms( 0, 0 ), point_rel_ms( 1, 0 ), point_rel_ms( 2, 0 ) };
             struct test_car {
                 const char *name;
                 units::angle dir;
                 tripoint_rel_ms at;
+                bool wall;
                 vehicle *veh = nullptr;
             };
-            std::array<test_car, 3> cars = { {
-                    { "fp3d car 0", 0_degrees, tripoint_rel_ms( 9, 9, 0 ) },
-                    { "fp3d car 90", 90_degrees, tripoint_rel_ms( 9, -9, 0 ) },
-                    { "fp3d car 45", 45_degrees, tripoint_rel_ms( -9, 9, 0 ) }
+            std::array<test_car, 5> cars = { {
+                    { "fp3d car 0", 0_degrees, tripoint_rel_ms( 9, 9, 0 ), false },
+                    { "fp3d car 90", 90_degrees, tripoint_rel_ms( 9, -9, 0 ), false },
+                    { "fp3d car 45", 45_degrees, tripoint_rel_ms( -9, 9, 0 ), false },
+                    { "fp3d wall 0", 0_degrees, tripoint_rel_ms( -9, -9, 0 ), true },
+                    { "fp3d wall 45", 45_degrees, tripoint_rel_ms( 18, 0, 0 ), true }
                 }
             };
             for( test_car &c : cars ) {
@@ -957,8 +964,11 @@ int main()
                 }
                 c.veh = here.add_vehicle( vehicle_prototype_none, mid, c.dir, 0, 0 );
                 if( c.veh != nullptr ) {
-                    for( const point_rel_ms &m : mounts ) {
+                    for( const point_rel_ms &m : c.wall ? line : ell ) {
                         c.veh->install_part( here, m, vpart_frame );
+                        if( c.wall ) {
+                            c.veh->install_part( here, m, vpart_id( "board" ) );
+                        }
                     }
                     c.veh->name = c.name;
                     here.add_vehicle_to_cache( c.veh );
@@ -968,6 +978,18 @@ int main()
             const std::shared_ptr<const fp3d::snapshot> parked = timed_capture( ms );
             std::ostringstream parked_json;
             fp3d::write_snapshot_json( parked_json, *parked, u.posz(), u.posz() );
+            // The snapshot's vehicle flag on a square of the bubble.
+            const auto flagged = [&]( const tripoint_bub_ms & p ) {
+                const tripoint_abs_ms abs = here.get_abs( p );
+                const tripoint_abs_sm sm_pos = project_to<coords::sm>( abs );
+                for( const std::shared_ptr<const fp3d::submap_view> &sm : parked->submaps ) {
+                    if( key_of( *sm ) == key{ sm_pos.x(), sm_pos.y(), sm_pos.z() } ) {
+                        const point local = abs.raw().xy() - project_to<coords::ms>( sm_pos ).raw().xy();
+                        return ( sm->flags[local.y * fp3d::sm_size + local.x] & fp3d::tile_has_vehicle ) != 0;
+                    }
+                }
+                return false;
+            };
             for( const test_car &c : cars ) {
                 const fp3d::vehicle_view *view = nullptr;
                 for( const fp3d::vehicle_view &v : parked->vehicles ) {
@@ -980,47 +1002,81 @@ int main()
                 int found_by_map = 0;
                 std::set<std::tuple<int, int, int>> squares;
                 size_t real_parts = 0;
+                size_t fillers = 0;
+                int fillers_right = 0;
                 if( view != nullptr && c.veh != nullptr ) {
                     const tripoint_bub_ms origin = c.veh->pos_bub( here );
+                    const auto note = [&]( const fp3d::vehicle_part_view & row ) {
+                        const optional_vpart_position there = here.veh_at( origin + tripoint_rel_ms( row.dx, row.dy,
+                                row.dz ) );
+                        found_by_map += there && &there->vehicle() == c.veh &&
+                                        flagged( origin + tripoint_rel_ms( row.dx, row.dy, row.dz ) ) ? 1 : 0;
+                        rows += std::string( " [" ) + ( row.state & fp3d::part_gap_filler ? "filler " : "" ) +
+                                std::to_string( row.mount_x ) + "," + std::to_string( row.mount_y ) + " -> " +
+                                std::to_string( row.dx ) + "," + std::to_string( row.dy ) + "," +
+                                std::to_string( row.dz ) + "]";
+                    };
+                    // Its own parts first, in CDDA's order.
                     for( const vpart_reference &vp : c.veh->get_all_parts() ) {
                         if( real_parts < view->parts.size() ) {
                             const fp3d::vehicle_part_view &row = view->parts[real_parts];
                             const tripoint_rel_ms want = vp.pos_bub( here ) - origin;
                             right += row.mount_x == vp.part().mount.x() && row.mount_y == vp.part().mount.y() &&
-                                     row.dx == want.x() && row.dy == want.y() && row.dz == want.z() ? 1 : 0;
-                            const optional_vpart_position there = here.veh_at( origin + tripoint_rel_ms( row.dx, row.dy,
-                                    row.dz ) );
-                            found_by_map += there && &there->vehicle() == c.veh ? 1 : 0;
+                                     row.dx == want.x() && row.dy == want.y() && row.dz == want.z() &&
+                                     ( row.state & fp3d::part_gap_filler ) == 0 ? 1 : 0;
                             squares.emplace( row.dx, row.dy, row.dz );
-                            rows += " [" + std::to_string( row.mount_x ) + "," + std::to_string( row.mount_y ) + " -> " +
-                                    std::to_string( row.dx ) + "," + std::to_string( row.dy ) + "," +
-                                    std::to_string( row.dz ) + "]";
+                            note( row );
                         }
                         real_parts++;
                     }
+                    // Then CDDA's active fake parts: the copied part's mount and vpart, the fake's own square, which
+                    // is none of the vehicle's own.
+                    for( const vpart_reference &vp : c.veh->get_all_parts_with_fakes() ) {
+                        if( !vp.part().is_fake ) {
+                            continue;
+                        }
+                        const size_t at = real_parts + fillers;
+                        if( at < view->parts.size() ) {
+                            const fp3d::vehicle_part_view &row = view->parts[at];
+                            const vehicle_part &copied = c.veh->part( vp.part().fake_part_to );
+                            const tripoint_rel_ms want = vp.pos_bub( here ) - origin;
+                            fillers_right += ( row.state & fp3d::part_gap_filler ) != 0 &&
+                                             row.mount_x == copied.mount.x() && row.mount_y == copied.mount.y() &&
+                                             row.vpart == fp3d::intern_id( fp3d::id_kind::vpart, copied.info().id.str() ) &&
+                                             row.dx == want.x() && row.dy == want.y() && row.dz == want.z() &&
+                                             squares.count( { row.dx, row.dy, row.dz } ) == 0 ? 1 : 0;
+                            note( row );
+                        }
+                        fillers++;
+                    }
                 }
-                check( view != nullptr && real_parts == mounts.size() && view->parts.size() == real_parts &&
-                       right == static_cast<int>( real_parts ) && found_by_map == right &&
-                       squares.size() == real_parts, ( std::string( c.name ) + ": each part's square" ).c_str(),
+                const size_t mounts = c.wall ? line.size() : ell.size();
+                const size_t want_real = c.wall ? 2 * mounts : mounts;
+                const bool fillers_as_expected = c.wall && c.dir != 0_degrees ? fillers >= 1 : fillers == 0;
+                check( view != nullptr && real_parts == want_real && view->parts.size() == real_parts + fillers &&
+                       right == static_cast<int>( real_parts ) && fillers_right == static_cast<int>( fillers ) &&
+                       found_by_map == static_cast<int>( real_parts + fillers ) && squares.size() == mounts &&
+                       fillers_as_expected, ( std::string( c.name ) + ": each part's square" ).c_str(),
                        view == nullptr ? "vehicle not seen" : "face " + std::to_string( static_cast<int>( std::lround(
                                    view->face_deg ) ) ) + " deg, mount -> dx,dy,dz:" + rows + "; " +
-                       std::to_string( found_by_map ) + " found there by the map" );
+                       std::to_string( fillers ) + " gap fillers; " + std::to_string( found_by_map ) +
+                       " found and flagged there" );
             }
             // The JSON row: the five fields older bridges sent, then dx, dy, dz.
             bool row_written = false;
             for( const fp3d::vehicle_view &v : parked->vehicles ) {
-                if( v.name == "fp3d car 45" && !v.parts.empty() ) {
+                if( v.name == "fp3d wall 45" && !v.parts.empty() ) {
                     const fp3d::vehicle_part_view &row = v.parts.back();
                     const std::string want = "[" + std::to_string( row.mount_x ) + "," + std::to_string( row.mount_y ) +
                                              "," + std::to_string( row.vpart ) + "," + std::to_string( row.hp_frac ) +
                                              "," + std::to_string( row.state ) + "," + std::to_string( row.dx ) + "," +
                                              std::to_string( row.dy ) + "," + std::to_string( row.dz ) + "]";
-                    const size_t named_at = parked_json.str().find( "\"name\":\"fp3d car 45\"" );
-                    row_written = named_at != std::string::npos &&
+                    const size_t named_at = parked_json.str().find( "\"name\":\"fp3d wall 45\"" );
+                    row_written = ( row.state & fp3d::part_gap_filler ) != 0 && named_at != std::string::npos &&
                                   parked_json.str().find( want, named_at ) != std::string::npos;
                 }
             }
-            check( row_written, "a part's JSON row: mount, vpart, hp, state, then dx, dy, dz" );
+            check( row_written, "a gap filler's JSON row: mount, vpart, hp, state with bit 3, then dx, dy, dz" );
             for( const test_car &c : cars ) {
                 if( c.veh != nullptr ) {
                     here.destroy_vehicle( c.veh );
