@@ -12,8 +12,13 @@
 
 #include "achievement.h"
 #include "avatar.h"
+#include "bodypart.h"
 #include "calendar.h"
+#include "character.h"
 #include "coordinates.h"
+#include "creature.h"
+#include "creature_tracker.h"
+#include "effect.h"
 #include "fp3d/arrival.h"
 #include "fp3d/bridge.h"
 #include "fp3d/test_range.h"
@@ -23,10 +28,16 @@
 #include "itype.h"
 #include "map.h"
 #include "map_scale_constants.h"
+#include "mapdata.h"
 #include "messages.h"
+#include "monster.h"
+#include "mtype.h"
+#include "npc.h"
 #include "options.h"
 #include "translations.h"
 #include "type_id.h"
+#include "vehicle.h"
+#include "vpart_position.h"
 #include "weather.h"
 #include "weather_type.h"
 
@@ -48,6 +59,15 @@ static const itype_id itype_scar_l( "scar_l" );
 static const itype_id itype_screwdriver_set( "screwdriver_set" );
 static const itype_id itype_water_clean( "water_clean" );
 
+static const efftype_id effect_harnessed( "harnessed" );
+static const efftype_id effect_pet( "pet" );
+static const efftype_id effect_ridden( "ridden" );
+
+static const flag_id json_flag_GRAB( "GRAB" );
+
+static const json_character_flag json_flag_CANNOT_MOVE( "CANNOT_MOVE" );
+static const json_character_flag json_flag_WATERWALKING( "WATERWALKING" );
+
 static const trait_id trait_DEBUG_CARDIO( "DEBUG_CARDIO" );
 static const trait_id trait_DEBUG_LS( "DEBUG_LS" );
 static const trait_id trait_DEBUG_NIGHTVISION( "DEBUG_NIGHTVISION" );
@@ -62,9 +82,31 @@ namespace fp3d
 namespace
 {
 constexpr std::array<const char *, cheat_count> names = {
-    "invincible", "no_needs", "no_weight_limit", "unlimited_ammo", "stamina", "no_temperature", "night_vision"
+    "invincible", "no_needs", "no_weight_limit", "unlimited_ammo", "stamina", "no_temperature", "night_vision",
+    "unstoppable"
 };
 const std::string ammo_value = "fp3d_cheat_ammo";
+const std::string unstoppable_value = "fp3d_cheat_unstoppable";
+
+// The cheats kept in an avatar var rather than traits.
+const std::string *value_of( cheat c )
+{
+    switch( c ) {
+        case cheat::unlimited_ammo:
+            return &ammo_value;
+        case cheat::unstoppable:
+            return &unstoppable_value;
+        case cheat::invincible:
+        case cheat::no_needs:
+        case cheat::no_weight_limit:
+        case cheat::stamina:
+        case cheat::no_temperature:
+        case cheat::night_vision:
+        case cheat::count:
+            break;
+    }
+    return nullptr;
+}
 
 std::vector<trait_id> traits_of( cheat c )
 {
@@ -82,6 +124,7 @@ std::vector<trait_id> traits_of( cheat c )
         case cheat::night_vision:
             return { trait_DEBUG_NIGHTVISION };
         case cheat::unlimited_ammo:
+        case cheat::unstoppable:
         case cheat::count:
             break;
     }
@@ -217,12 +260,14 @@ void give_test_kit( avatar &u )
 
 void set_cheat( avatar &u, cheat c, bool on )
 {
-    if( c == cheat::unlimited_ammo ) {
+    if( const std::string *value = value_of( c ) ) {
         if( on ) {
-            u.set_value( ammo_value, std::string( "1" ) );
-            top_up( u );
+            u.set_value( *value, std::string( "1" ) );
+            if( c == cheat::unlimited_ammo ) {
+                top_up( u );
+            }
         } else {
-            u.remove_value( ammo_value );
+            u.remove_value( *value );
         }
     } else {
         for( const trait_id &t : traits_of( c ) ) {
@@ -489,6 +534,17 @@ std::string run_range_op( const range_op &op )
             return teleport_to_square( op.square );
         case range_op_kind::weather:
             return set_weather( op.weather, op.wind );
+        case range_op_kind::break_grabs:
+            // Checked again here, on the sim thread: allowing may have been turned off since it was queued.
+            if( !cheats_allowed() ) {
+                return "Cheats aren't allowed.";
+            }
+            if( g->uquit != QUIT_NO || get_avatar().is_dead_state() ) {
+                return "Not now.";
+            }
+            no_achievements();
+            break_grabs( get_avatar() );
+            return "";
     }
     return "No such operation.";
 }
@@ -525,8 +581,8 @@ cheats_view latest_cheats()
 
 bool cheat_on( const avatar &u, cheat c )
 {
-    if( c == cheat::unlimited_ammo ) {
-        return u.maybe_get_value( ammo_value ) != nullptr;
+    if( const std::string *value = value_of( c ) ) {
+        return u.maybe_get_value( *value ) != nullptr;
     }
     const std::vector<trait_id> ts = traits_of( c );
     if( ts.empty() ) {
@@ -581,6 +637,155 @@ void cheats_turn( avatar &u )
     if( cheat_on( u, cheat::unlimited_ammo ) ) {
         top_up( u );
     }
+}
+
+int break_grabs( Character &u )
+{
+    int n = 0;
+    if( u.is_mounted() ) {
+        // As CDDA's break-free for a mount: the mount's grabbed effects go.
+        monster &mount = *u.mounted_creature;
+        std::vector<efftype_id> ids;
+        for( const effect &e : mount.get_effects_with_flag( json_flag_GRAB ) ) {
+            ids.push_back( e.get_id() );
+        }
+        for( const efftype_id &id : ids ) {
+            mount.remove_effect( id );
+            n++;
+        }
+        if( !ids.empty() ) {
+            u.add_msg_if_player( m_good, _( "Your %s breaks free from the grab!" ), mount.get_name() );
+        }
+    }
+    // Copied first: removing an effect would leave the list's references dangling.
+    std::vector<std::pair<efftype_id, bodypart_id>> grabs;
+    for( const effect &e : u.get_effects_with_flag( json_flag_GRAB ) ) {
+        grabs.emplace_back( e.get_id(), e.get_bp() );
+    }
+    map &here = get_map();
+    creature_tracker &creatures = get_creature_tracker();
+    for( const auto &[id, bp] : grabs ) {
+        monster *grabber = nullptr;
+        for( const tripoint_bub_ms &p : here.points_in_radius( u.pos_bub( here ), 1, 0 ) ) {
+            monster *const m = creatures.creature_at<monster>( p );
+            if( m != nullptr && m->is_grabbing( bp.id() ) ) {
+                grabber = m;
+                break;
+            }
+        }
+        if( grabber != nullptr ) {
+            grabber->remove_grab( bp.id() );
+            u.add_msg_player_or_npc( m_good, _( "You break %s grab on your %s!" ),
+                                     _( "<npcname> breaks %s grab on their %s!" ), grabber->disp_name( true ),
+                                     body_part_name( bp ) );
+        }
+        u.remove_effect( id, bp );
+        n++;
+    }
+    return n;
+}
+
+void unstoppable_acts( avatar &u )
+{
+    if( cheat_on( u, cheat::unstoppable ) ) {
+        break_grabs( u );
+    }
+}
+
+bool pushes_past( const avatar &u, const tripoint_bub_ms &dest )
+{
+    // A player who can't move steps (and bumps) as CDDA has it.
+    if( !cheat_on( u, cheat::unstoppable ) || u.has_flag( json_flag_CANNOT_MOVE ) ) {
+        return false;
+    }
+    map &here = get_map();
+    const tripoint_bub_ms from = u.pos_bub( here );
+    // A step on one level only; stairs and ramps stay CDDA's.
+    if( dest.z() != from.z() || rl_dist( from, dest ) != 1 ) {
+        return false;
+    }
+    // On a fast vehicle CDDA asks about diving off first: its bump.
+    const vehicle *const veh0 = veh_pointer_or_null( here.veh_at( from ) );
+    if( veh0 != nullptr && std::abs( veh0->velocity ) > 100 ) {
+        return false;
+    }
+    // Hostile as avatar_action::move judges it for its bump attack.
+    creature_tracker &creatures = get_creature_tracker();
+    if( const monster *const m = creatures.creature_at<monster>( dest, true ) ) {
+        // One CDDA never displaces (a turret, a fungal tower, harnessed, ridden) is bumped as without the cheat.
+        if( m->has_flag( mon_flag_IMMOBILE ) || m->has_flag( json_flag_CANNOT_MOVE ) ||
+            m->has_effect( effect_harnessed ) || m->has_effect( effect_ridden ) ) {
+            return false;
+        }
+        return m->friendly == 0 && !m->has_effect( effect_pet );
+    }
+    const npc *const np = creatures.creature_at<npc>( dest );
+    if( np == nullptr || !np->is_enemy() ) {
+        return false;
+    }
+    // CDDA's swap unboards both and boards them again, which a refused step would leave wrong: on a vehicle part
+    // (or mounted) an enemy NPC is bumped as without the cheat.
+    return !u.is_mounted() && !np->is_mounted() && !here.veh_at( from ) && !here.veh_at( dest );
+}
+
+// The step into `dest` will be avatar_action::move's swim (deep water, no boat): no displacement then.
+static bool step_swims( const avatar &u, const map &here, const tripoint_bub_ms &dest )
+{
+    return here.has_flag( ter_furn_flag::TFLAG_SWIMMABLE, dest ) &&
+           here.has_flag( ter_furn_flag::TFLAG_DEEP_WATER, dest ) && !here.has_flag_furn( "BRIDGE", dest ) &&
+           !here.veh_at( dest ) && !u.has_flag( json_flag_WATERWALKING );
+}
+
+push_result push_past( avatar &u, const tripoint_bub_ms &dest )
+{
+    if( !pushes_past( u, dest ) ) {
+        return push_result::none;
+    }
+    map &here = get_map();
+    const tripoint_bub_ms from = u.pos_bub( here );
+    creature_tracker &creatures = get_creature_tracker();
+    if( monster *const m = creatures.creature_at<monster>( dest, true ) ) {
+        if( m->is_hallucination() ) {
+            // As CDDA's bump into one: it vanishes (its displacement doesn't see hallucinations).
+            m->die( &here, &u );
+            return push_result::clear;
+        }
+        // CDDA's displacement in game::place_player moves it to the square left (a mount pushes it aside). A swim
+        // never gets there.
+        if( !step_swims( u, here, dest ) && ( u.is_mounted() || m->can_move_to( from ) ) ) {
+            return push_result::clear;
+        }
+        // The square left won't take it (deep water, a ledge), or the step is a swim: the nearest free square next
+        // to it.
+        for( const tripoint_bub_ms &p : here.points_in_radius( dest, 1, 0 ) ) {
+            if( p != dest && p != from && g->is_empty( p ) && m->can_move_to( p ) && m->move_to( p ) ) {
+                add_msg( _( "You push the %s aside." ), m->name() );
+                return push_result::clear;
+            }
+        }
+        add_msg( m_info, _( "There's no room to push past the %s." ), m->name() );
+        return push_result::refused;
+    }
+    npc *const np = creatures.creature_at<npc>( dest );
+    if( np == nullptr ) {
+        return push_result::none;
+    }
+    // CDDA's swap with a follower: the NPC takes the square left and the player walks (game::walk_move, a normal
+    // step's cost). The walk may refuse and the map may shift, so absolute squares are compared.
+    const tripoint_abs_ms from_abs = here.get_abs( from );
+    const tripoint_abs_ms dest_abs = here.get_abs( dest );
+    if( !g->swap_critters( u, *np ) ) {
+        return push_result::refused;
+    }
+    if( u.pos_abs() != dest_abs ) {
+        // The walk said why; the NPC goes back to its own square.
+        if( np->pos_abs() == from_abs ) {
+            np->setpos( dest_abs );
+        }
+        return push_result::refused;
+    }
+    add_msg( _( "You push past %s." ), np->get_name() );
+    return push_result::done;
 }
 
 void publish_cheats( const avatar &u )

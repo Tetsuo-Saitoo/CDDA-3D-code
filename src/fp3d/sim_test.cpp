@@ -38,6 +38,7 @@
 #include "calendar.h"
 #include "character_martial_arts.h"
 #include "coordinates.h"
+#include "creature_tracker.h"
 #include "cuboid_rectangle.h"
 #include "debug.h"
 #include "do_turn.h"
@@ -111,6 +112,7 @@ const itype_id itype_backpack( "backpack" );
 const itype_id itype_rock( "rock" );
 const mtype_id mon_zombie( "mon_zombie" );
 const mtype_id mon_horse( "mon_horse" );
+const mtype_id mon_fungaloid_tower( "mon_fungaloid_tower" );
 const itype_id itype_2h_flail_steel( "2h_flail_steel" );
 const itype_id itype_gasoline( "gasoline" );
 const itype_id itype_hose( "hose" );
@@ -135,6 +137,7 @@ const ter_str_id ter_t_dirt( "t_dirt" );
 const itype_id itype_bottle_twoliter( "bottle_twoliter" );
 const ter_str_id ter_t_open_air( "t_open_air" );
 const ter_str_id ter_t_water_sh( "t_water_sh" );
+const ter_str_id ter_t_water_dp( "t_water_dp" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
 const vpart_id vpart_tank_small( "tank_small" );
@@ -158,6 +161,8 @@ const trait_id trait_BADHEARING( "BADHEARING" );
 const trait_id trait_NIGHTVISION( "NIGHTVISION" );
 const bionic_id bio_flashlight( "bio_flashlight" );
 const efftype_id effect_winded( "winded" );
+const efftype_id effect_grabbed( "grabbed" );
+const flag_id json_flag_GRAB( "GRAB" );
 
 // Game state the driver checks; copied on the sim thread right before every request.
 struct observed {
@@ -228,6 +233,23 @@ std::atomic<int> sealed_items{ -1 };            // item checks 2: items placed i
 uint64_t pk_rock_uid = 0;
 uint64_t pk_wielded_uid = 0;
 std::atomic<int> hand_setup{ 0 };
+// The unstoppable checks (unstop_scene, unstop_look): the scene's start square and NPC (sim thread only), and the last
+// look at it (the sim thread writes, the driver reads after the next request).
+tripoint_abs_ms unstop_origin;
+std::optional<character_id> unstop_npc;
+struct unstop_look_t {
+    std::atomic<int> grabbed{ 0 };        // the player's grabbed effects
+    std::atomic<int> grabbing{ 0 };       // the body parts monsters hold (torso, right arm, left leg, left arm)
+    std::atomic<int> zombies{ 0 };
+    std::atomic<int> hp{ 0 };             // all monsters' hit points together
+    std::atomic<int> dx{ 0 };             // the player from the start square
+    std::atomic<int> dy{ 0 };
+    std::atomic<int> origin{ 0 };         // on the start square: 0 nobody (or the player), 1 a monster, 2 an NPC
+    std::atomic<int> east{ 0 };           // the same for the square east of it
+    std::atomic<int> under{ 0 };          // monsters on the player's own square
+    std::atomic<int> turn{ 0 };
+};
+unstop_look_t unstop_view;
 // The smash checks' scene (hand_setup 40 / 41): what the avatar wielded before it (sim thread only).
 std::optional<item> smash_saved_weapon;
 // The random start's strength while a scene sets its own (sim thread only; -1 = nothing saved).
@@ -764,6 +786,128 @@ static void fresh_cook_water( map &here, const tripoint_bub_ms &fire_at )
     }
 }
 
+// The unstoppable checks' scenes (run_unstoppable_checks; sim thread). Each starts from flat dirt around the player
+// with no zombie, NPC or grab left: 42 a zombie east holding the torso, 43 zombies on all eight squares around, four
+// of them holding on (the user's case: no way out while the no-damage cheat keeps you alive), 46 a hostile NPC east,
+// 47 deep water around the player (3 by 3) and a zombie east in it, 48 a fungaloid tower (IMMOBILE) east, 49 a hostile
+// NPC east on a vehicle seat; none of them gets a move. 44 only clears up (dirt again, no vehicle).
+void unstop_scene( int scene )
+{
+    avatar &u = get_avatar();
+    map &here = get_map();
+    const tripoint_bub_ms p = u.pos_bub( here );
+    g->clear_zombies();
+    if( unstop_npc ) {
+        g->remove_npc( *unstop_npc );
+        overmap_buffer.remove_npc( *unstop_npc );
+        unstop_npc.reset();
+    }
+    u.remove_effect( effect_grabbed );
+    // Scene 47's swim may sink a heavy swimmer (and wets what they carry: CDDA's water_affect_items); each scene
+    // starts on dry land, above water.
+    u.set_underwater( false );
+    for( int dx = -2; dx <= 2; dx++ ) {
+        for( int dy = -2; dy <= 2; dy++ ) {
+            const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+            if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                here.destroy_vehicle( &vp->vehicle() );
+            }
+            here.i_clear( q );
+            here.furn_set( q, furn_str_id::NULL_ID() );
+            here.ter_set( q, scene == 47 && std::abs( dx ) <= 1 && std::abs( dy ) <= 1 ? ter_t_water_dp : ter_t_dirt );
+        }
+    }
+    unstop_origin = u.pos_abs();
+    if( scene == 44 ) {
+        here.invalidate_map_cache( p.z() );
+        here.build_map_cache( p.z() );
+        return;
+    }
+    const tripoint_bub_ms east = p + tripoint_rel_ms( 1, 0, 0 );
+    if( scene == 46 || scene == 49 ) {
+        if( scene == 49 ) {
+            if( vehicle *veh = here.add_vehicle( vehicle_prototype_none, east, 0_degrees, 0, 0 ) ) {
+                veh->install_part( here, point_rel_ms::zero, vpart_frame );
+                veh->install_part( here, point_rel_ms::zero, vpart_seat );
+                here.add_vehicle_to_cache( veh );
+            }
+        }
+        shared_ptr_fast<npc> guy = make_shared_fast<npc>();
+        guy->normalize();
+        guy->randomize();
+        guy->spawn_at_precise( here.get_abs( east ) );
+        overmap_buffer.insert_npc( guy );
+        g->load_npcs();
+        guy->set_attitude( NPCATT_KILL );
+        guy->set_moves( -1000000 );
+        unstop_npc = guy->getID();
+    } else if( scene == 47 || scene == 48 ) {
+        if( monster *const z = g->place_critter_at( scene == 47 ? mon_zombie : mon_fungaloid_tower, east ) ) {
+            z->set_moves( -1000000 );
+        }
+    } else {
+        for( int dx = -1; dx <= 1; dx++ ) {
+            for( int dy = -1; dy <= 1; dy++ ) {
+                if( ( dx == 0 && dy == 0 ) || ( scene == 42 && !( dx == 1 && dy == 0 ) ) ) {
+                    continue;
+                }
+                if( monster *const z = g->place_critter_at( mon_zombie, p + tripoint_rel_ms( dx, dy, 0 ) ) ) {
+                    z->set_moves( -1000000 );
+                    // East holds the torso, north-east the right arm, south the left leg, west the left arm.
+                    const bodypart_str_id bp = dx == 1 && dy == 0 ? body_part_torso : scene == 42 ?
+                                               bodypart_str_id::NULL_ID() : dx == 1 && dy == -1 ? body_part_arm_r :
+                                               dx == 0 && dy == 1 ? body_part_leg_l : dx == -1 && dy == 0 ? body_part_arm_l :
+                                               bodypart_str_id::NULL_ID();
+                    if( !bp.is_null() ) {
+                        // As CDDA's grab attack (mattack_actors.cpp): the grabber's side and the effect.
+                        z->add_grab( bp );
+                        u.add_effect( effect_grabbed, 1_days, bp.id(), true, 100 );
+                    }
+                }
+            }
+        }
+    }
+    here.invalidate_map_cache( p.z() );
+    here.build_map_cache( p.z() );
+}
+
+// The unstoppable checks' look at the scene (hand_setup 45, between two requests: nothing acts).
+void unstop_look()
+{
+    const avatar &u = get_avatar();
+    map &here = get_map();
+    int grabbing = 0;
+    int zombies = 0;
+    int hp = 0;
+    for( monster &z : g->all_monsters() ) {
+        zombies++;
+        hp += z.get_hp();
+        for( const bodypart_str_id &bp : {
+                 body_part_torso, body_part_arm_r, body_part_leg_l, body_part_arm_l
+             } ) {
+            grabbing += z.is_grabbing( bp ) ? 1 : 0;
+        }
+    }
+    const tripoint_rel_ms d = u.pos_abs() - unstop_origin;
+    creature_tracker &creatures = get_creature_tracker();
+    const Creature *at_origin = creatures.creature_at( here.get_bub( unstop_origin ) );
+    const Creature *at_east = creatures.creature_at( here.get_bub( unstop_origin ) + tripoint_rel_ms( 1, 0, 0 ) );
+    int under = 0;
+    for( monster &z : g->all_monsters() ) {
+        under += z.pos_abs() == u.pos_abs() ? 1 : 0;
+    }
+    unstop_view.under = under;
+    unstop_view.east = at_east == nullptr || at_east->is_avatar() ? 0 : at_east->is_npc() ? 2 : 1;
+    unstop_view.grabbed = static_cast<int>( u.get_effects_with_flag( json_flag_GRAB ).size() );
+    unstop_view.grabbing = grabbing;
+    unstop_view.zombies = zombies;
+    unstop_view.hp = hp;
+    unstop_view.dx = d.x();
+    unstop_view.dy = d.y();
+    unstop_view.origin = at_origin == nullptr || at_origin->is_avatar() ? 0 : at_origin->is_npc() ? 2 : 1;
+    unstop_view.turn = to_turn<int>( calendar::turn );
+}
+
 void observe()
 {
     observe_calls++;
@@ -827,6 +971,30 @@ void observe()
             here.build_map_cache( p.z() );
             break;
         }
+        case 42:
+            unstop_scene( 42 );
+            break;
+        case 43:
+            unstop_scene( 43 );
+            break;
+        case 44:
+            unstop_scene( 44 );
+            break;
+        case 46:
+            unstop_scene( 46 );
+            break;
+        case 47:
+            unstop_scene( 47 );
+            break;
+        case 48:
+            unstop_scene( 48 );
+            break;
+        case 49:
+            unstop_scene( 49 );
+            break;
+        case 45:
+            unstop_look();
+            break;
         case 41: {
             // After the smash checks: flat dirt again (no glass about), the weapon from before.
             for( int dx = -2; dx <= 2; dx++ ) {
@@ -5779,6 +5947,228 @@ static bool run_smash_checks()
 
 // Safe mode (2026-11-10): FP3D games start with CDDA's safe mode off, new and loaded (boot.cpp); the `safemode`
 // action (Shift+1) still toggles it; auto-pause on a new hostile is its own clock setting (bridge.h).
+// The Unstoppable cheat (fp3d/cheats.h, 2026-11-17) and "Break all grabs" (range_op_kind::break_grabs). Off: a zombie
+// holding the torso keeps holding when the player bumps it (CDDA's bump attack, no step), and zombies all around
+// stop a step. On: the next action breaks the grab the way CDDA's won break-free does (both sides cleared), and a
+// step into a zombie swaps places with it at a normal step's cost, with no attack; a hostile NPC is pushed past
+// too. A swim pushes a zombie aside (never under the player); an IMMOBILE monster and an NPC on a vehicle part are
+// bumped as without the cheat. The one-shot breaks a grab with the cheat off.
+static bool run_unstoppable_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  unstoppable: %-52s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    // `action` queued and run to the next main-loop request (prompts cancelled): its messages.
+    const auto act = [&]( const char *action ) {
+        std::vector<fp3d::event> evs;
+        fp3d::drain_events( evs );
+        evs.clear();
+        if( !fp3d::queue_action( action ) ) {
+            return std::string( "(refused)" );
+        }
+        const uint64_t before = r->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 20000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, r->id );
+            if( !next ) {
+                continue;
+            }
+            r = next;
+            if( !r->timed ) {
+                fp3d::ui_answer a;
+                a.id = r->id;
+                a.cancel = true;
+                fp3d::answer( a );
+                continue;
+            }
+            if( r->id != before ) {
+                break;
+            }
+        }
+        fp3d::drain_events( evs );
+        std::string msgs;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                msgs += ( msgs.empty() ? "" : " | " ) + e.text;
+            }
+        }
+        return msgs;
+    };
+    // Scene `n` (unstop_scene / unstop_look) run before the next request; nothing acts ("no_such_action" is dropped).
+    const auto scene = [&]( int n ) {
+        hand_setup = n;
+        fp3d::queue_action( "no_such_action" );
+        r = fp3d::wait_request( 20000, r->id );
+        return r && r->timed && hand_setup.load() == 0;
+    };
+    struct look {
+        int grabbed = 0;
+        int grabbing = 0;
+        int zombies = 0;
+        int hp = 0;
+        int dx = 0;
+        int dy = 0;
+        int origin = 0;
+        int east = 0;
+        int under = 0;
+        int turn = 0;
+    };
+    const auto look_now = [&]() {
+        look l;
+        if( !scene( 45 ) ) {
+            l.zombies = -1;
+            return l;
+        }
+        l.grabbed = unstop_view.grabbed.load();
+        l.grabbing = unstop_view.grabbing.load();
+        l.zombies = unstop_view.zombies.load();
+        l.hp = unstop_view.hp.load();
+        l.dx = unstop_view.dx.load();
+        l.dy = unstop_view.dy.load();
+        l.origin = unstop_view.origin.load();
+        l.east = unstop_view.east.load();
+        l.under = unstop_view.under.load();
+        l.turn = unstop_view.turn.load();
+        return l;
+    };
+    const auto describe = []( const look & l ) {
+        return string_format( "grabbed %d grabbing %d, %d zombies %d hp, at %+d,%+d, start square %d, east %d, "
+                              "under %d, turn %d", l.grabbed, l.grabbing, l.zombies, l.hp, l.dx, l.dy, l.origin,
+                              l.east, l.under, l.turn );
+    };
+    const auto has = []( const std::string & str, const char *part ) {
+        return str.find( part ) != std::string::npos;
+    };
+    // The cheat as the bridge asks for it, then a request so it is applied and published.
+    const auto set_unstoppable = [&]( bool on ) {
+        const uint32_t bit = 1U << static_cast<int>( fp3d::cheat::unstoppable );
+        if( !fp3d::request_cheat( fp3d::cheat::unstoppable, on ) || !scene( 0 ) ) {
+            return false;
+        }
+        return ( ( fp3d::latest_cheats().on & bit ) != 0 ) == on;
+    };
+
+    check( fp3d::cheat_from_name( "unstoppable" ) == fp3d::cheat::unstoppable &&
+           std::string( fp3d::cheat_name( fp3d::cheat::unstoppable ) ) == "unstoppable", "named \"unstoppable\"", "" );
+    const bool cheats_were = fp3d::cheats_allowed();
+    fp3d::set_cheats_allowed( false );
+    fp3d::range_op op;
+    op.kind = fp3d::range_op_kind::break_grabs;
+    check( !fp3d::request_cheat( fp3d::cheat::unstoppable, true ) && fp3d::request_range_op( op ) == 0,
+           "refused while cheats aren't allowed (cheat, break all grabs)", "" );
+    fp3d::set_cheats_allowed( true );
+    check( set_unstoppable( false ), "off at first", "" );
+
+    // Off: the grab holds and walking into the grabber is CDDA's bump attack.
+    check( scene( 42 ), "scene: a zombie east holding the torso", "" );
+    look l = look_now();
+    check( l.grabbed == 1 && l.grabbing == 1 && l.zombies == 1 && l.origin == 0, "held: both sides", describe( l ) );
+    std::string m = act( "RIGHT" );
+    l = look_now();
+    // A hit may stagger the zombie, and CDDA's staggered effect ends its side of the grab; the player stays held.
+    check( l.grabbed == 1 && l.dx == 0 && l.dy == 0 && l.zombies == 1,
+           "off: a step into it attacks, the grab holds", describe( l ) + " [" + m + "]" );
+
+    // On: the next action breaks it, both sides (a fresh grab).
+    check( scene( 42 ), "scene: held again", "" );
+    check( set_unstoppable( true ), "turned on", "" );
+    l = look_now();
+    check( l.grabbed == 1 && l.grabbing == 1, "turning it on breaks nothing yet", describe( l ) );
+    m = act( "pause" );
+    l = look_now();
+    check( l.grabbed == 0 && l.grabbing == 0 && l.dx == 0 && l.dy == 0 && has( m, "grab on your torso" ),
+           "on: waiting a turn breaks the grab, both sides", describe( l ) + " [" + m + "]" );
+
+    // On, with no-damage on too (the user's case), surrounded and held by four: one step east breaks every grab and
+    // swaps places with that zombie, no attack, a normal step's time.
+    const bool invincible_was = ( fp3d::latest_cheats().on & ( 1U << static_cast<int>( fp3d::cheat::invincible ) ) ) != 0;
+    fp3d::request_cheat( fp3d::cheat::invincible, true );
+    check( scene( 43 ), "scene: zombies on all eight squares, four holding on", "" );
+    const look before = look_now();
+    m = act( "RIGHT" );
+    l = look_now();
+    check( before.zombies == 8 && before.grabbed == 4 && before.grabbing == 4 && l.grabbed == 0 && l.grabbing == 0 &&
+           l.zombies == 8 && l.dx == 1 && l.dy == 0 && l.origin == 1 && l.hp == before.hp && l.turn - before.turn <= 1,
+           "on: one step breaks all four grabs and pushes past, no attack",
+           describe( before ) + " -> " + describe( l ) + " [" + m + "]" );
+    m = act( "RIGHT" );
+    l = look_now();
+    check( l.dx == 2 && l.dy == 0 && l.zombies == 8, "and the next step is out", describe( l ) + " [" + m + "]" );
+
+    // On: a hostile NPC is pushed past too.
+    check( scene( 46 ), "scene: a hostile NPC east", "" );
+    m = act( "RIGHT" );
+    l = look_now();
+    check( l.dx == 1 && l.dy == 0 && l.origin == 2, "on: a step into a hostile NPC swaps places",
+           describe( l ) + " [" + m + "]" );
+
+    // On, both in deep water: the step is CDDA's swim, which moves nobody aside, so the zombie goes to a free
+    // square next to it first, never under the player.
+    check( scene( 47 ), "scene: deep water, a zombie east in it", "" );
+    l = look_now();
+    const bool zombie_east = l.east == 1;
+    m = act( "RIGHT" );
+    l = look_now();
+    check( zombie_east && l.dx == 1 && l.dy == 0 && l.zombies == 1 && l.under == 0 && l.origin == 0 &&
+           has( m, "aside" ), "on: a swim into a zombie pushes it aside, not under you",
+           describe( l ) + " [" + m + "]" );
+
+    // On: one CDDA never displaces (a fungaloid tower, IMMOBILE) is bumped as without the cheat: no step.
+    check( scene( 48 ), "scene: a fungaloid tower east", "" );
+    l = look_now();
+    const bool tower_east = l.east == 1;
+    m = act( "RIGHT" );
+    l = look_now();
+    check( tower_east && l.dx == 0 && l.dy == 0 && l.origin == 0 && l.under == 0,
+           "on: an immobile one isn't moved", describe( l ) + " [" + m + "]" );
+
+    // On: a hostile NPC on a vehicle part is bumped as without the cheat (CDDA's swap boards and unboards both).
+    check( scene( 49 ), "scene: a hostile NPC east on a seat", "" );
+    l = look_now();
+    const bool npc_east = l.east == 2;
+    m = act( "RIGHT" );
+    l = look_now();
+    check( npc_east && l.dx == 0 && l.dy == 0 && l.origin == 0 && l.east == 2,
+           "on: a hostile NPC on a vehicle isn't swapped", describe( l ) + " [" + m + "]" );
+
+    // Off again: surrounded and held, the step is CDDA's bump attack and every grab holds.
+    check( set_unstoppable( false ), "turned off", "" );
+    check( scene( 43 ), "scene: surrounded and held again", "" );
+    m = act( "RIGHT" );
+    l = look_now();
+    check( l.dx == 0 && l.dy == 0 && l.zombies == 8 && l.grabbed == 4 && l.grabbing >= 3,
+           "off: a step into one is an attack again, the grabs hold", describe( l ) + " [" + m + "]" );
+    if( !invincible_was ) {
+        fp3d::request_cheat( fp3d::cheat::invincible, false );
+    }
+
+    // "Break all grabs" with the cheat off.
+    check( scene( 42 ), "scene: held again", "" );
+    const uint64_t id = fp3d::request_range_op( op );
+    scene( 0 );
+    std::string error = "(no result)";
+    for( const fp3d::range_op_result &res : fp3d::latest_range_results() ) {
+        if( res.id == id ) {
+            error = res.error;
+        }
+    }
+    l = look_now();
+    check( id != 0 && error.empty() && l.grabbed == 0 && l.grabbing == 0 && l.dx == 0 && l.dy == 0,
+           "break all grabs: done with the cheat off", describe( l ) + " [" + error + "]" );
+
+    check( scene( 44 ), "cleared up", "" );
+    fp3d::set_cheats_allowed( cheats_were );
+    std::printf( "  unstoppable: %s\n", failed == 0 ? "all PASS" : "FAILED" );
+    return failed == 0;
+}
+
 static bool run_safemode_checks()
 {
     int failed = 0;
@@ -8666,7 +9056,7 @@ int main()
     const bool cheats_ok = cooking_ok && run_cheat_checks();
     const bool stairs_ok = cheats_ok && run_stairs_checks();
     const bool guns_ok = stairs_ok && run_gun_item_checks();
-    const bool combat_ok = guns_ok && run_combat_checks() && run_smash_checks();
+    const bool combat_ok = guns_ok && run_combat_checks() && run_smash_checks() && run_unstoppable_checks();
     const bool range_ok = combat_ok && run_range_op_checks() && run_point_teleport_checks();
     const bool throw_pour_ok = range_ok && run_throw_pour_checks();
     const bool physics_ok = throw_pour_ok && run_item_physics_checks();
