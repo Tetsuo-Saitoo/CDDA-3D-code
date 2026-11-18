@@ -141,6 +141,20 @@ int main()
                fp3d::gunmod_location_text( std::string( fp3d::max_gunmod_location_bytes + 1, 'a' ) ).empty(),
                "gun mods: only plain location ids" );
 
+        // First aid: what an item with CDDA's heal use treats; nothing for a pill or an apple.
+        const uint32_t bandage = fp3d::intern_id( fp3d::id_kind::itype, "bandages" );
+        const uint32_t disinfectant = fp3d::intern_id( fp3d::id_kind::itype, "disinfectant" );
+        const uint32_t aspirin = fp3d::intern_id( fp3d::id_kind::itype, "aspirin" );
+        const auto heal_of = [&]( uint32_t type ) {
+            return type < t->items.size() ? t->items[type].heal : -2;
+        };
+        check( heal_of( bandage ) == ( fp3d::heal_bandages | fp3d::heal_stops_bleeding ) &&
+               heal_of( disinfectant ) == ( fp3d::heal_disinfects | fp3d::heal_treats_bite ) &&
+               heal_of( aspirin ) == -1 && heal_of( apple ) == -1,
+               "first aid: what a bandage and a disinfectant treat, none for a pill",
+               std::to_string( heal_of( bandage ) ) + " / " + std::to_string( heal_of( disinfectant ) ) + " / " +
+               std::to_string( heal_of( aspirin ) ) );
+
         // Pockets per item type: a plastic bottle has one rigid, watertight, sealable 500 ml pocket.
         const uint32_t bottle = fp3d::intern_id( fp3d::id_kind::itype, "bottle_plastic" );
         const bool bottle_ok = bottle < t->items.size() && t->items[bottle].pockets.size() == 1;
@@ -195,6 +209,19 @@ int main()
                text.find( "\"mod_locations\":[[\"barrel\",1],[\"mechanism\",2],[\"rail\",1],"
                           "[\"sights mount\",1],[\"stock mount\",1]]" ) != std::string::npos,
                "gun mod locations in the JSON" );
+        // "heal" only where the item has the use: as many times as there are such items, the bandage's among them.
+        size_t healing_items = 0;
+        for( const fp3d::item_def &d : t2->items ) {
+            healing_items += d.heal >= 0 ? 1 : 0;
+        }
+        size_t heal_members = 0;
+        for( size_t at = text.find( "\"heal\":" ); at != std::string::npos; at = text.find( "\"heal\":", at + 1 ) ) {
+            heal_members++;
+        }
+        check( healing_items > 5 && heal_members == healing_items &&
+               text.find( "\"id\":\"bandages\"" ) != std::string::npos &&
+               text.find( "\"heal\":5,\"volume_ml\":27," ) != std::string::npos, "first aid in the JSON",
+               std::to_string( healing_items ) + " items, " + std::to_string( heal_members ) + " members" );
         JsonValue root = json_loader::from_string( text );
         JsonObject jo = root.get_object();
         jo.allow_omitted_members();

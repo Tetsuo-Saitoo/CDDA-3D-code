@@ -265,6 +265,9 @@ size_t queued_actions();
 // main or off; refused for a worn item or a hand that holds something else: nothing is ever put away to make room.
 // consume: CDDA's eat, drink or first aid for the item `item` (carried, or lying where `take` could get it at `pos`),
 // or for the first thing in it CDDA would consume (a drink in its bottle): CDDA's own prompts, time and messages.
+// First aid (an item with CDDA's heal use) may name the body part it goes on, `part`: then CDDA's body part menu
+// doesn't show, and the action is refused with a reason when that menu wouldn't let the part be picked (nothing
+// there the item treats, a broken or bionic limb). Without `part` the menu comes as a request.
 // cook: start CDDA's craft `recipe` (batch `batch`) from what the container `item` lying on `pos` (the avatar's
 // square or one next to it) holds: the recipe must be one match_recipes lists for it that can start; the components
 // come out of the container only, the tools from CDDA's crafting inventory (the heat under the pot first) plus the
@@ -324,7 +327,12 @@ struct item_action {
     // cook only (empty and 1 for every other op): the recipe id (plain, 1 .. max_cook_recipe_bytes) and the batch.
     std::string recipe;
     int batch = 1;
+    // consume only (empty for every other op), optional: the body part first aid goes on, a body part id of
+    // 1 .. max_item_part_bytes letters, digits and _. It must be one of the avatar's own main parts (the ones the
+    // snapshot's player.body_parts lists), which the action checks when it runs.
+    std::string part;
 };
+constexpr size_t max_item_part_bytes = 32;
 constexpr size_t max_cook_recipe_bytes = 128;
 constexpr int max_cook_batch = 20;
 constexpr int max_item_pocket = 255;

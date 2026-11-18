@@ -595,13 +595,19 @@ bool queue_item_action( const item_action &a )
                          a.batch >= 1 && a.batch <= max_cook_batch :
                          a.recipe.empty() && a.batch == 1;
     const bool hand_ok = a.hand == item_hand::pack || a.hand == item_hand::main || a.hand == item_hand::off;
+    // consume: optionally a body part id (letters, digits, _); every other op: none.
+    const bool part_chars_ok = std::all_of( a.part.begin(), a.part.end(), []( char ch ) {
+        return ( ch >= 'a' && ch <= 'z' ) || ( ch >= 'A' && ch <= 'Z' ) || ( ch >= '0' && ch <= '9' ) || ch == '_';
+    } );
+    const bool part_ok = a.part.empty() ||
+                         ( a.op == item_op::consume && a.part.size() <= max_item_part_bytes && part_chars_ok );
     // pour: exactly one target. Into a container: a whole ref, and no square (pos left at 0, 0, 0). Onto a square:
     // no container at all (uid 0, type 0) and no pocket.
     const bool no_container = a.container.uid == 0 && a.container.type == 0;
     const bool no_pos = a.pos.x == 0 && a.pos.y == 0 && a.pos.z == 0;
     const bool pour_ok = a.op != item_op::pour ||
                          ( no_container ? a.pocket == -1 : ref_ok( a.container ) && no_pos );
-    if( !op_ok || !cook_ok || !hand_ok || !item_ok || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
+    if( !op_ok || !cook_ok || !part_ok || !hand_ok || !item_ok || !coord_ok( a.pos.x ) || !coord_ok( a.pos.y ) ||
         !coord_ok( a.pos.z ) || a.pocket < -1 || a.pocket > max_item_pocket || !pour_ok ||
         ( ( a.op == item_op::put || a.op == item_op::reload || a.op == item_op::mod_add ||
             a.op == item_op::mod_remove ) && !ref_ok( a.container ) ) ||

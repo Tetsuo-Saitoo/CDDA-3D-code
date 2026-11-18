@@ -23,6 +23,7 @@
 #include "effect.h"
 #include "enums.h"
 #include "flag.h"
+#include "fp3d/item_hands.h" // FP3D:
 #include "game.h"
 #include "game_constants.h"
 #include "magic.h"
@@ -1325,6 +1326,17 @@ bodypart_id Character::body_window( const std::string &menu_header,
             }
         }
         bmenu.addentry_desc( i, e.allowed, MENU_AUTOASSIGN, msg, desc );
+    }
+
+    // FP3D: first aid on a part the client named (fp3d/item_hands.h): that part when this menu would let the
+    // player pick it, none otherwise; the menu doesn't show.
+    if( is_avatar() && fp3d::first_aid_part_named() ) {
+        for( const healable_bp &e : parts ) {
+            if( fp3d::take_first_aid_part( *this, e.bp, e.allowed ) ) {
+                return e.bp;
+            }
+        }
+        return bodypart_str_id::NULL_ID();
     }
 
     if( !is_valid_choice ) { // no body part can be chosen for this item/effect

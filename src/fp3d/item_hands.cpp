@@ -13,6 +13,7 @@
 #include "activity_actor_definitions.h"
 #include "avatar.h"
 #include "avatar_action.h"
+#include "bodypart.h"
 #include "calendar.h"
 #include "contents_change_handler.h"
 #include "coordinates.h"
@@ -63,6 +64,7 @@ static const ammotype ammo_plutonium( "plutonium" );
 static const damage_type_id damage_bash( "bash" );
 
 static const efftype_id effect_incorporeal( "incorporeal" );
+static const json_character_flag json_flag_BIONIC_LIMB( "BIONIC_LIMB" );
 static const json_character_flag json_flag_CANNOT_ATTACK( "CANNOT_ATTACK" );
 static const trait_id trait_SHELL2( "SHELL2" );
 static const trait_id trait_SHELL3( "SHELL3" );
@@ -2020,11 +2022,44 @@ std::string consume_denial( const avatar &u, const item_location &loc )
     return {};
 }
 
+// First aid on a named part (take_first_aid_part): set while the consume action's heal use runs. Sim thread only.
+struct named_first_aid {
+    bool active = false;
+    std::string part;                    // the body part's id
+    bool given = false;                  // CDDA got the part once
+    std::string refusal;                 // why it didn't get it
+};
+named_first_aid first_aid;
+
+struct first_aid_scope {
+    explicit first_aid_scope( const std::string &part ) {
+        first_aid = named_first_aid();
+        first_aid.active = !part.empty();
+        first_aid.part = part;
+    }
+    ~first_aid_scope() {
+        first_aid = named_first_aid();
+    }
+    first_aid_scope( const first_aid_scope & ) = delete;
+    first_aid_scope &operator=( const first_aid_scope & ) = delete;
+};
+
 // CDDA's eat (first aid for a medical tool) on one item, without the menu. CDDA's own prompts (rotten, allergy, too
 // full) stay real questions to the player; its time and messages. It took time when the consume activity started and
 // the player didn't say no; when CDDA itself refuses or the player says no, the result has no text (CDDA said why).
 bool consume( avatar &u, const item_action &a )
 {
+    if( !a.part.empty() ) {
+        // The client's word: only the id of one of the avatar's own main parts counts (compared as text, so an
+        // unknown id is never looked up).
+        bool own = false;
+        for( const bodypart_id &bp : u.get_all_body_parts( get_body_part_flags::only_main ) ) {
+            own = own || bp.id().str() == a.part;
+        }
+        if( !own ) {
+            return refuse( u, _( "You have no such body part." ) );
+        }
+    }
     std::string why;
     item_location loc = find_reachable( u, a.pos, a.item, why, /*sealed_ok=*/true );
     if( !loc ) {
@@ -2045,7 +2080,16 @@ bool consume( avatar &u, const item_action &a )
     }
     if( loc->is_medical_tool() ) {
         const int moves = u.get_moves();
-        avatar_action::use_item( u, loc, "heal" );
+        std::string part_refusal;
+        {
+            // With a part named, CDDA's body part menu asks take_first_aid_part instead of the player.
+            const first_aid_scope named( a.part );
+            avatar_action::use_item( u, loc, "heal" );
+            part_refusal = first_aid.refusal;
+        }
+        if( !part_refusal.empty() ) {
+            return refuse( u, part_refusal );
+        }
         return !u.activity.is_null() || u.get_moves() < moves;
     }
     avatar_action::eat( u, loc, {}, {}, std::string(), activity_id::NULL_ID() );
@@ -2054,6 +2098,40 @@ bool consume( avatar &u, const item_action &a )
     return eating != nullptr && !eating->fp3d_canceled();
 }
 } // namespace
+
+bool first_aid_part_named()
+{
+    return first_aid.active;
+}
+
+bool take_first_aid_part( const Character &who, const bodypart_id &part, bool allowed )
+{
+    if( !first_aid.active || part.id().str() != first_aid.part ) {
+        return false;
+    }
+    // The reasons are CDDA's own texts for these cases (iuse_actor.cpp, character_body.cpp).
+    if( first_aid.given ) {
+        first_aid.refusal = _( "You don't expect any effect from using this." );
+        return false;
+    }
+    if( part->has_flag( json_flag_BIONIC_LIMB ) ) {
+        first_aid.refusal = _( "You can't use first aid on a bionic limb." );
+        return false;
+    }
+    if( !allowed ) {
+        const bool broken = who.is_limb_broken( part );
+        if( broken && ( first_aid.part == "arm_l" || first_aid.part == "arm_r" ) ) {
+            first_aid.refusal = _( "That arm is broken.  It needs surgical attention or a splint." );
+        } else if( broken && ( first_aid.part == "leg_l" || first_aid.part == "leg_r" ) ) {
+            first_aid.refusal = _( "That leg is broken.  It needs surgical attention or a splint." );
+        } else {
+            first_aid.refusal = _( "You don't expect any effect from using this." );
+        }
+        return false;
+    }
+    first_aid.given = true;
+    return true;
+}
 
 void register_item_actions( input_context &ctxt )
 {
