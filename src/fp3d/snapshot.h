@@ -237,7 +237,9 @@ constexpr uint8_t part_gap_filler = 8;
 
 struct vehicle_view {
     uint64_t uid = 0;
-    ui_point pos;                                 // absolute square of the vehicle's origin part
+    // CDDA's position of the vehicle, an absolute square: its origin part's until it rolls, then its turning
+    // point. Parts are placed from it by their dx, dy, dz.
+    ui_point pos;
     float face_deg = 0;
     float turn_deg = 0;
     float velocity = 0;                           // m/s
@@ -373,6 +375,11 @@ struct player_view {
     mood_view mood;
     std::optional<activity_view> activity;        // while an activity runs
     bool asleep = false;                          // asleep (the sleep effect), not while still trying to
+    // Vehicles: `driving` while the player holds a vehicle's controls (CDDA's controlling_vehicle: the move actions
+    // then steer and change speed); `vehicle` the uid (vehicle_view) of the vehicle the player is boarded on, 0 =
+    // none. Driving a vehicle by remote control is `driving` with `vehicle` 0 or another vehicle's.
+    bool driving = false;
+    uint64_t vehicle = 0;
 };
 
 struct environment_view {
