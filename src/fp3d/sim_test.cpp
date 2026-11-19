@@ -7008,6 +7008,10 @@ static bool run_range_op_checks()
     big.kind = fp3d::range_op_kind::spawn_monster;
     big.monster = std::string( fp3d::max_monster_id + 1, 'a' );
     check( fp3d::request_range_op( big ) == 0, "range ops: overlong monster id refused", "" );
+    fp3d::range_op long_car;
+    long_car.kind = fp3d::range_op_kind::spawn_vehicle;
+    long_car.vehicle = std::string( fp3d::max_vehicle_proto_id + 1, 'a' );
+    check( fp3d::request_range_op( long_car ) == 0, "range ops: overlong vehicle id refused", "" );
     // Off the sim thread, or outside the main loop's hook: refused, nothing changed.
     check( fp3d::heal() == "Only between turns." && fp3d::set_ai_frozen( true ) == "Only between turns." &&
            !fp3d::ai_frozen(), "range ops: only in the main loop's hook", "" );

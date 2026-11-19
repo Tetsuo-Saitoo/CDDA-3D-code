@@ -1808,6 +1808,88 @@ std::string spawn_monster( const std::string &mtype, const ui_point &square )
     return "";
 }
 
+std::string spawn_vehicle( const std::string &proto, const ui_point &square, int facing )
+{
+    if( const std::string why = op_refusal(); !why.empty() ) {
+        return why;
+    }
+    const char *const unknown = "No such vehicle.";
+    if( proto.empty() || proto.size() > max_vehicle_proto_id ) {
+        return unknown;
+    }
+    for( const char c : proto ) {
+        const bool ok = ( c >= 'a' && c <= 'z' ) || ( c >= 'A' && c <= 'Z' ) || ( c >= '0' && c <= '9' ) ||
+                        c == '_' || c == '-';
+        if( !ok ) {
+            return unknown;
+        }
+    }
+    // Looked up among the loaded prototypes: an id made from the client's text would stay interned for good.
+    std::optional<vproto_id> found;
+    for( const vehicle_prototype &v : vehicles::get_all_prototypes() ) {
+        if( v.id.str() == proto ) {
+            found = v.id;
+            break;
+        }
+    }
+    if( !found || !found->is_valid() ) {
+        return unknown;
+    }
+    const vproto_id type = *found;
+    if( facing < 0 || facing > 359 ) {
+        return "The facing must be 0 to 359 degrees.";
+    }
+    const char *const outside = "That square is outside the reality bubble.";
+    if( !coord_ok( square ) ) {
+        return outside;
+    }
+    map &here = get_map();
+    const tripoint_bub_ms p = here.get_bub( tripoint_abs_ms( square.x, square.y, square.z ) );
+    if( !here.inbounds( p ) ) {
+        return outside;
+    }
+    if( here.get_vehicles().size() >= max_range_vehicles ) {
+        return "There are too many vehicles here already.";
+    }
+    const units::angle dir = units::from_degrees( facing );
+    // Where its frame would stand: the turn of the mounts that CDDA's add_vehicle makes, on a vehicle that is not
+    // on the map. Checked here because add_vehicle looks at vehicles and walls only.
+    vehicle scratch( type );
+    scratch.face.init( dir );
+    scratch.turn_dir = dir;
+    scratch.precalc_mounts( 0, dir, point_rel_ms::zero );
+    const std::vector<int> frame = scratch.all_parts_at_location( "structure" );
+    if( frame.empty() ) {
+        return unknown;
+    }
+    creature_tracker &creatures = get_creature_tracker();
+    for( const int index : frame ) {
+        const vehicle_part &part = scratch.part( index );
+        if( part.is_fake ) {
+            continue;
+        }
+        const tripoint_bub_ms q = p + part.precalc[0];
+        if( !here.inbounds( q ) ) {
+            return outside;
+        }
+        if( here.veh_at( q ) ) {
+            return "Another vehicle is in the way there.";
+        }
+        if( here.impassable( q ) || !here.has_floor( q ) ||
+            here.has_flag_ter( ter_furn_flag::TFLAG_DEEP_WATER, q ) ) {
+            return "Something is in the way there.";
+        }
+        if( creatures.creature_at( q ) != nullptr ) {
+            return "Someone is in the way there.";
+        }
+    }
+    // Intact, no faults or security, a full tank; never merged with a wreck or smashed into a wall.
+    if( here.add_vehicle( type, p, dir, 100, 2, false, true ) == nullptr ) {
+        return "It can't be placed there.";
+    }
+    return "";
+}
+
 std::string teleport_to_zone( size_t index )
 {
     if( const std::string why = op_refusal(); !why.empty() ) {

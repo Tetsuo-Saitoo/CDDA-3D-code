@@ -89,6 +89,9 @@ constexpr size_t pen_monsters_per_zone = 100;
 constexpr int max_spawn_count = 1000;
 constexpr int max_advance_minutes = 10080;       // a week
 constexpr size_t max_monster_id = 64;
+constexpr size_t max_vehicle_proto_id = 64;
+// spawn_vehicle refuses when the reality bubble holds this many vehicles already.
+constexpr size_t max_range_vehicles = 64;
 // The range clock stops this many days after the start of the game (about 10 years): set_time_of_day and advance
 // refuse to go past it, far from the end of CDDA's 32-bit turn counter.
 constexpr int max_range_days = 3650;
@@ -220,6 +223,12 @@ const std::vector<hub_prop> &kitchen_props();
 std::string spawn_item( uint32_t itype, int count, const ui_point &square );
 // A monster `mtype` (id, at most 64 characters) on `square`: in the bubble, passable, nobody there.
 std::string spawn_monster( const std::string &mtype, const ui_point &square );
+// A vehicle of the loaded prototype `proto` (id, at most max_vehicle_proto_id characters) with its origin on
+// `square`, facing `facing` degrees (0..359, CDDA's degrees as in the snapshot's face_deg), intact and fuelled.
+// Every square its frame would stand on must be in the bubble, passable, with a floor, no deep water, and free of
+// vehicles and creatures: nothing is smashed, merged or pushed aside to make room. Refused when the bubble holds
+// max_range_vehicles vehicles already.
+std::string spawn_vehicle( const std::string &proto, const ui_point &square, int facing );
 // Moves the player to zone `index` (range games only) and builds it the first time. Refused while riding. The player
 // lets go of what it grabbed, stops hauling and leaves the vehicle it is in; its auto-move route and the client's
 // queued actions are dropped. It arrives on the zone centre, or when that isn't free on the nearest free square
