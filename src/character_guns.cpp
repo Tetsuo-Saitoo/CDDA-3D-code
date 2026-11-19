@@ -13,6 +13,7 @@
 #include "calendar.h"
 #include "character.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/item_hands.h" // FP3D:
 #include "color.h"
 #include "coordinates.h"
 #include "debug.h"
@@ -208,6 +209,10 @@ void Character::gunmod_add( item &gun, item &mod )
     item &moved_mod = fp3d_named_mod ? mod : *mods.front(); // FP3D:
     // any (optional) tool charges that are used during installation
     auto odds = gunmod_installation_odds( wielded_gun, moved_mod );
+    // FP3D: the gun clamped in a vise the client named installs mods more easily (fp3d/item_hands.h vise_odds)
+    if( fp3d::gunmod_in_vise() ) {
+        odds = fp3d::vise_odds( odds );
+    }
     int roll = odds.first;
     int risk = odds.second;
 

@@ -1647,6 +1647,26 @@ void observe()
             }
             break;
         }
+        case 52: {
+            // Gun mods in a vise (FP3D): a bench vise lying on the avatar's square, a clamp (VISE 1, too small for a
+            // gun) on the square west of it, another bench vise three squares west, out of reach, and one east of it
+            // that belongs to the free merchants.
+            avatar &u = get_avatar();
+            const tripoint_bub_ms at = u.pos_bub();
+            const tripoint_bub_ms west = at + tripoint_rel_ms( -1, 0, 0 );
+            const tripoint_bub_ms far_west = at + tripoint_rel_ms( -3, 0, 0 );
+            const tripoint_bub_ms east = at + tripoint_rel_ms( 1, 0, 0 );
+            for( const tripoint_bub_ms &q : { at, west, far_west, east } ) {
+                here.i_clear( q );
+            }
+            here.add_item( at, item( itype_id( "bench_vise" ) ) );
+            here.add_item( west, item( itype_id( "clamp" ) ) );
+            here.add_item( far_west, item( itype_id( "bench_vise" ) ) );
+            item theirs( itype_id( "bench_vise" ) );
+            theirs.set_owner( faction_id( "free_merchants" ) );
+            here.add_item( east, theirs );
+            break;
+        }
         case 37: {
             // Gun mods, part 2: a red dot sight and an underbarrel shotgun put straight into the gun (CDDA's put_in,
             // no skill or slot check), the shotgun loaded and marked as one that can't be unloaded; and no skill
@@ -4046,8 +4066,10 @@ static bool run_gunmod_checks()
         bool done = false;
         std::string why;
         int64_t turns = 0;
+        std::string entry;        // the first menu's first entry
     };
     uint32_t next_tag = 700;
+    fp3d::item_ref with_vise{ 0, 0 };   // mod_add: the vise the next run names
     // One mod action on the gun; popups answered yes or no, a menu with `menu_entry` (-1 cancels it).
     const auto run = [&]( fp3d::item_op op, const fp3d::item_ref & mod, const fp3d::item_ref & gun, bool yes,
     int menu_entry ) {
@@ -4065,6 +4087,7 @@ static bool run_gunmod_checks()
         ia.item = mod;
         ia.container = gun;
         ia.tag = ++next_tag;
+        ia.vise = with_vise;
         res.queued = fp3d::queue_item_action( ia );
         if( !res.queued ) {
             return res;
@@ -4089,6 +4112,9 @@ static bool run_gunmod_checks()
             fp3d::ui_answer a;
             a.id = at->id;
             if( at->kind == fp3d::request_kind::menu ) {
+                if( res.menus == 0 && !at->entries.empty() ) {
+                    res.entry = at->entries[0].label;
+                }
                 res.menus++;
                 if( menu_entry < 0 ) {
                     a.cancel = true;
@@ -4269,6 +4295,82 @@ static bool run_gunmod_checks()
         }
         return found;
     };
+    // Gun mods in a vise (FP3D, item_hands.h vise_odds): CDDA's tools menu starts with its odds without tools.
+    const auto odds_text = []( int chance, int risk ) {
+        return "(" + std::to_string( chance ) + "%) risking damage (" + std::to_string( risk ) + "%)";
+    };
+    const fp3d::gun_fit_view plain = fit_of( mount.uid );
+    check( has( res.entry, odds_text( plain.chance, plain.risk ).c_str() ), "without a vise: CDDA's own odds",
+           res.entry );
+    check( fp3d::vise_odds( { 100, 0 } ) == std::make_pair( 100, 0 ) &&
+           fp3d::vise_odds( { 61, 9 } ) == std::make_pair( 81, 4 ) &&
+           fp3d::vise_odds( { 95, 3 } ) == std::make_pair( 100, 1 ) &&
+           fp3d::vise_odds( { -5, 300 } ) == std::make_pair( 15, 50 ), "a vise: 20 points more (at most 100), half the risk",
+           "" );
+    if( !scene( 52 ) ) {
+        check( false, "scene 52", "" );
+        return false;
+    }
+    const auto lying = []( int dx, const std::string & type ) {
+        fp3d::item_ref found{ 0, 0 };
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return found;
+        }
+        const fp3d::ui_point q{ s->player.pos.x + dx, s->player.pos.y, s->player.pos.z };
+        for( const fp3d::item_handle_view &h : handles_at( q ) ) {
+            if( fp3d::id_name( fp3d::id_kind::itype, h.type ) == type ) {
+                found = fp3d::item_ref{ h.uid, h.type };
+            }
+        }
+        return found;
+    };
+    const fp3d::item_ref vise = lying( 0, "bench_vise" );
+    const fp3d::item_ref clamp = lying( -1, "clamp" );
+    const fp3d::item_ref far_vise = lying( -3, "bench_vise" );
+    const fp3d::item_ref their_vise = lying( 1, "bench_vise" );
+    check( vise.uid != 0 && clamp.uid != 0 && far_vise.uid != 0 && their_vise.uid != 0,
+           "scene 52: a vise, a clamp, a vise out of reach, someone else's",
+           std::to_string( vise.uid ) + " " + std::to_string( clamp.uid ) + " " + std::to_string( far_vise.uid ) + " " +
+           std::to_string( their_vise.uid ) );
+    // Malformed: a vise with another op, or half a handle, is never queued.
+    fp3d::item_action odd;
+    odd.op = fp3d::item_op::mod_remove;
+    odd.item = barrel;
+    odd.container = gun;
+    odd.vise = vise;
+    const bool vise_on_remove = fp3d::queue_item_action( odd );
+    odd.op = fp3d::item_op::mod_add;
+    odd.item = mount;
+    odd.vise = fp3d::item_ref{ vise.uid, 0 };
+    const bool half_vise = fp3d::queue_item_action( odd );
+    check( !vise_on_remove && !half_vise, "a vise goes only with mod_add, a whole handle", "" );
+    // Not one that holds a gun, or out of reach: refused before CDDA asks anything.
+    with_vise = clamp;
+    res = run( fp3d::item_op::mod_add, mount, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && res.popups == 0 && res.menus == 0 &&
+           has( res.why, "can't hold a gun" ) && res.turns == 0, "a clamp is too small to hold a gun", show( res ) );
+    with_vise = far_vise;
+    res = run( fp3d::item_op::mod_add, mount, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && res.popups == 0 && res.menus == 0 &&
+           has( res.why, "isn't within reach" ) && res.turns == 0, "a vise out of reach is refused", show( res ) );
+    with_vise = their_vise;
+    res = run( fp3d::item_op::mod_add, mount, gun, true, -1 );
+    check( res.back && res.answers == 1 && !res.done && res.popups == 0 && res.menus == 0 &&
+           has( res.why, "isn't yours" ) && res.turns == 0, "someone else's vise is refused", show( res ) );
+    // In the vise within reach: CDDA's own questions, its tools menu with the better odds; cancelled, nothing happens.
+    with_vise = vise;
+    res = run( fp3d::item_op::mod_add, mount, gun, true, -1 );
+    with_vise = fp3d::item_ref{ 0, 0 };
+    const std::pair<int, int> clamped = fp3d::vise_odds( { plain.chance, plain.risk } );
+    check( clamped.first < 100 && res.back && res.popups == 1 && res.menus == 1 && res.answers == 1 && !res.done &&
+           has( res.why, "Never mind" ) && has( res.entry, odds_text( clamped.first, clamped.second ).c_str() ) &&
+           gun_now().mods.size() == 1, "in a vise: CDDA's menu offers the better odds", show( res ) + " [" + res.entry +
+           "]" );
+    // The next action without one: CDDA's own odds again.
+    res = run( fp3d::item_op::mod_add, mount, gun, true, -1 );
+    check( res.menus == 1 && !res.done && has( res.entry, odds_text( plain.chance, plain.risk ).c_str() ),
+           "then without a vise: CDDA's own odds again", res.entry );
     if( !scene( 37 ) ) {
         check( false, "scene 37", "" );
         return false;

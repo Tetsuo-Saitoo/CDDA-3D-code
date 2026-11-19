@@ -331,6 +331,10 @@ struct item_action {
     // 1 .. max_item_part_bytes letters, digits and _. It must be one of the avatar's own main parts (the ones the
     // snapshot's player.body_parts lists), which the action checks when it runs.
     std::string part;
+    // mod_add only (uid 0, type 0 for every other op), optional: the vise the gun is clamped in, an item with tool
+    // quality VISE 3 lying on the avatar's square or one next to it (FP3D rule, item_hands.h vise_odds: better
+    // odds). The action checks it when it runs and is refused when it isn't one or isn't there.
+    item_ref vise;
 };
 constexpr size_t max_item_part_bytes = 32;
 constexpr size_t max_cook_recipe_bytes = 128;
@@ -340,7 +344,8 @@ constexpr uint16_t max_item_yaw = 359;
 constexpr uint8_t max_item_shelf = 15;
 constexpr uint32_t max_item_tag = INT32_MAX;
 // Client side. False if a field is out of range, a pour names no target or two (container and pos), an item is
-// missing (only light may leave it out, extinguish must) or the queue is full.
+// missing (only light may leave it out, extinguish must), a vise is named for another op than mod_add or the queue
+// is full.
 bool queue_item_action( const item_action &a );
 constexpr const char *item_action_name = "fp3d_item";
 // Sim side: the item action the bridge just answered `fp3d_item` with (once), nullopt if none.
