@@ -66,6 +66,7 @@ static const damage_type_id damage_bash( "bash" );
 static const efftype_id effect_incorporeal( "incorporeal" );
 static const json_character_flag json_flag_BIONIC_LIMB( "BIONIC_LIMB" );
 static const json_character_flag json_flag_CANNOT_ATTACK( "CANNOT_ATTACK" );
+static const quality_id qual_VISE( "VISE" );
 static const trait_id trait_SHELL2( "SHELL2" );
 static const trait_id trait_SHELL3( "SHELL3" );
 
@@ -1439,6 +1440,64 @@ bool mod_job_waiting( const avatar &u )
     return mod_job( u.activity ) || std::any_of( u.backlog.begin(), u.backlog.end(), mod_job );
 }
 
+// A mod_add that named a vise (gunmod_in_vise): set while CDDA's gunmod_add runs. Sim thread only.
+bool in_vise = false;
+
+struct vise_scope {
+    vise_scope() {
+        in_vise = true;
+    }
+    ~vise_scope() {
+        in_vise = false;
+    }
+    vise_scope( const vise_scope & ) = delete;
+    vise_scope &operator=( const vise_scope & ) = delete;
+};
+
+// The vise `r` names (item_hands.h vise_odds): lying on the avatar's square or one next to it where the avatar can
+// get at it and see it, with tool quality VISE vise_quality or more (a clamp is too small for a gun), and the avatar's
+// or nobody's (as CDDA's crafting counts a tool lying near). The action gives no square: all nine are searched, and a
+// handle found twice names nothing.
+item_location find_vise( avatar &u, const item_ref &r, std::string &why )
+{
+    if( u.is_mounted() ) {
+        why = _( "You can't reach that while you're riding." );
+        return item_location();
+    }
+    map &here = get_map();
+    const tripoint_bub_ms at = u.pos_bub();
+    item_location found;
+    for( const tripoint_bub_ms &p : here.points_in_radius( at, 1 ) ) {
+        if( !here.inbounds( p ) || !here.accessible_items( p ) || !here.could_see_items( p, at ) ) {
+            continue;
+        }
+        for( item &it : here.i_at( p ) ) {
+            if( !matches( it, r ) ) {
+                continue;
+            }
+            if( found ) {
+                why = _( "That vise isn't within reach." );
+                return item_location();
+            }
+            found = item_location( map_cursor( p ), &it );
+        }
+    }
+    if( !found ) {
+        why = _( "That vise isn't within reach." );
+        return item_location();
+    }
+    if( !found->has_quality_nonrecursive( qual_VISE, vise_quality ) ) {
+        //~ %s: an item's name
+        why = string_format( _( "The %s can't hold a gun." ), found->tname() );
+        return item_location();
+    }
+    if( !found->is_owned_by( u, true ) ) {
+        why = string_format( _( "The %s isn't yours." ), found->tname() );
+        return item_location();
+    }
+    return found;
+}
+
 bool mod_add( avatar &u, const item_action &a )
 {
     item_location gun = named_wielded_gun( u, a.container );
@@ -1456,6 +1515,15 @@ bool mod_add( avatar &u, const item_action &a )
     if( !fit.ok ) {
         //~ %1$s: a gun's name, %2$s: why a mod doesn't go on it ("doesn't have a slot for this mod")
         return refuse( u, string_format( _( "Your %1$s %2$s." ), gun->tname(), fit.reason ) );
+    }
+    // The gun clamped in a vise the client named: CDDA's odds get better (vise_odds).
+    std::optional<vise_scope> clamped;
+    if( a.vise.uid != 0 ) {
+        std::string why;
+        if( !find_vise( u, a.vise, why ) ) {
+            return refuse( u, why );
+        }
+        clamped.emplace();
     }
     u.gunmod_add( *gun, *mod );
     if( u.activity.id() == ACT_GUNMOD_ADD ) {
@@ -1609,6 +1677,16 @@ bool extinguish( avatar &u, const item_action &a )
     return true;
 }
 } // namespace
+
+std::pair<int, int> vise_odds( const std::pair<int, int> &odds )
+{
+    return std::make_pair( std::clamp( odds.first + vise_roll_bonus, 0, 100 ), std::clamp( odds.second, 0, 100 ) / 2 );
+}
+
+bool gunmod_in_vise()
+{
+    return in_vise;
+}
 
 uint64_t read_item_handle( const item &it )
 {

@@ -33,6 +33,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_set>
+#include <utility>
 
 #include "type_id.h"
 
@@ -90,6 +91,17 @@ constexpr size_t max_gunmod_location_bytes = 32;
 // How many slots of one kind a gun is said to have, at most (game data and mods are not trusted to stay small).
 constexpr int max_mod_slots = 16;
 std::string gunmod_location_text( const std::string &id );
+// Gun mods in a vise (FP3D rule on top of CDDA; the user chose it 2026-11-18): a mod_add that names a vise (bridge.h
+// item_action::vise: an item with tool quality VISE vise_quality or more, lying on the avatar's square or one next to
+// it, in sight, the avatar's or nobody's) is done with the gun clamped in it, and Character::gunmod_add takes
+// vise_odds of CDDA's odds before its tools menu: vise_roll_bonus more on the roll (at most 100: then no menu comes)
+// and half the damage risk; the repair kits that menu offers still apply on top. The time is CDDA's, nothing needs a
+// vise, and a mod too difficult without one (odds 0) stays refused, as the snapshot's `fits` says.
+constexpr int vise_quality = 3;
+constexpr int vise_roll_bonus = 20;
+std::pair<int, int> vise_odds( const std::pair<int, int> &odds );
+// True while a mod_add that named a vise runs CDDA's gunmod_add (sim thread only).
+bool gunmod_in_vise();
 
 // First aid on the body part the client named (a consume action's `part`, bridge.h). While that action runs,
 // CDDA's body part menu (Character::body_window) doesn't show: it asks take_first_aid_part for each part it lists,
