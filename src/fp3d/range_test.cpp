@@ -751,6 +751,104 @@ void check_operations( size_t gallery )
         }
     } );
 
+    // spawn_vehicle: a car at an angle on open ground near the hub, and everything it must refuse.
+    bad.clear();
+    good.clear();
+    bool spot = false;
+    tripoint_abs_ms car_sq = s;
+    std::string car_seen;
+    int diagonal_parts = 0;
+    size_t vehicles_before = 0;
+    size_t vehicles_after = 0;
+    on_sim( [&] {
+        map &here = get_map();
+        creature_tracker &creatures = get_creature_tracker();
+        // The nearest 13 x 13 block with nothing in it.
+        const auto block_free = [&]( const tripoint_abs_ms & c ) {
+            for( int dy = -6; dy <= 6; dy++ ) {
+                for( int dx = -6; dx <= 6; dx++ ) {
+                    const tripoint_bub_ms q = here.get_bub( offset( c, dx, dy ) );
+                    if( !here.inbounds( q ) || here.impassable( q ) || !here.has_floor( q ) || here.veh_at( q ) ||
+                        here.has_furn( q ) || creatures.creature_at( q ) != nullptr ) {
+                        return false;
+                    }
+                }
+            }
+            return true;
+        };
+        int best = 1000;
+        for( int dy = -44; dy <= 44; dy += 2 ) {
+            for( int dx = -44; dx <= 44; dx += 2 ) {
+                const int steps = std::abs( dx ) + std::abs( dy );
+                if( steps < best && block_free( offset( s, dx, dy ) ) ) {
+                    best = steps;
+                    car_sq = offset( s, dx, dy );
+                    spot = true;
+                }
+            }
+        }
+        if( !spot ) {
+            return;
+        }
+        vehicles_before = here.get_vehicles().size();
+        good = fp3d::spawn_vehicle( "car", ui( car_sq ), 45 );
+        vehicles_after = here.get_vehicles().size();
+        for( const wrapped_vehicle &wv : here.get_vehicles() ) {
+            if( wv.v->pos_abs() == car_sq ) {
+                car_seen = wv.v->type.str() + " facing " + std::to_string( std::lround( units::to_degrees(
+                               wv.v->face.dir() ) ) ) + ", gasoline " +
+                           std::to_string( wv.v->fuel_left( here, itype_id( "gasoline" ) ) > 0 ? 1 : 0 );
+            }
+        }
+        const fp3d::ui_point at = ui( car_sq );
+        bad.push_back( fp3d::spawn_vehicle( "car_nope", at, 0 ) );
+        bad.push_back( fp3d::spawn_vehicle( std::string( fp3d::max_vehicle_proto_id + 1, 'a' ), at, 0 ) );
+        bad.push_back( fp3d::spawn_vehicle( "../car", at, 0 ) );
+        bad.push_back( fp3d::spawn_vehicle( "", at, 0 ) );
+        bad.push_back( fp3d::spawn_vehicle( "none", at, 0 ) );                       // a prototype without a frame
+        bad.push_back( fp3d::spawn_vehicle( "car", ui( offset( car_sq, 0, 20 ) ), -1 ) );
+        bad.push_back( fp3d::spawn_vehicle( "car", ui( offset( car_sq, 0, 20 ) ), 360 ) );
+        bad.push_back( fp3d::spawn_vehicle( "car", ui( outside_sq ), 0 ) );
+        bad.push_back( fp3d::spawn_vehicle( "car", ui( offset( s, 15, 3 ) ), 0 ) );  // the hub's wall
+        bad.push_back( fp3d::spawn_vehicle( "car", at, 0 ) );                        // taken by the first car
+        bad.push_back( fp3d::spawn_vehicle( "car", ui( get_avatar().pos_abs() ), 0 ) );   // the player is there
+        bad.push_back( fp3d::spawn_vehicle( "car", fp3d::ui_point{ s.x(), s.y(), 99 }, 0 ) );
+    } );
+    // The snapshot has it at that angle: its parts stand on squares off both axes.
+    on_sim( [&] {
+        const std::shared_ptr<const fp3d::snapshot> snap = fp3d::capture_snapshot();
+        for( const fp3d::vehicle_view &v : snap->vehicles ) {
+            if( v.pos.x == car_sq.x() && v.pos.y == car_sq.y() && v.pos.z == car_sq.z() &&
+                std::lround( v.face_deg ) == 45 ) {
+                for( const fp3d::vehicle_part_view &row : v.parts ) {
+                    diagonal_parts += row.dx != 0 && row.dy != 0 ? 1 : 0;
+                }
+            }
+        }
+    } );
+    check( spot && good.empty() && car_seen == "car facing 45, gasoline 1" && vehicles_after == vehicles_before + 1 &&
+           diagonal_parts > 4, "spawn_vehicle: a car facing 45 degrees",
+           ok_or( good ) + " " + car_seen + ", " + std::to_string( diagonal_parts ) + " parts off both axes" );
+    all_refused = bad.size() == 12;
+    why.clear();
+    for( const std::string &b : bad ) {
+        all_refused = all_refused && !b.empty();
+        why += "[" + b + "]";
+    }
+    check( all_refused && bad.size() == 12 && bad[0] == "No such vehicle." && bad[4] == "No such vehicle." &&
+           bad[5] == "The facing must be 0 to 359 degrees." && bad[9] == "Another vehicle is in the way there.",
+           "spawn_vehicle: unknown id, bad facing or square, wall, taken refused", why.substr( 0, 400 ) );
+    // The spawned car goes again: the hub stays as the other checks expect it.
+    on_sim( [&] {
+        map &here = get_map();
+        for( const wrapped_vehicle &wv : here.get_vehicles() ) {
+            if( wv.v->pos_abs() == car_sq && wv.v->type.str() == "car" ) {
+                here.destroy_vehicle( wv.v );
+                break;
+            }
+        }
+    } );
+
     // set_time_of_day
     int64_t before_turn = 0;
     int64_t after_turn = 0;

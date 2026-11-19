@@ -68,7 +68,7 @@ bool request_test_kit();
 // off): every grab on the player and their mount lets go (break_grabs below); done also when nothing held them.
 enum class range_op_kind : uint8_t {
     spawn_item, spawn_monster, teleport, time_of_day, advance, ai_frozen, heal, rebuild_zone, point_teleport, weather,
-    break_grabs
+    break_grabs, spawn_vehicle
 };
 constexpr size_t max_weather_id = 64;
 constexpr int max_cheat_wind = 100;    // mph, about 45 m/s
@@ -77,16 +77,17 @@ struct range_op {
     uint32_t itype = 0;      // spawn_item: session itype index (id tables)
     // spawn_item count, teleport and rebuild_zone zone index, time_of_day minute, advance minutes, ai_frozen 0/1
     int64_t number = 0;
-    ui_point square;         // spawn_item, spawn_monster, point_teleport
+    ui_point square;         // spawn_item, spawn_monster, point_teleport, spawn_vehicle
     std::string monster;     // spawn_monster: mtype id
+    std::string vehicle;     // spawn_vehicle: vehicle prototype id; its facing (degrees, 0..359) is `number`
     std::string weather;     // weather: a weather type id, "" = the game's own
     int wind = -1;           // weather: mph 0..max_cheat_wind, -1 = the game decides
 };
 constexpr size_t max_range_ops_waiting = 32;
 constexpr size_t max_range_results = 16;
 // Client side: the operation's id (1, 2, ...); 0 when cheats aren't allowed, max_range_ops_waiting already wait,
-// the monster id is longer than test_range.h's max_monster_id or the weather id than max_weather_id, or after
-// shutdown. Disallowing cheats drops what waits.
+// the monster id is longer than test_range.h's max_monster_id, the vehicle id than its max_vehicle_proto_id or
+// the weather id than max_weather_id, or after shutdown. Disallowing cheats drops what waits.
 uint64_t request_range_op( const range_op &op );
 struct range_op_result {
     uint64_t id = 0;

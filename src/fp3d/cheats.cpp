@@ -370,7 +370,8 @@ bool request_test_kit()
 
 uint64_t request_range_op( const range_op &op )
 {
-    if( is_shut_down() || op.monster.size() > max_monster_id || op.weather.size() > max_weather_id ) {
+    if( is_shut_down() || op.monster.size() > max_monster_id || op.vehicle.size() > max_vehicle_proto_id ||
+        op.weather.size() > max_weather_id ) {
         return 0;
     }
     uint64_t id = 0;
@@ -518,6 +519,8 @@ std::string run_range_op( const range_op &op )
             return spawn_item( op.itype, n, op.square );
         case range_op_kind::spawn_monster:
             return spawn_monster( op.monster, op.square );
+        case range_op_kind::spawn_vehicle:
+            return spawn_vehicle( op.vehicle, op.square, n );
         case range_op_kind::teleport:
             return teleport_to_zone( n < 0 ? SIZE_MAX : static_cast<size_t>( n ) );
         case range_op_kind::time_of_day:
