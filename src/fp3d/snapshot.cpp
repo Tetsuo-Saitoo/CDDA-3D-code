@@ -726,6 +726,12 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
         pv.activity = std::move( a );
     }
     pv.asleep = u.has_effect( effect_sleep );
+    pv.driving = u.controlling_vehicle;
+    if( u.in_vehicle ) {
+        if( const optional_vpart_position vp = get_map().veh_at( u.pos_bub() ) ) {
+            pv.vehicle = vehicle_uid( &vp->vehicle() );
+        }
+    }
     pv.wielded = wielded_index( u );
     if( const item_location w = u.get_wielded_item(); w && w->is_gun() ) {
         gun_view g;
@@ -1585,6 +1591,12 @@ static void write_snapshot( std::ostream &out, const snapshot &s, int z_min, int
     }
     if( pv.asleep ) {
         jo.member( "asleep", true );
+    }
+    if( pv.driving ) {
+        jo.member( "driving", true );
+    }
+    if( pv.vehicle != 0 ) {
+        jo.member( "vehicle", static_cast<int64_t>( pv.vehicle ) );
     }
     jo.member( "wielded", static_cast<int64_t>( pv.wielded ) );
     if( pv.wielded_gun ) {

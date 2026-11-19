@@ -101,6 +101,7 @@
 #include "units.h"
 #include "vehicle.h"
 #include "vpart_position.h"
+#include "vpart_range.h"
 #include "weather.h"
 #include "weather_type.h"
 #include "worldfactory.h"
@@ -137,8 +138,10 @@ const itype_id itype_v8_combustion( "v8_combustion" );
 const ter_str_id ter_t_dirt( "t_dirt" );
 const itype_id itype_bottle_twoliter( "bottle_twoliter" );
 const ter_str_id ter_t_open_air( "t_open_air" );
+const ter_str_id ter_t_pavement( "t_pavement" );
 const ter_str_id ter_t_water_sh( "t_water_sh" );
 const ter_str_id ter_t_water_dp( "t_water_dp" );
+const vproto_id vehicle_prototype_car( "car" );
 const vproto_id vehicle_prototype_none( "none" );
 const vpart_id vpart_frame( "frame" );
 const vpart_id vpart_tank_small( "tank_small" );
@@ -1744,6 +1747,57 @@ void observe()
             u.remove_effect( effect_bleed );
             u.remove_effect( effect_bandaged );
             u.remove_effect( effect_disinfected );
+            break;
+        }
+        case 53: {
+            // Driving: a paved strip nine squares wide from 8 squares west to 60 east of the avatar with nothing on
+            // it, no monsters; a car facing east on it with the avatar boarded on its controls, nothing in hand.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -8; dx <= 60; dx++ ) {
+                for( int dy = -4; dy <= 4; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( !here.inbounds( q ) ) {
+                        continue;
+                    }
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_pavement );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            u.remove_weapon();
+            if( u.controlling_vehicle || u.in_vehicle ) {
+                u.controlling_vehicle = false;
+                here.unboard_vehicle( u.pos_bub() );
+            }
+            vehicle *car = here.add_vehicle( vehicle_prototype_car, p, 0_degrees, 100, 2, false, true );
+            if( car != nullptr ) {
+                for( const vpart_reference &vpr : car->get_avail_parts( "CONTROLS" ) ) {
+                    const tripoint_bub_ms seat = vpr.pos_bub( here );
+                    u.setpos( here, seat );
+                    here.board_vehicle( seat, &u );
+                    break;
+                }
+            }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 54: {
+            // Driving, after: the avatar off the car, the car gone.
+            avatar &u = get_avatar();
+            u.controlling_vehicle = false;
+            if( const optional_vpart_position vp = here.veh_at( u.pos_bub() ) ) {
+                vehicle *car = &vp->vehicle();
+                if( u.in_vehicle ) {
+                    here.unboard_vehicle( u.pos_bub() );
+                }
+                here.destroy_vehicle( car );
+            }
+            here.build_map_cache( p.z() );
             break;
         }
         case 39: {
@@ -8395,6 +8449,230 @@ static bool run_first_aid_checks()
     return failed == 0;
 }
 
+// Driving through the bridge (lead-world, 2026-11-19): control_vehicle is let through, the step actions then drive,
+// and the snapshot says so (player.driving, player.vehicle; the vehicle's pos, velocity, turn_deg).
+static bool run_driving_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  driving: %-46s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    struct result {
+        bool queued = false;
+        bool back = false;        // in the main loop again
+        int menus = 0;
+        int popups = 0;
+        std::string asked;        // the questions' texts
+        std::string msgs;         // the messages, " | " between them
+        int64_t turns = 0;
+    };
+    // What the newest snapshot says of the player and the vehicle it is on.
+    struct seen {
+        bool driving = false;
+        uint64_t vehicle = 0;     // player.vehicle
+        fp3d::ui_point player;
+        bool car = false;         // that vehicle is listed
+        bool on_part = false;     // ... and one of its part rows is on the player's square
+        fp3d::ui_point pos;
+        float velocity = 0;
+        float face = 0;
+        float turn = 0;
+    };
+    const auto look = []() {
+        seen out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        out.driving = s->player.driving;
+        out.vehicle = s->player.vehicle;
+        out.player = s->player.pos;
+        for( const fp3d::vehicle_view &v : s->vehicles ) {
+            if( out.vehicle != 0 && v.uid == out.vehicle ) {
+                out.car = true;
+                out.pos = v.pos;
+                out.velocity = v.velocity;
+                out.face = v.face_deg;
+                out.turn = v.turn_deg;
+                for( const fp3d::vehicle_part_view &row : v.parts ) {
+                    out.on_part = out.on_part || ( v.pos.x + row.dx == out.player.x && v.pos.y + row.dy == out.player.y &&
+                                                   v.pos.z + row.dz == out.player.z );
+                }
+            }
+        }
+        return out;
+    };
+    const auto told = []( const seen & o ) {
+        return std::string( o.driving ? "driving" : "not driving" ) + ", vehicle " + std::to_string( o.vehicle ) +
+               ( o.car ? " at " + std::to_string( o.pos.x ) + "," + std::to_string( o.pos.y ) + " " +
+                 std::to_string( o.velocity ) + " m/s face " + std::to_string( o.face ) + " turn " +
+                 std::to_string( o.turn ) : std::string( " not listed" ) ) + ", player " +
+               std::to_string( o.player.x ) + "," + std::to_string( o.player.y ) + ( o.on_part ? " on a part" : "" );
+    };
+    // One queued main-loop action. CDDA's questions on the way: a menu takes the enabled entry whose label has
+    // `pick` (cancelled when none has), a popup YES.
+    const auto act = [&]( const std::string & action, const std::string & pick ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return res;
+        }
+        const int64_t turn0 = at->turn;
+        fp3d::drain_events( evs );
+        evs.clear();
+        res.queued = fp3d::queue_action( action );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = at->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 60000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, at->id );
+            if( !next ) {
+                continue;
+            }
+            at = next;
+            if( at->timed ) {
+                if( at->id != before ) {
+                    res.back = true;
+                    res.turns = at->turn - turn0;
+                    break;
+                }
+                continue;
+            }
+            res.asked += ( res.asked.empty() ? "" : " | " ) + ( at->text.empty() ? at->title : at->text );
+            fp3d::ui_answer a;
+            a.id = at->id;
+            if( at->kind == fp3d::request_kind::menu ) {
+                res.menus++;
+                a.cancel = true;
+                for( const fp3d::ui_entry &e : at->entries ) {
+                    if( !pick.empty() && e.enabled && e.label.find( pick ) != std::string::npos ) {
+                        a.cancel = false;
+                        a.entry = e.id;
+                        break;
+                    }
+                }
+            } else {
+                res.popups++;
+                if( std::find( at->actions.begin(), at->actions.end(), "YES" ) != at->actions.end() ) {
+                    a.action = "YES";
+                } else {
+                    a.cancel = true;
+                }
+            }
+            fp3d::answer( a );
+        }
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msgs += ( res.msgs.empty() ? "" : " | " ) + e.text;
+            }
+        }
+        return res;
+    };
+    const auto show = []( const result & r ) {
+        return std::string( r.queued ? "" : "not queued " ) + ( r.back ? "" : "not back " ) + "asked [" + r.asked +
+               "] msgs [" + r.msgs.substr( 0, 200 ) + "] " + std::to_string( r.menus ) + " menus, " +
+               std::to_string( r.popups ) + " popups, " + std::to_string( r.turns ) + " turns";
+    };
+    const auto scene = [&]( int number ) {
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return false;
+        }
+        hand_setup = number;
+        fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+        at = fp3d::wait_request( 20000, at->id );
+        return at && at->timed;
+    };
+
+    check( fp3d::action_allowed( "DEFAULTMODE", "control_vehicle", false ) &&
+           !fp3d::action_allowed( "DEFAULTMODE", "toggle_auto_travel_mode", false ) &&
+           !fp3d::action_allowed( "DEFAULTMODE", "control_vehicle ", false ),
+           "control_vehicle is on the main loop's list", "" );
+    const bool set = scene( 53 );
+    const seen parked = look();
+    if( !set || parked.vehicle == 0 || !parked.car || !parked.on_part || parked.driving ) {
+        check( false, "scene: boarded on a parked car's controls", told( parked ) );
+        return false;
+    }
+    // The controls: CDDA starts the engine (an activity) and the character then holds them. An engine can fail to
+    // start: asked again, at most three times.
+    result res;
+    seen now = parked;
+    for( int tries = 0; tries < 3 && !now.driving; tries++ ) {
+        res = act( "control_vehicle", "" );
+        now = look();
+    }
+    check( res.back && now.driving && now.vehicle == parked.vehicle && res.menus == 0, "control_vehicle: the controls taken",
+           show( res ) + "; " + told( now ) );
+    // Both are in the JSON while they hold, and left out before.
+    const auto json_has = []( const char *member ) {
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return false;
+        }
+        std::ostringstream out;
+        fp3d::write_snapshot_json( out, *s, s->player.pos.z, s->player.pos.z );
+        return out.str().find( member ) != std::string::npos;
+    };
+    const std::string vehicle_member = "\"vehicle\":" + std::to_string( now.vehicle ) + ",";
+    check( json_has( "\"driving\":true" ) && json_has( vehicle_member.c_str() ), "the JSON has driving and the vehicle",
+           vehicle_member );
+    // UP raises the speed the car is set to reach (CDDA's cruise speed, 4 mph a step) and takes no time; the car
+    // speeds up as turns pass. The player rides on one of its parts: CDDA moves the vehicle's `pos` to its turning
+    // point once it rolls, so the player's offset from `pos` is not a constant, the part rows are what holds.
+    const seen held = now;
+    int64_t up_turns = 0;
+    for( int i = 0; i < 4; i++ ) {
+        res = act( "UP", "" );
+        up_turns += res.turns;
+    }
+    const seen sped = look();
+    for( int i = 0; i < 6; i++ ) {
+        res = act( "pause", "" );
+    }
+    const seen rolling = look();
+    const int moved = std::abs( rolling.pos.x - held.pos.x ) + std::abs( rolling.pos.y - held.pos.y );
+    check( res.back && up_turns == 0 && sped.pos.x == held.pos.x && rolling.driving && rolling.car &&
+           rolling.velocity > 0.5f && moved >= 2 && rolling.on_part && rolling.vehicle == held.vehicle &&
+           ( rolling.player.x != held.player.x || rolling.player.y != held.player.y ),
+           "UP four times, then turns pass: the car rolls with the player",
+           told( rolling ) + ", moved " + std::to_string( moved ) + ", UP took " + std::to_string( up_turns ) + " turns" );
+    // Steering: the facing it turns to changes, and back.
+    res = act( "RIGHT", "" );
+    const seen steered = look();
+    const result back_res = act( "LEFT", "" );
+    const seen straight = look();
+    check( res.back && back_res.back && steered.driving && std::fabs( steered.turn - rolling.turn ) >= 1.0f &&
+           std::fabs( straight.turn - rolling.turn ) < 1.0f, "RIGHT, then LEFT: it steers and steers back",
+           told( steered ) + "; " + told( straight ) + "; " + show( res ) );
+    // DOWN lowers the speed it is set to reach; back at none, the car stands after some turns (at most thirty).
+    for( int i = 0; i < 4; i++ ) {
+        res = act( "DOWN", "" );
+    }
+    seen slowing = look();
+    for( int i = 0; i < 30 && std::fabs( slowing.velocity ) > 0.01f; i++ ) {
+        res = act( "pause", "" );
+        slowing = look();
+    }
+    check( res.back && slowing.driving && std::fabs( slowing.velocity ) <= 0.01f,
+           "DOWN four times, then turns pass: it stands", told( slowing ) );
+    // The controls again: CDDA's vehicle menu, where the character lets go of them.
+    res = act( "control_vehicle", "Let go of controls" );
+    const seen let_go = look();
+    check( res.back && res.menus >= 1 && !let_go.driving && let_go.vehicle == parked.vehicle,
+           "control_vehicle while driving: the menu, let go", show( res ) + "; " + told( let_go ) );
+    const bool cleared = scene( 54 );
+    const seen after = look();
+    check( cleared && !after.driving && after.vehicle == 0 && !json_has( "\"driving\"" ) && !json_has( "\"vehicle\":" ),
+           "after: off the car, the car gone, neither in the JSON", told( after ) );
+    return failed == 0;
+}
+
 // The off hand lets go of an item that has grown too heavy for one hand (here: filled up); it stays in its pocket
 // (lead-ui, 2026-11-15).
 static bool run_offhand_weight_checks()
@@ -9797,7 +10075,8 @@ int main()
     const bool actions_ok = number_ok && run_action_checks();
     const bool gunmods_ok = actions_ok && run_gunmod_checks();
     const bool first_aid_ok = gunmods_ok && run_first_aid_checks();
-    const bool names_ok = first_aid_ok && run_name_checks();
+    const bool driving_ok = first_aid_ok && run_driving_checks();
+    const bool names_ok = driving_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -9861,6 +10140,7 @@ int main()
     std::printf( "actions: %s\n", actions_ok ? "ok" : "BAD" );
     std::printf( "gun mods: %s\n", gunmods_ok ? "ok" : "BAD" );
     std::printf( "first aid: %s\n", first_aid_ok ? "ok" : "BAD" );
+    std::printf( "driving: %s\n", driving_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
     // the game's turns got slower.
@@ -9877,6 +10157,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok ?
+           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok && driving_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

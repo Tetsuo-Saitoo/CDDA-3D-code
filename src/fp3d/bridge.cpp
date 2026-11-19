@@ -196,7 +196,7 @@ bool action_allowed( const std::string &context, const std::string &action, bool
     static const char *const allowed[] = {
         "UP", "RIGHTUP", "RIGHT", "RIGHTDOWN", "DOWN", "LEFTDOWN", "LEFT", "LEFTUP", "LEVEL_UP", "LEVEL_DOWN",
         "pause", "toggle_run", "toggle_crouch",
-        "open", "close", "smash", "examine", "pickup", "grab", "butcher", "look", "peek",
+        "open", "close", "smash", "examine", "pickup", "grab", "butcher", "look", "peek", "control_vehicle",
         "inventory", "apply", "wear", "take_off", "eat", "read", "wield", "reload_weapon", "unload", "throw",
         "fire", "drop",
         "wait", "sleep", "safemode", "save", "SUICIDE"
