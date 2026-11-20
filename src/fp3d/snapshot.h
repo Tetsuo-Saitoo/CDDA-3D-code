@@ -380,6 +380,11 @@ struct player_view {
     // none. Driving a vehicle by remote control is `driving` with `vehicle` 0 or another vehicle's.
     bool driving = false;
     uint64_t vehicle = 0;
+    // CDDA's peek (game::peek) stands the avatar on the square next to it to see from there, asks what to look at,
+    // and puts it back. While that lasts `peeking` is set and `peeking_from` is the square the body is on; `pos` is
+    // the peeked square, which everything seen is seen from. (peek_scope below.)
+    bool peeking = false;
+    ui_point peeking_from;
 };
 
 struct environment_view {
@@ -456,6 +461,19 @@ void reset_snapshots();
 // Sim side. The uid a creature has (or gets) in snapshots, and the seq the next capture will have.
 uint64_t creature_uid( const Creature &c );
 uint64_t next_snapshot_seq();
+// Sim side. Lives while CDDA's peek has the avatar on the peeked square: captures then say where the body is
+// (player_view::peeking_from). `end()` ends it early; the destructor ends it in any case.
+class peek_scope
+{
+    public:
+        explicit peek_scope( const ui_point &body );
+        ~peek_scope();
+        peek_scope( const peek_scope & ) = delete;
+        peek_scope &operator=( const peek_scope & ) = delete;
+        void end();
+    private:
+        bool live = true;
+};
 // Sim side: makes `s` the newest snapshot, unless a later capture (a higher seq) is published already: the
 // newest one never goes back to an earlier capture. nullptr clears it. Client side: reads it (nullptr before the
 // first publish).

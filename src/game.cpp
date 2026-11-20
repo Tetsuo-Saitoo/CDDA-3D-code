@@ -41,6 +41,7 @@
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/chargen.h" // FP3D:
 #include "fp3d/points.h" // FP3D:
+#include "fp3d/snapshot.h" // FP3D:
 #include "action.h"
 #include "activity_actor_definitions.h"
 #include "activity_handlers.h"
@@ -6605,6 +6606,8 @@ void game::peek( const tripoint_bub_ms &p )
 
     u.mod_moves( -u.get_speed() * 2 );
     tripoint_bub_ms prev = u.pos_bub();
+    // FP3D: while the avatar stands on the peeked square, snapshots say where the body is (fp3d/snapshot.h)
+    fp3d::peek_scope fp3d_peeking( fp3d::to_ui_point( u.pos_abs() ) );
     u.setpos( here, p, false );
     const bool is_same_pos = u.pos_bub() == prev;
     const bool is_standup_peek = is_same_pos && u.is_crouching();
@@ -6622,6 +6625,7 @@ void game::peek( const tripoint_bub_ms &p )
         result = look_around( looka_params );
         u.setpos( here, prev, false );
     }
+    fp3d_peeking.end(); // FP3D: back on its own square
 
     if( result.peek_action ) {
         if( *result.peek_action == PA_BLIND_THROW ) {
