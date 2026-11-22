@@ -4965,8 +4965,15 @@ static bool run_combat_checks()
                 if( x == 0 && y == 0 ) {
                     return 0;
                 }
-                monster *m = g->place_critter_at( mon_zombie, p + tripoint_rel_ms( x, y, 0 ) );
+                const tripoint_bub_ms at = p + tripoint_rel_ms( x, y, 0 );
+                monster *m = g->place_critter_at( mon_zombie, at );
                 if( m == nullptr ) {
+                    // Rare (2 of 6 runs on one machine, 2026-11-21): said why, so the next one can be traced.
+                    const Creature *in_way = get_creature_tracker().creature_at( at );
+                    std::printf( "  combat: scene: no zombie placed at %+d,%+d (%s, %s)\n", x, y,
+                                 in_way == nullptr ? "no creature there" : in_way->is_npc() ? "an NPC there" :
+                                 in_way->is_avatar() ? "the avatar there" : "a monster there",
+                                 here.passable( at ) ? "passable" : "not passable" );
                     return 0;
                 }
                 if( friendly ) {
