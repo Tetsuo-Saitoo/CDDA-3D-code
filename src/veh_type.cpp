@@ -24,6 +24,7 @@
 #include "flag.h"
 #include "flat_set.h"
 #include "flexbuffer_json.h"
+#include "fp3d/glovebox.h" // FP3D:
 #include "game_constants.h"
 #include "generic_factory.h"
 #include "item.h"
@@ -1667,6 +1668,7 @@ void vehicles::finalize_prototypes()
                 cargo_spots.insert( pt.pos );
             }
         }
+        fp3d::add_glovebox( here, blueprint ); // FP3D: cars and trucks get a glovebox
         blueprint.enable_refresh();
 
         for( vehicle_item_spawn &i : proto.item_spawns ) {
