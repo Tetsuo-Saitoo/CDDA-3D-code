@@ -114,6 +114,8 @@ struct capture_state {
     uint64_t next_uid = uint64_t( 2 ) << 32;
 };
 capture_state state;
+// The body's square while a peek_scope lives (sim thread only).
+std::optional<ui_point> peek_body;
 
 std::mutex latest_mutex;
 std::shared_ptr<const snapshot> latest;
@@ -213,6 +215,24 @@ uint64_t creature_uid( const Creature &c )
         return monster_uid( *m );
     }
     return 0;
+}
+
+peek_scope::peek_scope( const ui_point &body )
+{
+    peek_body = body;
+}
+
+peek_scope::~peek_scope()
+{
+    end();
+}
+
+void peek_scope::end()
+{
+    if( live ) {
+        live = false;
+        peek_body.reset();
+    }
 }
 
 uint64_t next_snapshot_seq()
@@ -726,6 +746,10 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
         pv.activity = std::move( a );
     }
     pv.asleep = u.has_effect( effect_sleep );
+    if( peek_body ) {
+        pv.peeking = true;
+        pv.peeking_from = *peek_body;
+    }
     pv.driving = u.controlling_vehicle;
     if( u.in_vehicle ) {
         if( const optional_vpart_position vp = get_map().veh_at( u.pos_bub() ) ) {
@@ -1597,6 +1621,10 @@ static void write_snapshot( std::ostream &out, const snapshot &s, int z_min, int
     }
     if( pv.vehicle != 0 ) {
         jo.member( "vehicle", static_cast<int64_t>( pv.vehicle ) );
+    }
+    if( pv.peeking ) {
+        jo.member( "peeking_from" );
+        write_point( jo, pv.peeking_from );
     }
     jo.member( "wielded", static_cast<int64_t>( pv.wielded ) );
     if( pv.wielded_gun ) {

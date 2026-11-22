@@ -312,6 +312,8 @@ std::atomic<uint64_t> fa_bandage_a_uid{ 0 };
 std::atomic<uint64_t> fa_bandage_b_uid{ 0 };
 std::atomic<uint64_t> fa_bandage_c_uid{ 0 };
 std::atomic<uint64_t> fa_apple_uid{ 0 };
+// Lean checks (scene 55): a rock lying behind a wall's end.
+std::atomic<uint64_t> lean_rock_uid{ 0 };
 // The lying-container checks' scene (hand_setup 22).
 std::atomic<uint64_t> lc_pack_uid{ 0 };         // a backpack west holding a rock and 2 empty bottles
 std::atomic<uint64_t> lc_rock_uid{ 0 };         // the rock
@@ -1797,6 +1799,33 @@ void observe()
                 }
                 here.destroy_vehicle( car );
             }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 55: {
+            // Leaning: floor 6 squares around, nothing lying there, no monsters. A wall runs along the row north of
+            // the avatar from 6 squares west up to the square straight north of it; east of that the row is open.
+            // A rock lies three squares straight north: behind the wall from where the avatar stands, in view from
+            // the square east of it.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -6; dx <= 6; dx++ ) {
+                for( int dy = -6; dy <= 6; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, dy == -1 && dx <= 0 ? ter_t_wall : ter_t_floor );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            if( u.is_crouching() ) {
+                u.reset_move_mode();
+            }
+            item &rock = here.add_item( p + tripoint_rel_ms( 0, -3, 0 ), item( itype_rock ) );
+            lean_rock_uid = rock.is_null() ? 0 : fp3d::item_handle( rock );
             here.build_map_cache( p.z() );
             break;
         }
@@ -8680,6 +8709,168 @@ static bool run_driving_checks()
     return failed == 0;
 }
 
+// Leaning (lead-ui's lean keys, lead-vr's physical lean, 2026-11-19): CDDA's peek on a square the client names with
+// queue_action_at, no direction asked; the snapshot of the peek request is the view from the peeked square and says
+// where the body is; cancelling the request brings the avatar back.
+static bool run_lean_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  lean: %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    // What the newest snapshot says: where the avatar is, whether it peeks and from where, and whether the rock's
+    // handle is listed on its square (items are only listed on squares in view).
+    struct seen {
+        fp3d::ui_point pos;
+        bool peeking = false;
+        fp3d::ui_point from;
+        bool rock = false;
+        bool in_json = false;     // "peeking_from" is a member of the player's JSON
+    };
+    fp3d::ui_point rock_sq;
+    const auto look = [&]() {
+        seen out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        out.pos = s->player.pos;
+        out.peeking = s->player.peeking;
+        out.from = s->player.peeking_from;
+        for( const fp3d::item_handle_view &h : handles_at( rock_sq ) ) {
+            out.rock = out.rock || h.uid == lean_rock_uid;
+        }
+        std::ostringstream js;
+        fp3d::write_snapshot_json( js, *s, s->player.pos.z, s->player.pos.z );
+        out.in_json = js.str().find( "\"peeking_from\":[" ) != std::string::npos;
+        return out;
+    };
+    const auto told = []( const seen & o ) {
+        return "at " + std::to_string( o.pos.x ) + "," + std::to_string( o.pos.y ) +
+               ( o.peeking ? ", peeking from " + std::to_string( o.from.x ) + "," + std::to_string( o.from.y ) :
+                 std::string( ", not peeking" ) ) + ( o.rock ? ", rock in view" : ", rock hidden" ) +
+               ( o.in_json ? ", in the JSON" : "" );
+    };
+    struct result {
+        bool queued = false;
+        bool back = false;        // in the main loop again
+        int directions = 0;       // direction requests on the way
+        int targets = 0;          // target requests on the way
+        std::string mode;         // the first one's mode
+        seen during;              // the snapshot at the first target request
+        std::string msgs;
+        int64_t turns = 0;
+    };
+    // Peeks on `square`; the peek's request is cancelled, as a lean that ends.
+    const auto peek_at = [&]( const fp3d::ui_point & square ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return res;
+        }
+        const int64_t turn0 = at->turn;
+        fp3d::drain_events( evs );
+        evs.clear();
+        res.queued = fp3d::queue_action_at( "peek", square );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = at->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 30000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, at->id );
+            if( !next ) {
+                continue;
+            }
+            at = next;
+            if( at->timed ) {
+                if( at->id != before ) {
+                    res.back = true;
+                    res.turns = at->turn - turn0;
+                    break;
+                }
+                continue;
+            }
+            if( at->kind == fp3d::request_kind::direction ) {
+                res.directions++;
+            } else if( at->kind == fp3d::request_kind::target ) {
+                if( res.targets == 0 ) {
+                    res.mode = at->mode;
+                    res.during = look();
+                }
+                res.targets++;
+            }
+            fp3d::ui_answer a;
+            a.id = at->id;
+            a.cancel = true;
+            fp3d::answer( a );
+        }
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::message ) {
+                res.msgs += ( res.msgs.empty() ? "" : " | " ) + e.text;
+            }
+        }
+        return res;
+    };
+    const auto show = []( const result & r ) {
+        return std::string( r.queued ? "" : "not queued " ) + ( r.back ? "" : "not back " ) +
+               std::to_string( r.directions ) + " direction, " + std::to_string( r.targets ) + " target [" + r.mode +
+               "] msgs [" + r.msgs.substr( 0, 160 ) + "] " + std::to_string( r.turns ) + " turns";
+    };
+    const auto scene = [&]( int number ) {
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return false;
+        }
+        hand_setup = number;
+        fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+        at = fp3d::wait_request( 20000, at->id );
+        return at && at->timed;
+    };
+
+    const bool set = scene( 55 );
+    const std::shared_ptr<const fp3d::snapshot> s0 = fp3d::latest_snapshot();
+    if( !set || !s0 || lean_rock_uid == 0 ) {
+        check( false, "scene", "" );
+        return false;
+    }
+    const fp3d::ui_point body = s0->player.pos;
+    rock_sq = fp3d::ui_point{ body.x, body.y - 3, body.z };
+    const fp3d::ui_point east{ body.x + 1, body.y, body.z };
+    const seen standing = look();
+    check( !standing.peeking && !standing.rock && !standing.in_json && standing.pos.x == body.x,
+           "standing: the rock behind the wall is not in view", told( standing ) );
+    // The square east, named with the action: no direction asked, the peek's request, and its snapshot is the view
+    // from there with the body's square in it. Cancelled: back, the rock out of view again, two turns gone.
+    result res = peek_at( east );
+    const seen after = look();
+    check( res.back && res.directions == 0 && res.targets == 1 && res.mode == "peek" && res.during.pos.x == east.x &&
+           res.during.pos.y == east.y && res.during.peeking && res.during.from.x == body.x &&
+           res.during.from.y == body.y && res.during.from.z == body.z && res.during.rock && res.during.in_json,
+           "peek east: no direction asked, the view from there", show( res ) + "; " + told( res.during ) );
+    check( after.pos.x == body.x && after.pos.y == body.y && !after.peeking && !after.rock && !after.in_json &&
+           res.turns == 2, "the lean ends: back, the rock hidden again, two turns", told( after ) + ", " +
+           std::to_string( res.turns ) + " turns" );
+    // West of the avatar the wall still hides the rock: a peek shows what CDDA lets be seen, no more.
+    res = peek_at( fp3d::ui_point{ body.x - 1, body.y, body.z } );
+    check( res.back && res.targets == 1 && res.during.peeking && !res.during.rock && !look().peeking,
+           "peek west: the wall still hides the rock", show( res ) + "; " + told( res.during ) );
+    // The client's square is checked: two squares off is no peek, the wall's square is none, one far outside is
+    // not even queued. None of them costs time.
+    const result far_off = peek_at( fp3d::ui_point{ body.x + 2, body.y, body.z } );
+    const result wall = peek_at( fp3d::ui_point{ body.x, body.y - 1, body.z } );
+    const bool outside_queued = fp3d::queue_action_at( "peek", fp3d::ui_point{ 1 << 29, body.y, body.z } ) ||
+                                fp3d::queue_action_at( "peek", fp3d::ui_point{ body.x, body.y, 99 } );
+    check( far_off.back && far_off.targets == 0 && far_off.directions == 0 && far_off.turns == 0 &&
+           far_off.msgs.find( "Never mind" ) != std::string::npos && wall.back && wall.targets == 0 &&
+           wall.directions == 0 && wall.turns == 0 && !outside_queued && !look().peeking,
+           "a square not next to the player, a wall, one far outside: no peek", show( far_off ) + "; " + show( wall ) );
+    return failed == 0;
+}
+
 // The off hand lets go of an item that has grown too heavy for one hand (here: filled up); it stays in its pocket
 // (lead-ui, 2026-11-15).
 static bool run_offhand_weight_checks()
@@ -10083,7 +10274,8 @@ int main()
     const bool gunmods_ok = actions_ok && run_gunmod_checks();
     const bool first_aid_ok = gunmods_ok && run_first_aid_checks();
     const bool driving_ok = first_aid_ok && run_driving_checks();
-    const bool names_ok = driving_ok && run_name_checks();
+    const bool lean_ok = driving_ok && run_lean_checks();
+    const bool names_ok = lean_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -10148,6 +10340,7 @@ int main()
     std::printf( "gun mods: %s\n", gunmods_ok ? "ok" : "BAD" );
     std::printf( "first aid: %s\n", first_aid_ok ? "ok" : "BAD" );
     std::printf( "driving: %s\n", driving_ok ? "ok" : "BAD" );
+    std::printf( "lean: %s\n", lean_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
     // the game's turns got slower.
@@ -10164,6 +10357,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok && driving_ok ?
+           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok && driving_ok && lean_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }
