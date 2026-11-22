@@ -30,6 +30,7 @@
 #include "effect.h"
 #include "enums.h"
 #include "mutation.h"
+#include "options.h"
 #include "profession.h"
 #include "proficiency.h"
 #include "skill.h"
@@ -68,6 +69,7 @@
 #include "submap.h"
 #include "trap.h"
 #include "units.h"
+#include "units_utility.h"
 #include "veh_type.h"
 #include "vehicle.h"
 #include "vpart_position.h"
@@ -79,6 +81,7 @@
 static_assert( SEEX == fp3d::sm_size && SEEY == fp3d::sm_size, "snapshot submaps are 12x12" );
 
 static const efftype_id effect_sleep( "sleep" );
+static const itype_id fuel_type_battery( "battery" );
 
 namespace fp3d
 {
@@ -709,6 +712,80 @@ void capture_mood( const avatar &u, mood_view &mood )
     }
 }
 
+// The numbers of the vehicle the player is on (player_vehicle_view), each one CDDA's own.
+player_vehicle_view capture_player_vehicle( const avatar &u, const vehicle &veh, const point_rel_ms &mount )
+{
+    map &here = get_map();
+    player_vehicle_view out;
+    out.uid = vehicle_uid( &veh );
+    out.name = client_text( veh.name, max_vehicle_name_columns, 4 * max_vehicle_name_columns );
+    out.in_control = veh.player_in_control( here, u );
+    out.at_controls = veh.avail_part_with_feature( mount, "CONTROLS" ) >= 0;
+    const auto speed = []( int v ) {
+        return std::clamp( v, -max_vehicle_speed, max_vehicle_speed );
+    };
+    out.velocity = speed( veh.velocity );
+    out.cruise_velocity = speed( veh.cruise_velocity );
+    out.safe_velocity = speed( veh.safe_velocity( here ) );
+    out.max_velocity = speed( veh.max_velocity( here ) );
+    const std::string unit = get_option<std::string>( "USE_METRIC_SPEEDS" );
+    out.speed_unit = unit == "km/h" || unit == "t/t" ? unit : "mph";
+    out.speed_scale = static_cast<float>( convert_velocity( 10000, VU_VEHICLE ) / 10000.0 );
+    out.engine_on = veh.engine_on;
+    // Fuels: what an engine burns now, and what is in a tank. The batteries' charge is its own pair below.
+    std::set<itype_id> fuel_types;
+    for( const int index : veh.engines ) {
+        const vehicle_part &part = veh.part( index );
+        const itype_id fuel = part.fuel_current();
+        if( !fuel.is_null() ) {
+            fuel_types.insert( fuel );
+        }
+        if( out.engines.size() < max_vehicle_engines ) {
+            vehicle_engine_view e;
+            e.vpart = intern_id( id_kind::vpart, part.info().id.str() );
+            // CDDA's is_engine_on says the engine is switched on and works; it runs when the vehicle's engines do.
+            e.state = ( part.enabled ? engine_enabled : 0 ) |
+                      ( veh.engine_on && veh.is_engine_on( part ) ? engine_running : 0 ) |
+                      ( part.is_broken() ? engine_broken : 0 );
+            e.hp_frac = clamp_u8( 255.0 * part.health_percent() );
+            e.fuel = fuel.is_null() ? 0 : intern_id( id_kind::itype, fuel.str() );
+            out.engines.push_back( e );
+        }
+    }
+    for( const std::pair<const itype_id, int> &tank : veh.fuels_left() ) {
+        fuel_types.insert( tank.first );
+    }
+    const auto amount = []( int64_t v ) {
+        return static_cast<int32_t>( std::clamp<int64_t>( v, 0, INT32_MAX ) );
+    };
+    for( const itype_id &fuel : fuel_types ) {
+        if( fuel == fuel_type_battery || out.fuels.size() >= max_vehicle_fuels ) {
+            continue;
+        }
+        vehicle_fuel_view f;
+        f.type = intern_id( id_kind::itype, fuel.str() );
+        f.left = amount( veh.fuel_left( here, fuel ) );
+        f.capacity = amount( veh.fuel_capacity( here, fuel ) );
+        out.fuels.push_back( f );
+    }
+    const std::pair<int, int> battery = veh.battery_power_level();
+    out.battery_left = amount( battery.first );
+    out.battery_capacity = amount( battery.second );
+    out.turn_deg = static_cast<float>( units::to_degrees( veh.turn_dir ) );
+    out.skidding = veh.skidding;
+    out.mass_kg = amount( std::llround( units::to_kilogram( veh.total_mass( here ) ) ) );
+    // As veh_interact::count_durability, the vehicle screen's "Status".
+    int64_t damage = 0;
+    int64_t whole = 0;
+    for( const vpart_reference &vpr : veh.get_all_parts() ) {
+        damage += std::max( vpr.part().damage(), vpr.part().degradation() );
+        whole += vpr.part().max_damage();
+    }
+    const int64_t damaged_pct = whole > 0 ? 100 * damage / whole : 0;
+    out.health_pct = static_cast<uint8_t>( std::clamp<int64_t>( 100 - damaged_pct, 0, 100 ) );
+    return out;
+}
+
 void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &seen )
 {
     pv.uid = 1;
@@ -754,6 +831,7 @@ void capture_player( avatar &u, player_view &pv, std::unordered_set<uint64_t> &s
     if( u.in_vehicle ) {
         if( const optional_vpart_position vp = get_map().veh_at( u.pos_bub() ) ) {
             pv.vehicle = vehicle_uid( &vp->vehicle() );
+            pv.vehicle_state = capture_player_vehicle( u, vp->vehicle(), vp->mount_pos() );
         }
     }
     pv.wielded = wielded_index( u );
@@ -1625,6 +1703,53 @@ static void write_snapshot( std::ostream &out, const snapshot &s, int z_min, int
     if( pv.peeking ) {
         jo.member( "peeking_from" );
         write_point( jo, pv.peeking_from );
+    }
+    if( pv.vehicle_state ) {
+        const player_vehicle_view &v = *pv.vehicle_state;
+        jo.member( "vehicle_state" );
+        jo.start_object();
+        jo.member( "uid", static_cast<int64_t>( v.uid ) );
+        jo.member( "name", v.name );
+        jo.member( "in_control", v.in_control );
+        jo.member( "at_controls", v.at_controls );
+        jo.member( "velocity", v.velocity );
+        jo.member( "cruise_velocity", v.cruise_velocity );
+        jo.member( "safe_velocity", v.safe_velocity );
+        jo.member( "max_velocity", v.max_velocity );
+        jo.member( "speed_unit", v.speed_unit );
+        jo.member( "speed_scale", v.speed_scale );
+        jo.member( "engine_on", v.engine_on );
+        jo.member( "engines" );
+        jo.start_array();
+        for( const vehicle_engine_view &e : v.engines ) {
+            jo.start_array();
+            jo.write( static_cast<int64_t>( e.vpart ) );
+            jo.write( static_cast<int>( e.state ) );
+            jo.write( static_cast<int>( e.hp_frac ) );
+            jo.write( static_cast<int64_t>( e.fuel ) );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "fuels" );
+        jo.start_array();
+        for( const vehicle_fuel_view &f : v.fuels ) {
+            jo.start_array();
+            jo.write( static_cast<int64_t>( f.type ) );
+            jo.write( f.left );
+            jo.write( f.capacity );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "battery" );
+        jo.start_array();
+        jo.write( v.battery_left );
+        jo.write( v.battery_capacity );
+        jo.end_array();
+        jo.member( "turn_deg", v.turn_deg );
+        jo.member( "skidding", v.skidding );
+        jo.member( "mass_kg", v.mass_kg );
+        jo.member( "health_pct", static_cast<int>( v.health_pct ) );
+        jo.end_object();
     }
     jo.member( "wielded", static_cast<int64_t>( pv.wielded ) );
     if( pv.wielded_gun ) {

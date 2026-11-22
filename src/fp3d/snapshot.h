@@ -343,6 +343,53 @@ struct activity_view {
 constexpr size_t max_activity_id_bytes = 64;
 constexpr size_t max_activity_verb_columns = 40;
 
+// The vehicle the player is on, for a driving HUD: only numbers CDDA itself computes and shows. Captured only
+// while the player is boarded, so snapshots on foot don't grow.
+constexpr size_t max_vehicle_engines = 16;
+constexpr size_t max_vehicle_fuels = 16;
+constexpr int max_vehicle_speed = 10000000;       // CDDA's units; far beyond any vehicle
+constexpr uint8_t engine_enabled = 1;             // switched on in the vehicle's engine list
+constexpr uint8_t engine_running = 2;             // the vehicle's engines are on and this one is switched on and works
+constexpr uint8_t engine_broken = 4;
+struct vehicle_engine_view {
+    uint32_t vpart = 0;                           // vpart index
+    uint8_t state = 0;                            // engine_* bits
+    uint8_t hp_frac = 0;                          // 0..255
+    uint32_t fuel = 0;                            // itype index of the fuel it burns now; 0 = none (muscle, wind)
+};
+struct vehicle_fuel_view {
+    uint32_t type = 0;                            // itype index
+    int32_t left = 0;                             // CDDA's charges of that fuel in all tanks
+    int32_t capacity = 0;                         // ... and what the tanks for it hold
+};
+struct player_vehicle_view {
+    uint64_t uid = 0;                             // the vehicle_view's uid
+    std::string name;                             // as vehicle_view::name: plain text, capped
+    bool in_control = false;                      // CDDA's player_in_control: holds the controls, on a square with some
+    bool at_controls = false;                     // controls on the player's square (driving or not)
+    // Speeds in CDDA's units, mph * 100; negative backwards. cruise: the speed it is set to reach. safe: the top
+    // speed that doesn't strain the engines. max: its top speed.
+    int32_t velocity = 0;
+    int32_t cruise_velocity = 0;
+    int32_t safe_velocity = 0;
+    int32_t max_velocity = 0;
+    // The player's speed unit option ("mph", "km/h" or "t/t": squares a turn) and what a speed above is multiplied
+    // by to show it in that unit (CDDA's convert_velocity).
+    std::string speed_unit;
+    float speed_scale = 0.01f;
+    bool engine_on = false;
+    std::vector<vehicle_engine_view> engines;     // cap max_vehicle_engines
+    std::vector<vehicle_fuel_view> fuels;         // every fuel in a tank or burnt by an engine, battery charge not; cap max_vehicle_fuels
+    int32_t battery_left = 0;                     // kJ in the vehicle's batteries
+    int32_t battery_capacity = 0;                 // kJ they hold; 0 = no battery
+    float turn_deg = 0;                           // the facing it is steering to
+    bool skidding = false;
+    int32_t mass_kg = 0;
+    // CDDA's overall condition (the vehicle screen's "Status"): 100 minus the share of all parts' damage. Above 95
+    // CDDA says "like new", above 67 "dented", above 34 "battered", above 0 "wrecked", at 0 "destroyed".
+    uint8_t health_pct = 0;
+};
+
 struct player_view {
     uint64_t uid = 0;
     ui_point pos;
@@ -385,6 +432,7 @@ struct player_view {
     // the peeked square, which everything seen is seen from. (peek_scope below.)
     bool peeking = false;
     ui_point peeking_from;
+    std::optional<player_vehicle_view> vehicle_state;   // only while boarded on a vehicle
 };
 
 struct environment_view {
