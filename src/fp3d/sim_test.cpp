@@ -314,6 +314,12 @@ std::atomic<uint64_t> fa_bandage_c_uid{ 0 };
 std::atomic<uint64_t> fa_apple_uid{ 0 };
 // Lean checks (scene 55): a rock lying behind a wall's end.
 std::atomic<uint64_t> lean_rock_uid{ 0 };
+// Cargo checks (scenes 56-58): how many bottles went into the car's biggest cargo space, and where that space is
+// from the avatar (sim thread writes, the test reads after the scene).
+std::atomic<int> cargo_items{ 0 };
+std::atomic<int> cargo_dx{ 0 };
+std::atomic<int> cargo_dy{ 0 };
+std::optional<tripoint_abs_ms> cargo_centre;     // sim thread only: where scene 56 was set up
 // The lying-container checks' scene (hand_setup 22).
 std::atomic<uint64_t> lc_pack_uid{ 0 };         // a backpack west holding a rock and 2 empty bottles
 std::atomic<uint64_t> lc_rock_uid{ 0 };         // the rock
@@ -1826,6 +1832,93 @@ void observe()
             }
             item &rock = here.add_item( p + tripoint_rel_ms( 0, -3, 0 ), item( itype_rock ) );
             lean_rock_uid = rock.is_null() ? 0 : fp3d::item_handle( rock );
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 56: {
+            // Cargo: floor 12 squares around, nothing lying there, no monsters; a car six squares east. 40 plastic
+            // bottles (or as many as fit; they don't stack, as rocks would) go into its biggest cargo space, and the
+            // avatar stands on a passable square next to that space.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -12; dx <= 12; dx++ ) {
+                for( int dy = -12; dy <= 12; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( !here.inbounds( q ) ) {
+                        continue;
+                    }
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_pavement );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            cargo_items = 0;
+            cargo_centre = here.get_abs( p );
+            vehicle *car = here.add_vehicle( vehicle_prototype_car, p + tripoint_rel_ms( 6, 0, 0 ), 0_degrees, 100, 2,
+                                             false, true );
+            if( car != nullptr ) {
+                int best = -1;
+                units::volume room = 0_ml;
+                for( const vpart_reference &vpr : car->get_avail_parts( "CARGO" ) ) {
+                    if( vpr.items().max_volume() > room ) {
+                        room = vpr.items().max_volume();
+                        best = static_cast<int>( vpr.part_index() );
+                    }
+                }
+                if( best >= 0 ) {
+                    vehicle_part &space = car->part( best );
+                    vehicle_stack old = car->get_items( space );
+                    while( !old.empty() ) {
+                        old.erase( old.begin() );
+                    }
+                    int in = 0;
+                    for( int i = 0; i < 40; i++ ) {
+                        in += car->add_item( here, space, item( itype_bottle_plastic ) ) ? 1 : 0;
+                    }
+                    cargo_items = in;
+                    // A square next to the space the avatar can stand on: off the car if there is one, else on it.
+                    const tripoint_bub_ms at = car->bub_part_pos( here, space );
+                    std::optional<tripoint_bub_ms> stand;
+                    for( const bool off_car : { true, false } ) {
+                        for( const tripoint_bub_ms &q : here.points_in_radius( at, 1 ) ) {
+                            if( !stand && q != at && here.passable( q ) && ( !off_car || !here.veh_at( q ) ) ) {
+                                stand = q;
+                            }
+                        }
+                    }
+                    if( stand ) {
+                        u.setpos( here, *stand );
+                        cargo_dx = at.x() - stand->x();
+                        cargo_dy = at.y() - stand->y();
+                    }
+                }
+            }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 57: {
+            // Cargo: the avatar eight squares west of the scene's centre, 14 from the car.
+            avatar &u = get_avatar();
+            if( cargo_centre ) {
+                u.setpos( here, here.get_bub( *cargo_centre ) + tripoint_rel_ms( -8, 0, 0 ) );
+            }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 58: {
+            // Cargo, after: the car gone.
+            for( const wrapped_vehicle &wv : here.get_vehicles() ) {
+                if( cargo_centre && wv.v->type == vehicle_prototype_car &&
+                    rl_dist( wv.pos, here.get_bub( *cargo_centre ) ) <= 24 ) {
+                    here.destroy_vehicle( wv.v );
+                    break;
+                }
+            }
+            cargo_centre.reset();
             here.build_map_cache( p.z() );
             break;
         }
@@ -8926,6 +9019,104 @@ static bool run_lean_checks()
     return failed == 0;
 }
 
+// Vehicle cargo in the snapshot (lead-world's car interiors, 2026-11-21): the cargo spaces within the avatar's
+// reach, each with its part row, its room and its items by handle.
+static bool run_cargo_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  cargo: %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    const auto scene = [&]( int number ) {
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return false;
+        }
+        hand_setup = number;
+        fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+        at = fp3d::wait_request( 20000, at->id );
+        return at && at->timed;
+    };
+    // The cargo rows of the newest snapshot, all vehicles together, and the row on the square (dx, dy) from the
+    // player if there is one.
+    struct seen {
+        size_t spaces = 0;
+        bool found = false;
+        fp3d::vehicle_cargo_view space;
+        bool in_json = false;
+        int parts_there = 0;      // part rows of any vehicle on that square
+        size_t vehicles = 0;
+    };
+    const auto look = []( int dx, int dy ) {
+        seen out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        out.vehicles = s->vehicles.size();
+        for( const fp3d::vehicle_view &v : s->vehicles ) {
+            for( const fp3d::vehicle_part_view &row : v.parts ) {
+                out.parts_there += v.pos.x + row.dx == s->player.pos.x + dx && v.pos.y + row.dy == s->player.pos.y + dy &&
+                                   v.pos.z + row.dz == s->player.pos.z ? 1 : 0;
+            }
+            out.spaces += v.cargo.size();
+            for( const fp3d::vehicle_cargo_view &c : v.cargo ) {
+                if( c.part >= v.parts.size() ) {
+                    continue;
+                }
+                const fp3d::vehicle_part_view &row = v.parts[c.part];
+                if( v.pos.x + row.dx == s->player.pos.x + dx && v.pos.y + row.dy == s->player.pos.y + dy &&
+                    v.pos.z + row.dz == s->player.pos.z ) {
+                    out.found = true;
+                    out.space = c;
+                }
+            }
+        }
+        std::ostringstream js;
+        fp3d::write_snapshot_json( js, *s, s->player.pos.z, s->player.pos.z );
+        out.in_json = js.str().find( "\"cargo\":[[" ) != std::string::npos;
+        return out;
+    };
+    const auto told = []( const seen & o ) {
+        return std::to_string( o.spaces ) + " spaces listed" + ( o.found ? ", the one there: part row " +
+                std::to_string( o.space.part ) + ", " + std::to_string( o.space.used_ml ) + " of " +
+                std::to_string( o.space.capacity_ml ) + " ml, " + std::to_string( o.space.items.size() ) +
+                " items, " + std::to_string( o.space.more ) + " more" : std::string( ", none there" ) ) +
+               ( o.in_json ? ", in the JSON" : "" ) + "; " + std::to_string( o.vehicles ) + " vehicles, " +
+               std::to_string( o.parts_there ) + " part rows on that square";
+    };
+
+    if( !scene( 56 ) || cargo_items.load() < 33 || ( cargo_dx.load() == 0 && cargo_dy.load() == 0 ) ) {
+        check( false, "scene: a car with bottles in its biggest cargo space, the avatar next to it",
+               std::to_string( cargo_items.load() ) + " bottles, the space at " + std::to_string( cargo_dx.load() ) + "," +
+               std::to_string( cargo_dy.load() ) + " from the avatar" );
+        return false;
+    }
+    const int bottles = cargo_items.load();
+    const uint32_t t_bottle = fp3d::intern_id( fp3d::id_kind::itype, "bottle_plastic" );
+    const seen by = look( cargo_dx.load(), cargo_dy.load() );
+    std::set<uint64_t> uids;
+    bool all_bottles = true;
+    for( const fp3d::cargo_item_view &it : by.space.items ) {
+        all_bottles = all_bottles && it.uid != 0 && it.type == t_bottle;
+        uids.insert( it.uid );
+    }
+    check( by.found && by.space.items.size() == fp3d::max_cargo_items && uids.size() == fp3d::max_cargo_items &&
+           all_bottles && static_cast<int>( by.space.more ) == bottles - static_cast<int>( fp3d::max_cargo_items ) &&
+           by.space.used_ml > 0 && by.space.used_ml <= by.space.capacity_ml && by.spaces >= 1 &&
+           by.spaces <= fp3d::max_cargo_spaces && by.in_json,
+           "next to the car: the space, its room, 32 bottles by handle", told( by ) + ", " + std::to_string( bottles ) +
+           " bottles in it, the space at " + std::to_string( cargo_dx.load() ) + "," + std::to_string( cargo_dy.load() ) +
+           " from the player" );
+    // Further off nothing of it is listed: the member is left out.
+    const bool stepped = scene( 57 );
+    const seen off = look( 0, 0 );
+    check( stepped && off.spaces == 0 && !off.in_json, "away from the car: no cargo listed", told( off ) );
+    check( scene( 58 ), "after: the car gone", "" );
+    return failed == 0;
+}
+
 // The off hand lets go of an item that has grown too heavy for one hand (here: filled up); it stays in its pocket
 // (lead-ui, 2026-11-15).
 static bool run_offhand_weight_checks()
@@ -10330,7 +10521,8 @@ int main()
     const bool first_aid_ok = gunmods_ok && run_first_aid_checks();
     const bool driving_ok = first_aid_ok && run_driving_checks();
     const bool lean_ok = driving_ok && run_lean_checks();
-    const bool names_ok = lean_ok && run_name_checks();
+    const bool cargo_ok = lean_ok && run_cargo_checks();
+    const bool names_ok = cargo_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -10396,6 +10588,7 @@ int main()
     std::printf( "first aid: %s\n", first_aid_ok ? "ok" : "BAD" );
     std::printf( "driving: %s\n", driving_ok ? "ok" : "BAD" );
     std::printf( "lean: %s\n", lean_ok ? "ok" : "BAD" );
+    std::printf( "cargo: %s\n", cargo_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
     // the game's turns got slower.
@@ -10412,6 +10605,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok && driving_ok && lean_ok ?
+           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok && driving_ok && lean_ok && cargo_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

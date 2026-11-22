@@ -235,6 +235,23 @@ constexpr int max_part_offset = 127;
 // the vehicle's own parts, with the copied part's mount, vpart, hp and state, and its own square.
 constexpr uint8_t part_gap_filler = 8;
 
+// What a vehicle carries where the player can get at it: the cargo spaces on the avatar's square and the eight
+// around it, the squares CDDA's own item menus list as nearby (reached by a clear path). CDDA has one cargo space
+// a square (vpart_position::cargo). Items are listed like the map's handles, in CDDA's stack order.
+constexpr size_t max_cargo_spaces = 9;
+constexpr size_t max_cargo_items = 32;
+struct cargo_item_view {
+    uint64_t uid = 0;                             // item handle (item_hands.h)
+    uint32_t type = 0;                            // itype index
+};
+struct vehicle_cargo_view {
+    uint16_t part = 0;                            // index into the vehicle's `parts`: the cargo part's row
+    int32_t used_ml = 0;                          // volume of what is in it
+    int32_t capacity_ml = 0;                      // volume it holds
+    uint32_t more = 0;                            // items not listed (beyond max_cargo_items)
+    std::vector<cargo_item_view> items;           // cap max_cargo_items
+};
+
 struct vehicle_view {
     uint64_t uid = 0;
     // CDDA's position of the vehicle, an absolute square: its origin part's until it rolls, then its turning
@@ -245,6 +262,7 @@ struct vehicle_view {
     float velocity = 0;                           // m/s
     std::string name;
     std::vector<vehicle_part_view> parts;         // cap 4096
+    std::vector<vehicle_cargo_view> cargo;        // cap max_cargo_spaces; empty unless the avatar is next to one
 };
 
 struct worn_view {
