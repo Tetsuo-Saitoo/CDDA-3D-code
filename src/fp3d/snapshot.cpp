@@ -1129,14 +1129,28 @@ void capture_vehicles( map &here, const avatar &u, snapshot &s, std::vector<uint
             pv.dz = static_cast<int8_t>( std::clamp( offset.z(), -max_part_offset, max_part_offset ) );
             return pv;
         };
-        std::map<int, uint16_t> row_of_part;      // CDDA's part index -> its row
         for( const vpart_reference &vp : v->get_all_parts() ) {
             if( vv.parts.size() >= max_vehicle_parts ) {
                 break;
             }
-            row_of_part[static_cast<int>( vp.part_index() )] = static_cast<uint16_t>( vv.parts.size() );
             vv.parts.push_back( row_of( vp.part(), vp.pos_bub( here ) ) );
         }
+        // The row of one of its parts by CDDA's part index: the rows above are in get_all_parts' order. Only walked
+        // for a cargo space in reach, so a vehicle away from the avatar costs nothing here.
+        const size_t own_rows = vv.parts.size();
+        const auto row_of_part = [&]( size_t part_index ) -> std::optional<uint16_t> {
+            size_t row = 0;
+            for( const vpart_reference &vp : v->get_all_parts() ) {
+                if( row >= own_rows ) {
+                    break;
+                }
+                if( vp.part_index() == part_index ) {
+                    return static_cast<uint16_t>( row );
+                }
+                row++;
+            }
+            return std::nullopt;
+        };
         // Its cargo spaces within the avatar's reach, with what is in them.
         for( const tripoint_bub_ms &p : reach ) {
             const optional_vpart_position on = here.veh_at( p );
@@ -1147,8 +1161,8 @@ void capture_vehicles( map &here, const avatar &u, snapshot &s, std::vector<uint
             if( !space ) {
                 continue;
             }
-            const auto row = row_of_part.find( static_cast<int>( space->part_index() ) );
-            if( row == row_of_part.end() ) {
+            const std::optional<uint16_t> row = row_of_part( space->part_index() );
+            if( !row ) {
                 continue;
             }
             const auto ml = []( const units::volume & vol ) {
@@ -1156,7 +1170,7 @@ void capture_vehicles( map &here, const avatar &u, snapshot &s, std::vector<uint
             };
             vehicle_stack stack = space->items();
             vehicle_cargo_view cv;
-            cv.part = row->second;
+            cv.part = *row;
             cv.used_ml = ml( stack.stored_volume() );
             cv.capacity_ml = ml( stack.max_volume() );
             size_t total = 0;
