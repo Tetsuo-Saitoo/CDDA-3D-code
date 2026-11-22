@@ -607,6 +607,20 @@ void capture_near_item_states( map &here, const avatar &u, const std::unordered_
                                std::vector<item_state_view> &out, std::vector<item_amount_view> &amounts )
 {
     for( const tripoint_bub_ms &p : here.points_in_radius( u.pos_bub(), 1 ) ) {
+        // What a vehicle's cargo space there holds (vehicle_cargo_view), as far as this capture listed it.
+        if( const std::optional<vpart_reference> cargo = here.veh_at( p ).cargo() ) {
+            size_t in_cargo = 0;
+            for( const item &it : cargo->items() ) {
+                if( in_cargo++ >= max_cargo_items || out.size() >= max_item_states ) {
+                    break;
+                }
+                const uint64_t uid = read_item_handle( it );
+                if( uid != 0 && seen.count( uid ) != 0 ) {
+                    add_item_state( it, uid, out );
+                    add_item_amount( it, uid, amounts );
+                }
+            }
+        }
         size_t listed = 0;
         for( const item &it : here.i_at( p ) ) {
             if( listed++ >= max_handles_near_player || out.size() >= max_item_states ) {
@@ -1051,8 +1065,24 @@ void capture_environment( const avatar &u, environment_view &env )
 }
 
 // vehicle_tiles: bit0 a part is here, bit1 the part is inside the vehicle (roofed).
-void capture_vehicles( map &here, snapshot &s, std::vector<uint8_t> &vehicle_tiles )
+// The squares CDDA's item menus take as nearby (inventory_selector::add_nearby_items with radius 1): the avatar's
+// own, and each of the eight around it that a clear path leads to.
+std::vector<tripoint_bub_ms> squares_in_reach( map &here, const avatar &u )
 {
+    std::vector<tripoint_bub_ms> out;
+    const tripoint_bub_ms at = u.pos_bub();
+    for( const tripoint_bub_ms &p : here.points_in_radius( at, 1 ) ) {
+        if( here.inbounds( p ) && ( p == at || here.clear_path( at, p, rl_dist( at, p ), 1, 100 ) ) ) {
+            out.push_back( p );
+        }
+    }
+    return out;
+}
+
+void capture_vehicles( map &here, const avatar &u, snapshot &s, std::vector<uint8_t> &vehicle_tiles,
+                       std::unordered_set<uint64_t> &seen )
+{
+    const std::vector<tripoint_bub_ms> reach = squares_in_reach( here, u );
     std::set<const vehicle *> present;
     for( const wrapped_vehicle &wv : here.get_vehicles() ) {
         vehicle *v = wv.v;
@@ -1099,11 +1129,48 @@ void capture_vehicles( map &here, snapshot &s, std::vector<uint8_t> &vehicle_til
             pv.dz = static_cast<int8_t>( std::clamp( offset.z(), -max_part_offset, max_part_offset ) );
             return pv;
         };
+        std::map<int, uint16_t> row_of_part;      // CDDA's part index -> its row
         for( const vpart_reference &vp : v->get_all_parts() ) {
             if( vv.parts.size() >= max_vehicle_parts ) {
                 break;
             }
+            row_of_part[static_cast<int>( vp.part_index() )] = static_cast<uint16_t>( vv.parts.size() );
             vv.parts.push_back( row_of( vp.part(), vp.pos_bub( here ) ) );
+        }
+        // Its cargo spaces within the avatar's reach, with what is in them.
+        for( const tripoint_bub_ms &p : reach ) {
+            const optional_vpart_position on = here.veh_at( p );
+            if( !on || &on->vehicle() != v || vv.cargo.size() >= max_cargo_spaces ) {
+                continue;
+            }
+            const std::optional<vpart_reference> space = on.cargo();
+            if( !space ) {
+                continue;
+            }
+            const auto row = row_of_part.find( static_cast<int>( space->part_index() ) );
+            if( row == row_of_part.end() ) {
+                continue;
+            }
+            const auto ml = []( const units::volume & vol ) {
+                return static_cast<int32_t>( std::clamp<int64_t>( units::to_milliliter( vol ), 0, INT32_MAX ) );
+            };
+            vehicle_stack stack = space->items();
+            vehicle_cargo_view cv;
+            cv.part = row->second;
+            cv.used_ml = ml( stack.stored_volume() );
+            cv.capacity_ml = ml( stack.max_volume() );
+            size_t total = 0;
+            for( item &it : stack ) {
+                total++;
+                if( cv.items.size() < max_cargo_items ) {
+                    cargo_item_view iv;
+                    iv.uid = item_handle( it, &seen );
+                    iv.type = intern_id( id_kind::itype, it.typeId().str() );
+                    cv.items.push_back( iv );
+                }
+            }
+            cv.more = static_cast<uint32_t>( total - cv.items.size() );
+            vv.cargo.push_back( std::move( cv ) );
         }
         // Then the active gap fillers, each as the part it copies (CDDA keeps hp and damage on that one), on its
         // own square.
@@ -1331,7 +1398,7 @@ std::shared_ptr<const snapshot> capture_snapshot()
     capture_environment( u, s->env );
 
     std::vector<uint8_t> vehicle_tiles( static_cast<size_t>( MAPSIZE_X ) * MAPSIZE_Y * OVERMAP_LAYERS, 0 );
-    capture_vehicles( here, *s, vehicle_tiles );
+    capture_vehicles( here, u, *s, vehicle_tiles, seen );
     capture_creatures( here, u, *s );
 
     here.update_visibility_cache( u.posz() );
@@ -2052,6 +2119,28 @@ static void write_snapshot( std::ostream &out, const snapshot &s, int z_min, int
             jo.end_array();
         }
         jo.end_array();
+        if( !v.cargo.empty() ) {
+            // [[part, used_ml, capacity_ml, more, [[uid, type], ...]], ...]
+            jo.member( "cargo" );
+            jo.start_array();
+            for( const vehicle_cargo_view &c : v.cargo ) {
+                jo.start_array();
+                jo.write( static_cast<int>( c.part ) );
+                jo.write( c.used_ml );
+                jo.write( c.capacity_ml );
+                jo.write( static_cast<int64_t>( c.more ) );
+                jo.start_array();
+                for( const cargo_item_view &it : c.items ) {
+                    jo.start_array();
+                    jo.write( static_cast<int64_t>( it.uid ) );
+                    jo.write( static_cast<int64_t>( it.type ) );
+                    jo.end_array();
+                }
+                jo.end_array();
+                jo.end_array();
+            }
+            jo.end_array();
+        }
         jo.end_object();
     }
     jo.end_array();
