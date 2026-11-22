@@ -824,6 +824,10 @@ static void fresh_cook_water( map &here, const tripoint_bub_ms &fire_at )
 // of them holding on (the user's case: no way out while the no-damage cheat keeps you alive), 46 a hostile NPC east,
 // 47 deep water around the player (3 by 3) and a zombie east in it, 48 a fungaloid tower (IMMOBILE) east, 49 a hostile
 // NPC east on a vehicle seat; none of them gets a move. 44 only clears up (dirt again, no vehicle).
+// The scene's monsters' hp: far above what one hit takes (a critical once killed the "off" check's zombie with its
+// first blow, so nothing was left holding on), so a check finds them still there.
+constexpr int UNSTOP_HP = 10000;
+
 void unstop_scene( int scene )
 {
     avatar &u = get_avatar();
@@ -877,6 +881,7 @@ void unstop_scene( int scene )
     } else if( scene == 47 || scene == 48 ) {
         if( monster *const z = g->place_critter_at( scene == 47 ? mon_zombie : mon_fungaloid_tower, east ) ) {
             z->set_moves( -1000000 );
+            z->set_hp( UNSTOP_HP );
         }
     } else {
         for( int dx = -1; dx <= 1; dx++ ) {
@@ -886,6 +891,7 @@ void unstop_scene( int scene )
                 }
                 if( monster *const z = g->place_critter_at( mon_zombie, p + tripoint_rel_ms( dx, dy, 0 ) ) ) {
                     z->set_moves( -1000000 );
+                    z->set_hp( UNSTOP_HP );
                     // East holds the torso, north-east the right arm, south the left leg, west the left arm.
                     const bodypart_str_id bp = dx == 1 && dy == 0 ? body_part_torso : scene == 42 ?
                                                bodypart_str_id::NULL_ID() : dx == 1 && dy == -1 ? body_part_arm_r :
@@ -4970,10 +4976,10 @@ static bool run_combat_checks()
                 if( m == nullptr ) {
                     // Rare (2 of 6 runs on one machine, 2026-11-21): said why, so the next one can be traced.
                     const Creature *in_way = get_creature_tracker().creature_at( at );
-                    std::printf( "  combat: scene: no zombie placed at %+d,%+d (%s, %s)\n", x, y,
+                    std::printf( "  combat: scene: no zombie placed at %+d,%+d (%s, %s; avatar at %s)\n", x, y,
                                  in_way == nullptr ? "no creature there" : in_way->is_npc() ? "an NPC there" :
                                  in_way->is_avatar() ? "the avatar there" : "a monster there",
-                                 here.passable( at ) ? "passable" : "not passable" );
+                                 here.passable( at ) ? "passable" : "not passable", u.pos_abs().to_string().c_str() );
                     return 0;
                 }
                 if( friendly ) {
