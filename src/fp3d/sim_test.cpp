@@ -8503,6 +8503,7 @@ static bool run_driving_checks()
         fp3d::ui_point player;
         bool car = false;         // that vehicle is listed
         bool on_part = false;     // ... and one of its part rows is on the player's square
+        std::optional<fp3d::player_vehicle_view> hud;   // player.vehicle_state
         fp3d::ui_point pos;
         float velocity = 0;
         float face = 0;
@@ -8516,6 +8517,7 @@ static bool run_driving_checks()
         }
         out.driving = s->player.driving;
         out.vehicle = s->player.vehicle;
+        out.hud = s->player.vehicle_state;
         out.player = s->player.pos;
         for( const fp3d::vehicle_view &v : s->vehicles ) {
             if( out.vehicle != 0 && v.uid == out.vehicle ) {
@@ -8628,6 +8630,50 @@ static bool run_driving_checks()
         check( false, "scene: boarded on a parked car's controls", told( parked ) );
         return false;
     }
+    // The vehicle's numbers, parked: it is named, the player sits at the controls without holding them, nothing
+    // moves, the engine is off, there is fuel in the tank and charge in the battery, and it is whole.
+    const auto hud_told = []( const seen & o ) {
+        if( !o.hud ) {
+            return std::string( "no vehicle_state" );
+        }
+        const fp3d::player_vehicle_view &h = *o.hud;
+        std::string out = "\"" + h.name + "\" " + ( h.in_control ? "in control" : "not in control" ) +
+                          ( h.at_controls ? ", at controls" : "" ) + ", v " + std::to_string( h.velocity ) + " cruise " +
+                          std::to_string( h.cruise_velocity ) + " safe " + std::to_string( h.safe_velocity ) + " max " +
+                          std::to_string( h.max_velocity ) + " " + h.speed_unit + " x" + std::to_string( h.speed_scale ) +
+                          ( h.engine_on ? ", engine on" : ", engine off" ) + ", " + std::to_string( h.engines.size() ) +
+                          " engines";
+        for( const fp3d::vehicle_engine_view &e : h.engines ) {
+            out += " [state " + std::to_string( e.state ) + " hp " + std::to_string( e.hp_frac ) + " fuel " +
+                   fp3d::id_name( fp3d::id_kind::itype, e.fuel ) + "]";
+        }
+        for( const fp3d::vehicle_fuel_view &f : h.fuels ) {
+            out += " " + fp3d::id_name( fp3d::id_kind::itype, f.type ) + " " + std::to_string( f.left ) + "/" +
+                   std::to_string( f.capacity );
+        }
+        return out + ", battery " + std::to_string( h.battery_left ) + "/" + std::to_string( h.battery_capacity ) +
+               ", turn " + std::to_string( h.turn_deg ) + ( h.skidding ? ", skidding" : "" ) + ", " +
+               std::to_string( h.mass_kg ) + " kg, health " + std::to_string( h.health_pct );
+    };
+    const auto fuel_ok = []( const fp3d::player_vehicle_view & h ) {
+        bool some = false;
+        for( const fp3d::vehicle_fuel_view &f : h.fuels ) {
+            some = some || ( f.type != 0 && f.left > 0 && f.left <= f.capacity );
+        }
+        return some;
+    };
+    const bool parked_hud = parked.hud && parked.hud->uid == parked.vehicle && !parked.hud->name.empty() &&
+                            parked.hud->at_controls && !parked.hud->in_control && parked.hud->velocity == 0 &&
+                            parked.hud->cruise_velocity == 0 && parked.hud->safe_velocity > 0 &&
+                            parked.hud->max_velocity >= parked.hud->safe_velocity && !parked.hud->engine_on &&
+                            !parked.hud->engines.empty() && ( parked.hud->engines[0].state & fp3d::engine_running ) == 0 &&
+                            parked.hud->engines[0].fuel != 0 && fuel_ok( *parked.hud ) && parked.hud->battery_capacity > 0 &&
+                            parked.hud->battery_left > 0 && parked.hud->battery_left <= parked.hud->battery_capacity &&
+                            parked.hud->mass_kg > 300 && parked.hud->health_pct >= 95 && !parked.hud->skidding &&
+                            ( parked.hud->speed_unit == "mph" || parked.hud->speed_unit == "km/h" ||
+                              parked.hud->speed_unit == "t/t" ) && parked.hud->speed_scale > 0.001f &&
+                            parked.hud->speed_scale < 0.02f;
+    check( parked_hud, "parked: the vehicle's numbers", hud_told( parked ) );
     // The controls: CDDA starts the engine (an activity) and the character then holds them. An engine can fail to
     // start: asked again, at most three times.
     result res;
@@ -8638,6 +8684,9 @@ static bool run_driving_checks()
     }
     check( res.back && now.driving && now.vehicle == parked.vehicle && res.menus == 0, "control_vehicle: the controls taken",
            show( res ) + "; " + told( now ) );
+    check( now.hud && now.hud->in_control && now.hud->engine_on && !now.hud->engines.empty() &&
+           ( now.hud->engines[0].state & fp3d::engine_running ) != 0 && now.hud->velocity == 0,
+           "the controls taken: in control, the engine runs", hud_told( now ) );
     // Both are in the JSON while they hold, and left out before.
     const auto json_has = []( const char *member ) {
         const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
@@ -8649,8 +8698,10 @@ static bool run_driving_checks()
         return out.str().find( member ) != std::string::npos;
     };
     const std::string vehicle_member = "\"vehicle\":" + std::to_string( now.vehicle ) + ",";
-    check( json_has( "\"driving\":true" ) && json_has( vehicle_member.c_str() ), "the JSON has driving and the vehicle",
-           vehicle_member );
+    check( json_has( "\"driving\":true" ) && json_has( vehicle_member.c_str() ) &&
+           json_has( "\"vehicle_state\":{\"uid\":" ) && json_has( "\"speed_unit\":\"" ) &&
+           json_has( "\"engines\":[[" ) && json_has( "\"fuels\":[[" ) && json_has( "\"battery\":[" ),
+           "the JSON has driving, the vehicle and its numbers", vehicle_member );
     // UP raises the speed the car is set to reach (CDDA's cruise speed, 4 mph a step) and takes no time; the car
     // speeds up as turns pass. The player rides on one of its parts: CDDA moves the vehicle's `pos` to its turning
     // point once it rolls, so the player's offset from `pos` is not a constant, the part rows are what holds.
@@ -8671,6 +8722,13 @@ static bool run_driving_checks()
            ( rolling.player.x != held.player.x || rolling.player.y != held.player.y ),
            "UP four times, then turns pass: the car rolls with the player",
            told( rolling ) + ", moved " + std::to_string( moved ) + ", UP took " + std::to_string( up_turns ) + " turns" );
+    // The numbers follow: four steps set 16 mph to reach while it still stands, then it moves at what the
+    // vehicle row says, in CDDA's units.
+    check( sped.hud && sped.hud->cruise_velocity == 1600 && sped.hud->velocity == 0 && rolling.hud &&
+           rolling.hud->cruise_velocity == 1600 && rolling.hud->velocity > 0 &&
+           std::fabs( rolling.hud->velocity / 100.0 * 0.44704 - rolling.velocity ) < 0.01 &&
+           rolling.hud->velocity <= rolling.hud->max_velocity,
+           "the numbers change with acceleration", hud_told( sped ) + "; " + hud_told( rolling ) );
     // Steering: the facing it turns to changes, and back.
     res = act( "RIGHT", "" );
     const seen steered = look();
@@ -8679,6 +8737,9 @@ static bool run_driving_checks()
     check( res.back && back_res.back && steered.driving && std::fabs( steered.turn - rolling.turn ) >= 1.0f &&
            std::fabs( straight.turn - rolling.turn ) < 1.0f, "RIGHT, then LEFT: it steers and steers back",
            told( steered ) + "; " + told( straight ) + "; " + show( res ) );
+    check( steered.hud && std::fabs( steered.hud->turn_deg - steered.turn ) < 0.01f && straight.hud &&
+           std::fabs( straight.hud->turn_deg - straight.turn ) < 0.01f, "the numbers have the steering",
+           hud_told( steered ) );
     // DOWN lowers the speed it is set to reach; back at none, the car stands after some turns (at most thirty).
     for( int i = 0; i < 4; i++ ) {
         res = act( "DOWN", "" );
@@ -8697,8 +8758,9 @@ static bool run_driving_checks()
            "control_vehicle while driving: the menu, let go", show( res ) + "; " + told( let_go ) );
     const bool cleared = scene( 54 );
     const seen after = look();
-    check( cleared && !after.driving && after.vehicle == 0 && !json_has( "\"driving\"" ) && !json_has( "\"vehicle\":" ),
-           "after: off the car, the car gone, neither in the JSON", told( after ) );
+    check( cleared && !after.driving && after.vehicle == 0 && !after.hud && !json_has( "\"driving\"" ) &&
+           !json_has( "\"vehicle\":" ) && !json_has( "\"vehicle_state\"" ),
+           "after: off the car, the car gone, nothing of it in the JSON", told( after ) );
     return failed == 0;
 }
 
