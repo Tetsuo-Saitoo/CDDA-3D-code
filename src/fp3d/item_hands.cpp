@@ -54,6 +54,10 @@
 #include "translation.h"
 #include "translations.h"
 #include "units.h"
+#include "veh_type.h"
+#include "vehicle.h"
+#include "vehicle_selector.h"
+#include "vpart_position.h"
 
 static const activity_id ACT_CONSUME( "ACT_CONSUME" );
 static const activity_id ACT_GUNMOD_ADD( "ACT_GUNMOD_ADD" );
@@ -236,6 +240,38 @@ item_location find_inside( item_location box, const item_ref &r )
     return found;
 }
 
+// The vehicle cargo space on `p` the avatar can get at, by CDDA's rule for items nearby (its item menus,
+// inventory_selector::add_nearby_items): on the avatar's square, or on one next to it that a clear path leads to.
+// The snapshot lists the same spaces (vehicles[].cargo). CDDA has one cargo space a square and asks for no open lid.
+std::optional<vpart_reference> cargo_in_reach( map &here, const avatar &u, const tripoint_bub_ms &p )
+{
+    const tripoint_bub_ms at = u.pos_bub();
+    if( !within_reach( u, p ) || ( p != at && !here.clear_path( at, p, rl_dist( at, p ), 1, 100 ) ) ) {
+        return std::nullopt;
+    }
+    return here.veh_at( p ).cargo();
+}
+
+// The one item with this handle in the cargo space on `p`; none when two share it.
+item_location find_in_cargo( map &here, const avatar &u, const tripoint_bub_ms &p, const item_ref &r )
+{
+    const std::optional<vpart_reference> space = cargo_in_reach( here, u, p );
+    if( !space ) {
+        return item_location();
+    }
+    item_location found;
+    for( item &it : space->items() ) {
+        if( matches( it, r ) ) {
+            if( found ) {
+                return item_location();
+            }
+            found = item_location( vehicle_cursor( space->vehicle(), static_cast<std::ptrdiff_t>( space->part_index() ) ),
+                                   &it );
+        }
+    }
+    return found;
+}
+
 bool take( avatar &u, const item_action &a )
 {
     map &here = get_map();
@@ -269,6 +305,10 @@ bool take( avatar &u, const item_action &a )
         }
     } else {
         loc = find_on_square( here, *p, a.item );
+        if( !loc ) {
+            // Not lying there: in the vehicle's cargo space on that square.
+            loc = find_in_cargo( here, u, *p, a.item );
+        }
     }
     if( !loc ) {
         return refuse( u, _( "That isn't there any more." ) );
@@ -500,6 +540,37 @@ bool drop( avatar &u, const item_action &a )
         return refuse( u, _( "You can't reach that from here." ) );
     }
     const std::string name = src->tname();
+    if( a.cargo ) {
+        // Into the vehicle's cargo space on that square, as CDDA's drop there puts it (vehicle::add_item: the room
+        // and the item count the space has). What doesn't fit stays in the hand: nothing spills onto the ground.
+        const std::optional<vpart_reference> space = cargo_in_reach( here, u, *p );
+        if( !space ) {
+            return refuse( u, string_format( _( "There's nothing to put your %s into there." ), name ) );
+        }
+        if( src->is_bucket_nonempty() ) {
+            return refuse( u, string_format( _( "Can't stash %s while it's not empty" ), src->display_name() ) );
+        }
+        const int cost = src.obtain_cost( u ) + Pickup::cost_to_move_item( u, *src );
+        item copy = *src;
+        clear_offhand_mark( copy );
+        forget_spot( copy );
+        vehicle &veh = space->vehicle();
+        const std::string part_name = space->part().info().name();
+        if( !veh.add_item( here, space->part(), copy ) ) {
+            //~ %1$s is item name, %2$s is vehicle name, %3$s is vehicle part name
+            return refuse( u, string_format( _( "Unable to fit %1$s in the %2$s's %3$s." ), name, veh.name,
+                                             part_name ) );
+        }
+        contents_change_handler handler;
+        handler.unseal_pocket_containing( src );
+        src.remove_item();
+        handler.handle_by( u );
+        u.mod_moves( -cost );
+        after_inventory_change( u );
+        //~ %1$s is item name, %2$s is vehicle name, %3$s is vehicle part name
+        u.add_msg_if_player( _( "You put your %1$s in the %2$s's %3$s." ), name, veh.name, part_name );
+        return true;
+    }
     if( !here.can_put_items_ter_furn( *p ) ) {
         return refuse( u, string_format( _( "You can't put your %s there." ), name ) );
     }

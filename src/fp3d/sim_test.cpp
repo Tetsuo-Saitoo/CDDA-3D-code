@@ -320,6 +320,19 @@ std::atomic<int> cargo_items{ 0 };
 std::atomic<int> cargo_dx{ 0 };
 std::atomic<int> cargo_dy{ 0 };
 std::optional<tripoint_abs_ms> cargo_centre;     // sim thread only: where scene 56 was set up
+vehicle *cargo_car = nullptr;                    // sim thread only: scene 56's car, until scene 58
+int cargo_part = -1;                             // ... and its biggest cargo space
+// Cargo by hand (scene 59): two of the five bottles in the space, the free merchants' bottle there, the carried
+// rock, the giant backpack in hand; and a square in the avatar's reach without a cargo space, from the avatar
+// (cg_free 0: there is none).
+std::atomic<uint64_t> cg_bottle_a_uid{ 0 };
+std::atomic<uint64_t> cg_bottle_b_uid{ 0 };
+std::atomic<uint64_t> cg_theirs_uid{ 0 };
+std::atomic<uint64_t> cg_rock_uid{ 0 };
+std::atomic<uint64_t> cg_big_uid{ 0 };
+std::atomic<int> cg_free{ 0 };
+std::atomic<int> cg_free_dx{ 0 };
+std::atomic<int> cg_free_dy{ 0 };
 // The lying-container checks' scene (hand_setup 22).
 std::atomic<uint64_t> lc_pack_uid{ 0 };         // a backpack west holding a rock and 2 empty bottles
 std::atomic<uint64_t> lc_rock_uid{ 0 };         // the rock
@@ -1870,6 +1883,8 @@ void observe()
                     }
                 }
                 if( best >= 0 ) {
+                    cargo_car = car;
+                    cargo_part = best;
                     vehicle_part &space = car->part( best );
                     vehicle_stack old = car->get_items( space );
                     while( !old.empty() ) {
@@ -1900,6 +1915,63 @@ void observe()
             here.build_map_cache( p.z() );
             break;
         }
+        case 59: {
+            // Cargo by hand: scene 56's car, the avatar still next to its biggest cargo space. The space now holds
+            // five plastic bottles and a sixth that belongs to the free merchants. The avatar wears a backpack with
+            // a rock in it and holds a giant backpack.
+            avatar &u = get_avatar();
+            cg_bottle_a_uid = 0;
+            cg_free = 0;
+            if( cargo_car != nullptr && cargo_part >= 0 ) {
+                vehicle_part &space = cargo_car->part( cargo_part );
+                vehicle_stack old = cargo_car->get_items( space );
+                while( !old.empty() ) {
+                    old.erase( old.begin() );
+                }
+                const auto into = [&]( const item & it ) -> uint64_t {
+                    const std::optional<vehicle_stack::iterator> at = cargo_car->add_item( here, space, it );
+                    return at ? fp3d::item_handle( **at ) : 0;
+                };
+                cg_bottle_a_uid = into( item( itype_bottle_plastic ) );
+                cg_bottle_b_uid = into( item( itype_bottle_plastic ) );
+                for( int i = 0; i < 3; i++ ) {
+                    into( item( itype_bottle_plastic ) );
+                }
+                item theirs( itype_bottle_plastic );
+                theirs.set_owner( faction_id( "free_merchants" ) );
+                cg_theirs_uid = into( theirs );
+            }
+            u.clear_worn();
+            u.inv->clear();
+            u.remove_weapon();
+            u.wear_item( item( itype_backpack ), false );
+            item_location rock = u.i_add( item( itype_rock ) );
+            cg_rock_uid = rock ? fp3d::item_handle( *rock ) : 0;
+            u.set_wielded_item( item( itype_backpack_giant ) );
+            item_location big = u.get_wielded_item();
+            cg_big_uid = big ? fp3d::item_handle( *big ) : 0;
+            for( const tripoint_bub_ms &q : here.points_in_radius( u.pos_bub(), 1 ) ) {
+                if( cg_free.load() == 0 && q != u.pos_bub() && !here.veh_at( q ).cargo() ) {
+                    cg_free = 1;
+                    cg_free_dx = q.x() - u.pos_bub().x();
+                    cg_free_dy = q.y() - u.pos_bub().y();
+                }
+            }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 60: {
+            // Cargo by hand: giant backpacks into that space until no more fit.
+            if( cargo_car != nullptr && cargo_part >= 0 ) {
+                vehicle_part &space = cargo_car->part( cargo_part );
+                for( int i = 0; i < 400; i++ ) {
+                    if( !cargo_car->add_item( here, space, item( itype_backpack_giant ) ) ) {
+                        break;
+                    }
+                }
+            }
+            break;
+        }
         case 57: {
             // Cargo: the avatar eight squares west of the scene's centre, 14 from the car.
             avatar &u = get_avatar();
@@ -1919,6 +1991,8 @@ void observe()
                 }
             }
             cargo_centre.reset();
+            cargo_car = nullptr;
+            cargo_part = -1;
             here.build_map_cache( p.z() );
             break;
         }
@@ -9109,6 +9183,169 @@ static bool run_cargo_checks()
            "next to the car: the space, its room, 32 bottles by handle", told( by ) + ", " + std::to_string( bottles ) +
            " bottles in it, the space at " + std::to_string( cargo_dx.load() ) + "," + std::to_string( cargo_dy.load() ) +
            " from the player" );
+    // ---- by hand: take an item out of the space, put one in (item_hands.h) ----
+    struct result {
+        bool queued = false;
+        bool back = false;
+        int answers = 0;
+        bool done = false;
+        std::string why;
+        int spent = 0;
+    };
+    uint32_t next_tag = 900;
+    const auto act = [&]( fp3d::item_op op, uint64_t uid, uint32_t type, const fp3d::ui_point & pos, bool into_cargo,
+    fp3d::item_hand hand ) {
+        result res;
+        std::vector<fp3d::event> evs;
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return res;
+        }
+        const observed o0 = snapshot();
+        fp3d::drain_events( evs );
+        evs.clear();
+        fp3d::item_action ia;
+        ia.op = op;
+        ia.item = fp3d::item_ref{ uid, type };
+        ia.pos = pos;
+        ia.hand = hand;
+        ia.cargo = into_cargo;
+        ia.tag = ++next_tag;
+        res.queued = fp3d::queue_item_action( ia );
+        if( !res.queued ) {
+            return res;
+        }
+        const uint64_t before = at->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 30000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, at->id );
+            if( !next ) {
+                continue;
+            }
+            at = next;
+            if( at->timed ) {
+                if( at->id != before ) {
+                    res.back = true;
+                    break;
+                }
+                continue;
+            }
+            fp3d::ui_answer a;
+            a.id = at->id;
+            a.cancel = true;
+            fp3d::answer( a );
+        }
+        fp3d::drain_events( evs );
+        const observed o1 = snapshot();
+        res.spent = static_cast<int>( o1.turn - o0.turn ) * o0.speed + o0.moves - o1.moves;
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::item_result && e.detail == ia.tag ) {
+                res.answers++;
+                res.done = e.amount == 1;
+                res.why = e.text;
+            }
+        }
+        return res;
+    };
+    const auto show = []( const result & r ) {
+        return std::string( r.queued ? "" : "not queued " ) + ( r.back ? "" : "not back " ) +
+               ( r.done ? "done" : "not done" ) + " [" + r.why + "] " + std::to_string( r.spent ) + " moves, " +
+               std::to_string( r.answers ) + " answers";
+    };
+    const auto has = []( const std::string & str, const char *part ) {
+        return str.find( part ) != std::string::npos;
+    };
+    const auto carried_has = []( uint64_t uid ) {
+        for( const fp3d::carried_view &c : carried_now() ) {
+            if( c.uid == uid ) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const auto in_space = [&]( uint64_t uid ) {
+        const seen now = look( cargo_dx.load(), cargo_dy.load() );
+        for( const fp3d::cargo_item_view &it : now.space.items ) {
+            if( now.found && it.uid == uid ) {
+                return true;
+            }
+        }
+        return false;
+    };
+    const bool handed = scene( 59 );
+    const std::shared_ptr<const fp3d::snapshot> s2 = fp3d::latest_snapshot();
+    const uint64_t a_uid = cg_bottle_a_uid;
+    const uint64_t b_uid = cg_bottle_b_uid;
+    const uint64_t theirs_uid = cg_theirs_uid;
+    const uint64_t rock_uid = cg_rock_uid;
+    const uint64_t big_uid = cg_big_uid;
+    const seen loaded = look( cargo_dx.load(), cargo_dy.load() );
+    if( !handed || !s2 || a_uid == 0 || b_uid == 0 || theirs_uid == 0 || rock_uid == 0 || big_uid == 0 ||
+        !loaded.found || loaded.space.items.size() != 6 || !in_space( a_uid ) || !in_space( theirs_uid ) ||
+        !carried_has( rock_uid ) || !carried_has( big_uid ) ) {
+        check( false, "by hand: scene: six bottles in the space, a rock and a giant backpack carried", told( loaded ) );
+        return false;
+    }
+    const fp3d::ui_point me = s2->player.pos;
+    const fp3d::ui_point space_sq{ me.x + cargo_dx.load(), me.y + cargo_dy.load(), me.z };
+    const uint32_t t_rock = fp3d::intern_id( fp3d::id_kind::itype, "rock" );
+    const uint32_t t_big = fp3d::intern_id( fp3d::id_kind::itype, "backpack_giant" );
+    // What the queue takes: `cargo` only with drop, and never with a spot.
+    fp3d::item_action odd;
+    odd.op = fp3d::item_op::take;
+    odd.item = fp3d::item_ref{ a_uid, t_bottle };
+    odd.pos = space_sq;
+    odd.cargo = true;
+    const bool take_with_cargo = fp3d::queue_item_action( odd );
+    odd.op = fp3d::item_op::drop;
+    odd.item = fp3d::item_ref{ rock_uid, t_rock };
+    odd.has_spot = true;
+    odd.spot_x = 500;
+    odd.spot_y = 500;
+    check( !take_with_cargo && !fp3d::queue_item_action( odd ), "by hand: cargo only with drop, never with a spot", "" );
+    // A bottle out of the space into the pack.
+    result res = act( fp3d::item_op::take, a_uid, t_bottle, space_sq, false, fp3d::item_hand::pack );
+    const seen after_take = look( cargo_dx.load(), cargo_dy.load() );
+    check( res.back && res.answers == 1 && res.done && res.spent > 0 && carried_has( a_uid ) && !in_space( a_uid ) &&
+           after_take.space.items.size() == 5, "by hand: a bottle out of the space into the pack",
+           show( res ) + "; " + told( after_take ) );
+    // The same handle again: it isn't there any more.
+    res = act( fp3d::item_op::take, a_uid, t_bottle, space_sq, false, fp3d::item_hand::pack );
+    check( res.back && res.answers == 1 && !res.done && has( res.why, "isn't there any more" ) && res.spent == 0,
+           "by hand: taken once, not there twice", show( res ) );
+    // Someone else's bottle stays.
+    res = act( fp3d::item_op::take, theirs_uid, t_bottle, space_sq, false, fp3d::item_hand::pack );
+    check( res.back && !res.done && has( res.why, "isn't yours" ) && in_space( theirs_uid ) && !carried_has( theirs_uid ),
+           "by hand: someone else's bottle is refused", show( res ) );
+    // Into a hand that holds something: refused as from the ground.
+    res = act( fp3d::item_op::take, b_uid, t_bottle, space_sq, false, fp3d::item_hand::main );
+    check( res.back && !res.done && has( res.why, "hand is full" ) && in_space( b_uid ), "by hand: a full hand takes nothing",
+           show( res ) );
+    // A square two off: out of reach.
+    res = act( fp3d::item_op::take, b_uid, t_bottle, fp3d::ui_point{ me.x + 2 * cargo_dx.load(), me.y + 2 * cargo_dy.load(), me.z },
+               false, fp3d::item_hand::pack );
+    check( res.back && !res.done && has( res.why, "reach" ) && in_space( b_uid ), "by hand: a space two squares off is out of reach",
+           show( res ) );
+    // The rock into the space.
+    res = act( fp3d::item_op::drop, rock_uid, t_rock, space_sq, true, fp3d::item_hand::pack );
+    const seen after_put = look( cargo_dx.load(), cargo_dy.load() );
+    check( res.back && res.answers == 1 && res.done && res.spent > 0 && !carried_has( rock_uid ) && in_space( rock_uid ) &&
+           after_put.space.items.size() == 6 && after_put.space.used_ml > after_take.space.used_ml,
+           "by hand: the rock into the space", show( res ) + "; " + told( after_put ) );
+    // A square in reach with no cargo space on it.
+    if( cg_free.load() != 0 ) {
+        res = act( fp3d::item_op::drop, a_uid, t_bottle, fp3d::ui_point{ me.x + cg_free_dx.load(), me.y + cg_free_dy.load(), me.z },
+                   true, fp3d::item_hand::pack );
+        check( res.back && !res.done && has( res.why, "nothing to put" ) && carried_has( a_uid ) && res.spent == 0,
+               "by hand: no cargo space on that square", show( res ) );
+    } else {
+        std::printf( "  cargo: by hand: every square in reach has a cargo space (not checked: none without)\n" );
+    }
+    // The space filled up: the giant backpack in hand doesn't fit and stays in the hand.
+    const bool filled = scene( 60 );
+    res = act( fp3d::item_op::drop, big_uid, t_big, space_sq, true, fp3d::item_hand::pack );
+    check( filled && res.back && res.answers == 1 && !res.done && has( res.why, "Unable to fit" ) && carried_has( big_uid ) &&
+           res.spent == 0, "by hand: a full space takes no more", show( res ) );
     // Further off nothing of it is listed: the member is left out.
     const bool stepped = scene( 57 );
     const seen off = look( 0, 0 );

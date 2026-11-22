@@ -335,6 +335,11 @@ struct item_action {
     // quality VISE 3 lying on the avatar's square or one next to it (FP3D rule, item_hands.h vise_odds: better
     // odds). The action checks it when it runs and is refused when it isn't one or isn't there.
     item_ref vise;
+    // drop only (false for every other op), optional: the item goes into the vehicle's cargo space on `pos` (the
+    // snapshot's vehicles[].cargo) instead of onto the ground there, by CDDA's own fit rule. Never with a spot, a
+    // pose or a shelf: an item in a cargo space has no place on a square. take needs no such word: it finds the
+    // item lying on `pos` or, failing that, in the cargo space there.
+    bool cargo = false;
 };
 constexpr size_t max_item_part_bytes = 32;
 constexpr size_t max_cook_recipe_bytes = 128;
