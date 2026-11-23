@@ -1474,6 +1474,14 @@ int main()
                         here.furn_set( q, furn_str_id::NULL_ID() );
                         here.ter_set( q, ter_t_floor );
                         here.i_clear( q );
+                        // A vehicle of the map's own on this ground (a parked car) goes too. CDDA's lookup holds
+                        // one vehicle a square and fills it in the order of the vehicles' addresses, so with two
+                        // on a square map::veh_at gave the test's on most runs and the parked one on a few.
+                        if( const optional_vpart_position parked_here = here.veh_at( q ) ) {
+                            std::printf( "  %s: the map's '%s' stood on its ground, removed\n", c.name,
+                                         parked_here->vehicle().name.c_str() );
+                            here.destroy_vehicle( &parked_here->vehicle() );
+                        }
                     }
                 }
                 c.veh = here.add_vehicle( vehicle_prototype_none, mid, c.dir, 0, 0 );
@@ -1521,14 +1529,19 @@ int main()
                 if( view != nullptr && c.veh != nullptr ) {
                     const tripoint_bub_ms origin = c.veh->pos_bub( here );
                     const auto note = [&]( const fp3d::vehicle_part_view & row ) {
-                        const optional_vpart_position there = here.veh_at( origin + tripoint_rel_ms( row.dx, row.dy,
-                                row.dz ) );
-                        found_by_map += there && &there->vehicle() == c.veh &&
-                                        flagged( origin + tripoint_rel_ms( row.dx, row.dy, row.dz ) ) ? 1 : 0;
+                        const tripoint_bub_ms square = origin + tripoint_rel_ms( row.dx, row.dy, row.dz );
+                        const optional_vpart_position there = here.veh_at( square );
+                        const bool mine = there && &there->vehicle() == c.veh;
+                        const bool flag = flagged( square );
+                        found_by_map += mine && flag ? 1 : 0;
+                        // What went wrong on a square that doesn't count: whose it is by the map, a missing flag.
+                        const std::string wrong = std::string( mine ? "" : there ? " map: another vehicle, '" +
+                                                  there->vehicle().name + "'" : " map: no vehicle" ) +
+                                                  ( flag ? "" : " no flag" );
                         rows += std::string( " [" ) + ( row.state & fp3d::part_gap_filler ? "filler " : "" ) +
                                 std::to_string( row.mount_x ) + "," + std::to_string( row.mount_y ) + " -> " +
                                 std::to_string( row.dx ) + "," + std::to_string( row.dy ) + "," +
-                                std::to_string( row.dz ) + "]";
+                                std::to_string( row.dz ) + wrong + "]";
                     };
                     // Its own parts first, in CDDA's order.
                     for( const vpart_reference &vp : c.veh->get_all_parts() ) {
