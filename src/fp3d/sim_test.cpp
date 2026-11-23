@@ -9789,6 +9789,11 @@ static bool run_vehicle_work_checks()
         int damage = -1;
         int flags = -1;
         size_t faults = 0;
+        bool holds = false;
+        std::string fill_what;
+        int64_t fill_now = -1;
+        int64_t fill_max = -1;
+        std::string fill_unit;
     };
     struct parsed {
         bool valid = false;
@@ -9818,6 +9823,7 @@ static bool run_vehicle_work_checks()
             out.kind = jo.get_string( "kind" );
             if( !out.ok ) {
                 out.error = jo.get_string( "error" );
+                out.vehicle = jo.has_member( "vehicle" ) ? jo.get_member( "vehicle" ).get_int64() : 0;
                 out.valid = true;
                 return out;
             }
@@ -9839,6 +9845,15 @@ static bool run_vehicle_work_checks()
                 part.flags = p.get_int( "flags" );
                 if( p.has_array( "faults" ) ) {
                     part.faults = p.get_array( "faults" ).size();
+                }
+                if( p.has_object( "fill" ) ) {
+                    JsonObject fill = p.get_object( "fill" );
+                    fill.allow_omitted_members();
+                    part.holds = true;
+                    part.fill_what = fill.get_string( "what" );
+                    part.fill_now = fill.get_member( "now" ).get_int64();
+                    part.fill_max = fill.get_member( "max" ).get_int64();
+                    part.fill_unit = fill.get_string( "unit" );
                 }
                 out.parts.push_back( part );
             }
@@ -10098,6 +10113,27 @@ static bool run_vehicle_work_checks()
            box ? box->name + ", hp " + std::to_string( box->hp ) + ", damage " + std::to_string( box->damage ) +
            ", flags " + std::to_string( box->flags ) + ", variant \"" + box->variant + "\"" : "not listed" );
 
+    // What its tanks and batteries hold, as CDDA's overview shows it: a car fresh from its prototype has fuel in
+    // its tank and a battery; the glovebox holds nothing of the kind.
+    int tanks = 0;
+    int stores = 0;
+    int odd = 0;
+    std::string holding;
+    for( const w_part &p : all.parts ) {
+        if( !p.holds ) {
+            continue;
+        }
+        const bool tank = p.fill_unit == "ml";
+        tanks += tank && p.fill_max > 0 && p.fill_now > 0 && p.fill_now <= p.fill_max && !p.fill_what.empty() ? 1 : 0;
+        stores += p.fill_unit == "charges" && p.fill_max > 0 && p.fill_now >= 0 && p.fill_now <= p.fill_max ? 1 : 0;
+        odd += ( !tank && p.fill_unit != "charges" ) || p.fill_now < 0 || p.fill_max < 0 ||
+               ( p.fill_now == 0 ) != p.fill_what.empty() ? 1 : 0;
+        holding += " [" + p.name + ": " + p.fill_what + " " + std::to_string( p.fill_now ) + " of " +
+                std::to_string( p.fill_max ) + " " + p.fill_unit + "]";
+    }
+    check( tanks >= 1 && stores >= 1 && odd == 0 && box != nullptr && !box->holds,
+           "fill: fuel in a tank in ml, a battery in charges", holding.substr( 0, 500 ) );
+
     // The glovebox selected, with no mechanics skill.
     const parsed bare = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
     const bool order = bare.cmds.size() == 4 && bare.cmds[0].cmd == "r" && bare.cmds[1].cmd == "o" &&
@@ -10185,7 +10221,8 @@ static bool run_vehicle_work_checks()
     const parsed gone = parse( await( fp3d::post_vehicle_work_query( car.uid + 100000, -1 ) ) );
     const parsed no_row = parse( await( fp3d::post_vehicle_work_query( car.uid, 4000 ) ) );
     check( gone.valid && !gone.ok && gone.kind == "vehicle_work" && gone.error == "no such vehicle" &&
-           no_row.valid && !no_row.ok && no_row.error == "no such part",
+           gone.vehicle == static_cast<int64_t>( car.uid + 100000 ) && no_row.valid && !no_row.ok &&
+           no_row.error == "no such part" && no_row.vehicle == static_cast<int64_t>( car.uid ),
            "an unknown uid, a row it doesn't have: errors", gone.error + " / " + no_row.error );
 
     // One at a time: posted during the wait menu, a second one is refused; the first runs back at the main loop.

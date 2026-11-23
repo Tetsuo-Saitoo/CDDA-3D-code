@@ -38,7 +38,8 @@ constexpr int max_work_part_row = 4095;         // the highest part row a query 
 // when there is no such vehicle in the reality bubble, no part of it is on the avatar's square or one next to it,
 // or the row isn't one of its parts. At most about `max_bytes`: part entries go from the end first, then the lines.
 std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle, int part_row, size_t max_bytes );
-std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error );
+// `vehicle`: the uid the query named, given back so a client can tell which vehicle the error is about; 0 none.
+std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error, uint64_t vehicle = 0 );
 
 // Sim side, from the main loop (fp3d/held.h held_action): runs the vehicle-work action the bridge just answered
 // with. True when the work was started. Refused with a message, nothing done: no such vehicle in the reality

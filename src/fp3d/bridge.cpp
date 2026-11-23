@@ -116,7 +116,7 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
         lk.unlock();
         const auto failed = [&q]( const std::string & error ) {
             return q.kind == query_kind::character ? character_query_error_json( q.id, error ) :
-                   q.kind == query_kind::vehicle_work ? vehicle_work_query_error_json( q.id, error ) :
+                   q.kind == query_kind::vehicle_work ? vehicle_work_query_error_json( q.id, error, q.vehicle ) :
                    recipe_query_error_json( q.id, q.container.uid, error );
         };
         std::string result;

@@ -18,6 +18,7 @@
 #include "fp3d/events.h"
 #include "fp3d/snapshot.h"
 #include "item.h"
+#include "itype.h"
 #include "json.h"
 #include "map.h"
 #include "messages.h"
@@ -31,6 +32,8 @@
 #include "veh_type.h"
 #include "vehicle.h"
 #include "vpart_position.h"
+
+static const ammotype ammo_battery( "battery" );
 
 static const trait_id trait_DEBUG_HS( "DEBUG_HS" );
 
@@ -64,6 +67,12 @@ struct part_view {
     int damage = 0;
     int flags = 0;
     std::vector<std::string> faults;
+    // What a tank, a battery or another fuel store holds, as CDDA's vehicle overview shows it.
+    bool holds = false;
+    std::string fill_what;           // the name of what is in it, "" when empty
+    int64_t fill_now = 0;
+    int64_t fill_max = 0;            // 0 when CDDA can't tell (an empty fuel store that takes several kinds)
+    bool fill_ml = false;            // a tank: millilitres; else CDDA's charges
 };
 
 struct work_view {
@@ -210,6 +219,30 @@ part_view part_of( const vehicle_part &pt, int row )
             v.faults.push_back( client_text( f->name(), max_work_name_columns, 4 * max_work_name_columns ) );
         }
     }
+    // veh_interact::calc_overview: a tank by the volume in it, a battery and other fuel stores by their charges;
+    // a turret's ammunition is not a fill.
+    const itype_id in_it = pt.ammo_current();
+    if( pt.is_tank() ) {
+        v.holds = true;
+        v.fill_ml = true;
+        v.fill_now = units::to_milliliter( pt.get_base().get_total_contained_volume() );
+        v.fill_max = units::to_milliliter( pt.get_base().get_total_capacity() );
+    } else if( pt.is_battery() || ( pt.is_fuel_store() && !pt.is_turret() ) ) {
+        v.holds = true;
+        v.fill_now = pt.ammo_remaining();
+        if( pt.is_battery() ) {
+            v.fill_max = pt.ammo_capacity( ammo_battery );
+        } else if( !in_it.is_null() && item::find_type( in_it )->ammo ) {
+            v.fill_max = pt.ammo_capacity( item::find_type( in_it )->ammo->type );
+        }
+    }
+    if( v.holds ) {
+        v.fill_now = std::max<int64_t>( 0, v.fill_now );
+        v.fill_max = std::max<int64_t>( 0, v.fill_max );
+        if( !in_it.is_null() && v.fill_now > 0 ) {
+            v.fill_what = client_text( item::nname( in_it ), max_work_name_columns, 4 * max_work_name_columns );
+        }
+    }
     return v;
 }
 
@@ -248,6 +281,15 @@ std::string write_work( uint64_t query_id, const work_view &w, bool truncated )
                 jo.write( f );
             }
             jo.end_array();
+        }
+        if( p.holds ) {
+            jo.member( "fill" );
+            jo.start_object();
+            jo.member( "what", p.fill_what );
+            jo.member( "now", p.fill_now );
+            jo.member( "max", p.fill_max );
+            jo.member( "unit", std::string( p.fill_ml ? "ml" : "charges" ) );
+            jo.end_object();
         }
         jo.end_object();
     }
@@ -529,7 +571,7 @@ struct vehicle_work_access {
     }
 };
 
-std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error )
+std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error, uint64_t vehicle )
 {
     std::ostringstream os;
     JsonOut jo( os );
@@ -537,6 +579,9 @@ std::string vehicle_work_query_error_json( uint64_t query_id, const std::string 
     jo.member( "id", static_cast<int64_t>( query_id ) );
     jo.member( "ok", false );
     jo.member( "kind", std::string( "vehicle_work" ) );
+    if( vehicle != 0 ) {
+        jo.member( "vehicle", static_cast<int64_t>( vehicle ) );
+    }
     jo.member( "error", error );
     jo.end_object();
     return os.str();
@@ -548,17 +593,17 @@ std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int
     avatar &u = get_avatar();
     vehicle *const veh = vehicle_by_uid( here, vehicle_uid );
     if( veh == nullptr ) {
-        return vehicle_work_query_error_json( query_id, "no such vehicle" );
+        return vehicle_work_query_error_json( query_id, "no such vehicle", vehicle_uid );
     }
     if( !workable( *veh ) ) {
-        return vehicle_work_query_error_json( query_id, "an appliance" );
+        return vehicle_work_query_error_json( query_id, "an appliance", vehicle_uid );
     }
     if( !within_reach( here, u, *veh ) ) {
-        return vehicle_work_query_error_json( query_id, "too far" );
+        return vehicle_work_query_error_json( query_id, "too far", vehicle_uid );
     }
     const std::vector<int> rows = vehicle_part_rows( *veh );
     if( part_row < -1 || ( part_row >= 0 && static_cast<size_t>( part_row ) >= rows.size() ) ) {
-        return vehicle_work_query_error_json( query_id, "no such part" );
+        return vehicle_work_query_error_json( query_id, "no such part", vehicle_uid );
     }
 
     work_view w;
