@@ -80,6 +80,14 @@ struct part_view {
     bool fill_ml = false;            // a tank: millilitres; else CDDA's charges
 };
 
+// A part type CDDA's screen lists for a square.
+struct type_view {
+    uint32_t vpart = 0;
+    int bits = 0;                    // type_have, type_fits
+};
+constexpr int type_have = 1;         // the avatar has its components and tools (can_potentially_install)
+constexpr int type_fits = 2;         // it can go on the square as the vehicle is now (vehicle::can_mount)
+
 struct work_view {
     uint64_t vehicle = 0;
     std::string name;
@@ -91,6 +99,17 @@ struct work_view {
     int selected_row = -1;
     std::vector<int> here;
     std::vector<command_view> commands;
+    // The install list for a square, in place of a part's commands.
+    bool has_install = false;
+    int install_x = 0;
+    int install_y = 0;
+    int install_reason = 0;          // CDDA's task_reason for installing anything there
+    std::string install_text;
+    std::vector<type_view> types;
+    size_t types_more = 0;
+    bool has_type = false;           // a type was picked
+    uint32_t type_vpart = 0;
+    command_view type_command;
 };
 
 constexpr int part_broken = 1;
@@ -269,6 +288,30 @@ part_view part_of( const vehicle_part &pt, int row )
     return v;
 }
 
+// One command as JSON. `vpart`: the type it is about (install), 0 none.
+void write_command( JsonOut &jo, const command_view &c, uint32_t vpart )
+{
+    jo.start_object();
+    jo.member( "cmd", std::string( 1, c.cmd ) );
+    if( vpart != 0 ) {
+        jo.member( "vpart", static_cast<int64_t>( vpart ) );
+    }
+    jo.member( "ok", c.ok );
+    jo.member( "reason", c.reason );
+    jo.member( "text", c.text );
+    jo.member( "time_s", c.time_s );
+    jo.member( "lines" );
+    jo.start_array();
+    for( const line_view &l : c.lines ) {
+        jo.start_object();
+        jo.member( "text", l.text );
+        jo.member( "met", l.met );
+        jo.end_object();
+    }
+    jo.end_array();
+    jo.end_object();
+}
+
 std::string write_work( uint64_t query_id, const work_view &w, bool truncated )
 {
     std::ostringstream os;
@@ -331,24 +374,35 @@ std::string write_work( uint64_t query_id, const work_view &w, bool truncated )
         jo.member( "commands" );
         jo.start_array();
         for( const command_view &c : w.commands ) {
-            jo.start_object();
-            jo.member( "cmd", std::string( 1, c.cmd ) );
-            jo.member( "ok", c.ok );
-            jo.member( "reason", c.reason );
-            jo.member( "text", c.text );
-            jo.member( "time_s", c.time_s );
-            jo.member( "lines" );
-            jo.start_array();
-            for( const line_view &l : c.lines ) {
-                jo.start_object();
-                jo.member( "text", l.text );
-                jo.member( "met", l.met );
-                jo.end_object();
-            }
-            jo.end_array();
-            jo.end_object();
+            write_command( jo, c, 0 );
         }
         jo.end_array();
+        jo.end_object();
+    }
+    if( w.has_install ) {
+        jo.member( "install" );
+        jo.start_object();
+        jo.member( "mount" );
+        jo.start_array();
+        jo.write( w.install_x );
+        jo.write( w.install_y );
+        jo.end_array();
+        jo.member( "reason", w.install_reason );
+        jo.member( "text", w.install_text );
+        jo.member( "types" );
+        jo.start_array();
+        for( const type_view &t : w.types ) {
+            jo.start_array();
+            jo.write( static_cast<int64_t>( t.vpart ) );
+            jo.write( t.bits );
+            jo.end_array();
+        }
+        jo.end_array();
+        jo.member( "types_more", static_cast<int64_t>( w.types_more ) );
+        if( w.has_type ) {
+            jo.member( "selected" );
+            write_command( jo, w.type_command, w.type_vpart );
+        }
         jo.end_object();
     }
     jo.member( "truncated", truncated );
@@ -592,6 +646,147 @@ struct vehicle_work_access {
         u.assign_activity( act );
         return true;
     }
+
+    // CDDA's sentence when nothing is installed whatever the type: do_install.
+    static std::string install_refusal( task_reason reason ) {
+        switch( reason ) {
+            case task_reason::INVALID_TARGET:
+                return _( "Cannot install any part here." );
+            case task_reason::LOW_MORALE:
+                return _( "Your morale is too low to construct…" );
+            case task_reason::LOW_LIGHT:
+                return _( "It's too dark to see what you are doing…" );
+            case task_reason::MOVING_VEHICLE:
+                return _( "You can't install parts while driving." );
+            default:
+                return std::string();
+        }
+    }
+
+    // The part type with the id-table index `type`, if CDDA's screen `vi` lists it for its cursor's square; else
+    // null (no such type, one CDDA hides from the list, an appliance).
+    static const vpart_info *listed( const veh_interact &vi, uint32_t type ) {
+        const vpart_id id( id_name( id_kind::vpart, type ) );
+        if( !id.is_valid() ) {
+            return nullptr;
+        }
+        const auto at = std::find_if( vi.can_mount.begin(), vi.can_mount.end(), [&id]( const vpart_info * vpi ) {
+            return vpi->id == id;
+        } );
+        return at == vi.can_mount.end() ? nullptr : *at;
+    }
+
+    // What CDDA's screen `vi`, its cursor on a square, says about installing `vpi` there: do_install and
+    // update_part_requirements. `vpi` null: not a type CDDA lists for the square.
+    static command_view install_of( veh_interact &vi, map &here, const vpart_info *vpi ) {
+        avatar &u = get_avatar();
+        const task_reason reason = vi.cant_do( here, 'i' );
+        command_view c;
+        c.cmd = 'i';
+        c.reason = static_cast<int>( reason );
+        c.text = install_refusal( reason );
+        if( reason == task_reason::INVALID_TARGET ) {
+            return c;
+        }
+        if( vpi == nullptr ) {
+            c.reason = static_cast<int>( task_reason::INVALID_TARGET );
+            c.text = _( "That can't be installed here." );
+            return c;
+        }
+        vi.sel_vpart_info = vpi;
+        vi.msg.reset();
+        const bool met = vi.update_part_requirements( here );
+        const std::string said = vi.msg.value_or( std::string() );
+        vi.msg.reset();
+        // CDDA either refuses with one sentence, or lists what installing it takes.
+        if( !met && std::count( said.begin(), said.end(), '\n' ) <= 1 ) {
+            c.text = first_line( said );
+        } else {
+            c.lines = lines_of( said );
+            c.time_s = seconds_of( vpi->install_time( u ), u );
+        }
+        c.ok = met && reason == task_reason::CAN_DO;
+        return c;
+    }
+
+    // The install list for the square at `mount` of `veh`: every type CDDA's screen lists there, in its order (the
+    // ones the avatar has the parts for first), and what installing the type `picked` (0 none) there takes.
+    static void fill_install( map &here, vehicle &veh, const point_rel_ms &mount, uint32_t picked,
+                              work_view &out ) {
+        // CDDA's screen with its cursor on the square, never shown.
+        veh_interact vi( here, veh, -mount );
+        widen( vi );
+        const task_reason reason = vi.cant_do( here, 'i' );
+        out.install_reason = static_cast<int>( reason );
+        out.install_text = install_refusal( reason );
+        for( const vpart_info *vpi : vi.can_mount ) {
+            if( out.types.size() >= max_work_types ) {
+                out.types_more++;
+                continue;
+            }
+            type_view t;
+            t.vpart = intern_id( id_kind::vpart, vpi->id.str() );
+            t.bits = ( vi.can_potentially_install( *vpi ) ? type_have : 0 ) |
+                     ( veh.can_mount( mount, *vpi ).success() ? type_fits : 0 );
+            out.types.push_back( t );
+        }
+        if( picked != 0 ) {
+            out.has_type = true;
+            out.type_vpart = picked;
+            out.type_command = install_of( vi, here, listed( vi, picked ) );
+        }
+    }
+
+    // Starts installing the type `type` on the square at `mount`, as CDDA's screen does: its question when the
+    // vehicle is someone else's, the same check as the read, its questions when the part would ground an aircraft
+    // or keep the vehicle from folding, then its activity. False when it isn't started: `why` as for start().
+    static bool start_install( map &here, vehicle &veh, const point_rel_ms &mount, uint32_t type,
+                               std::string &why ) {
+        avatar &u = get_avatar();
+        if( !veh.handle_potential_theft( u ) ) {
+            why.clear();
+            return false;
+        }
+        veh_interact vi( here, veh, -mount );
+        widen( vi );
+        const vpart_info *const vpi = listed( vi, type );
+        const command_view said = install_of( vi, here, vpi );
+        if( !said.ok || vpi == nullptr ) {
+            why = !said.text.empty() || vpi == nullptr ? said.text :
+                  string_format( _( "You don't meet the requirements to install the %s." ), vpi->name() );
+            return false;
+        }
+        // do_install: a part that grounds an aircraft or keeps the vehicle from folding is asked about first.
+        if( veh.would_install_prevent_flyable( *vpi, u ) ) {
+            if( !query_yn( _( "Installing this part will mean that this vehicle is no longer "
+                              "flightworthy.  Continue?" ) ) ) {
+                why.clear();
+                return false;
+            }
+            veh.set_flyable( false );
+        }
+        if( veh.is_foldable() && !vpi->folded_volume &&
+            !query_yn( _( "Installing this part will make the vehicle unfoldable. "
+                          " Continue?" ) ) ) {
+            why.clear();
+            return false;
+        }
+        for( const Character *helper : u.get_crafting_helpers() ) {
+            add_msg( m_info, _( "%s helps with this task…" ), helper->get_name() );
+        }
+        vi.sel_vehicle_part = nullptr;
+        vi.sel_vpart_info = vpi;
+        vi.sel_cmd = 'i';
+        const player_activity act = vi.serialize_activity( here );
+        if( !act ) {
+            why.clear();
+            return false;
+        }
+        // game::exam_vehicle.
+        u.set_moves( 0 );
+        u.assign_activity( act );
+        return true;
+    }
 };
 
 std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error, uint64_t vehicle,
@@ -614,7 +809,12 @@ std::string vehicle_work_query_error_json( uint64_t query_id, const std::string 
     return os.str();
 }
 
-std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int part_row, size_t max_bytes )
+namespace
+{
+// The read: with a part row the commands for that part; with `install` the install list for that square and what
+// installing the type `picked` (0 none) there takes.
+std::string read_work( uint64_t query_id, uint64_t vehicle_uid, int part_row,
+                       const std::optional<point_rel_ms> &install, uint32_t picked, size_t max_bytes )
 {
     // A read leaves the game's dice as they were: CDDA rolls what removing some parts may yield just to list it.
     struct dice_kept {
@@ -662,6 +862,12 @@ std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int
         w.selected_row = part_row;
         vehicle_work_access::fill_selected( here, *veh, rows[part_row], rows, w );
     }
+    if( install ) {
+        w.has_install = true;
+        w.install_x = install->x();
+        w.install_y = install->y();
+        vehicle_work_access::fill_install( here, *veh, *install, picked, w );
+    }
 
     std::string out = write_work( query_id, w, false );
     // Over the limit: part entries go from the end, half of them a round; then the selected part's lines.
@@ -675,9 +881,29 @@ std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int
         for( command_view &c : w.commands ) {
             c.lines.clear();
         }
+        w.type_command.lines.clear();
+        out = write_work( query_id, w, true );
+    }
+    // Then the part types, from the end.
+    while( out.size() > max_bytes && !w.types.empty() ) {
+        const size_t drop = std::max<size_t>( 1, w.types.size() / 2 );
+        w.types.resize( w.types.size() - drop );
+        w.types_more += drop;
         out = write_work( query_id, w, true );
     }
     return out;
+}
+} // namespace
+
+std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int part_row, size_t max_bytes )
+{
+    return read_work( query_id, vehicle_uid, part_row, std::nullopt, 0, max_bytes );
+}
+
+std::string run_vehicle_install_query( uint64_t query_id, uint64_t vehicle_uid, int mount_x, int mount_y,
+                                       uint32_t vpart, size_t max_bytes )
+{
+    return read_work( query_id, vehicle_uid, -1, point_rel_ms( mount_x, mount_y ), vpart, max_bytes );
 }
 
 bool run_vehicle_work( avatar &u )
@@ -695,7 +921,7 @@ bool run_vehicle_work( avatar &u )
         }
         return done;
     };
-    if( a->cmd != 'r' && a->cmd != 'o' ) {
+    if( a->cmd != 'r' && a->cmd != 'o' && a->cmd != 'i' ) {
         return answer( false, _( "That can't be done to a vehicle this way." ) );
     }
     if( const std::optional<gate> shut = examine_gate( u ) ) {
@@ -711,6 +937,12 @@ bool run_vehicle_work( avatar &u )
     }
     if( !within_reach( here, u, *veh ) ) {
         return answer( false, _( "That vehicle is too far away." ) );
+    }
+    if( a->cmd == 'i' ) {
+        std::string why;
+        const bool started = vehicle_work_access::start_install( here, *veh, point_rel_ms( a->mount_x, a->mount_y ),
+                             a->vpart, why );
+        return answer( started, started ? std::string() : why );
     }
     const std::vector<int> rows = vehicle_part_rows( *veh );
     if( a->part < 0 || static_cast<size_t>( a->part ) >= rows.size() ) {

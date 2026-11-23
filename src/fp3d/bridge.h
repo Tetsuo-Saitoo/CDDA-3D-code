@@ -372,13 +372,14 @@ std::optional<stairs_action> take_stairs_action();
 // CDDA's vehicle screen starts it. Everything is checked again when it runs.
 struct vehicle_work_action {
     uint64_t vehicle = 0;                // the snapshot's vehicle uid, 1 .. max_item_uid
-    int part = -1;                       // a row of its parts, 0 .. max_work_part_row (vehicle_work.h)
+    int part = -1;                       // a row of its parts, 0 .. max_work_part_row (vehicle_work.h); -1 for 'i'
     // Which part the client means by that row, as the read gave it: rows move up when a part comes off, so a row
     // from an older read can be another part's by now. The action is refused when they don't fit the row's part.
+    // For 'i': the type to install and the square to install it on.
     uint32_t vpart = 0;                  // its type, the vpart id-table index, 1 .. max_work_vpart
     int mount_x = 0;                     // its mount, each -max_work_mount .. max_work_mount
     int mount_y = 0;
-    char cmd = ' ';                      // 'r' repair (replace when broken), 'o' remove
+    char cmd = ' ';                      // 'r' repair (replace when broken), 'o' remove, 'i' install
     uint32_t tag = 0;                    // the client's number for it, 0 none; answered by a work_result event
 };
 // Client side. False if a field is out of range, the command isn't one of the above, or the queue is full.
@@ -409,6 +410,19 @@ uint64_t post_character_query();
 // max_work_part_row, a vehicle-work query pending already (one at a time), max_pending_queries pending, or
 // after shutdown.
 uint64_t post_vehicle_work_query( uint64_t vehicle, int part );
+// The same with everything a vehicle-work query can ask. `install`: the install list for the square at the mount
+// mount_x, mount_y (each within max_work_mount) instead of a part's commands; `vpart`: the type picked there (the
+// id-table index, 0 none, up to max_work_vpart). Also refused: `install` with a part row, a mount or a type
+// without `install`.
+struct vehicle_work_ask {
+    uint64_t vehicle = 0;
+    int part = -1;
+    bool install = false;
+    int mount_x = 0;
+    int mount_y = 0;
+    uint32_t vpart = 0;
+};
+uint64_t post_vehicle_work_query( const vehicle_work_ask &ask );
 // Client side. The result (once), nullopt while it is pending or for an unknown or already taken id.
 std::optional<std::string> take_query_result( uint64_t id );
 size_t pending_queries();

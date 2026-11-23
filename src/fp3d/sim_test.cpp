@@ -9908,6 +9908,14 @@ static bool run_vehicle_work_checks()
         std::vector<int> here;
         std::vector<w_cmd> cmds;
         bool truncated = false;
+        bool has_install = false;
+        int inst_reason = -9;
+        std::string inst_text;
+        std::vector<std::pair<int64_t, int>> types;   // the type's id-table index, its bits
+        int types_more = -1;
+        bool has_picked = false;
+        int64_t picked_vpart = 0;
+        w_cmd picked;
     };
     const auto parse = []( const std::string & text ) {
         parsed out;
@@ -9982,6 +9990,35 @@ static bool run_vehicle_work_checks()
                         cmd.lines.push_back( line );
                     }
                     out.cmds.push_back( cmd );
+                }
+            }
+            if( jo.has_object( "install" ) ) {
+                JsonObject in = jo.get_object( "install" );
+                in.allow_omitted_members();
+                out.has_install = true;
+                out.inst_reason = in.get_int( "reason" );
+                out.inst_text = in.get_string( "text" );
+                out.types_more = in.get_int( "types_more" );
+                for( JsonArray t : in.get_array( "types" ) ) {
+                    out.types.emplace_back( t.get_int( 0 ), t.get_int( 1 ) );
+                }
+                if( in.has_object( "selected" ) ) {
+                    JsonObject c = in.get_object( "selected" );
+                    c.allow_omitted_members();
+                    out.has_picked = true;
+                    out.picked_vpart = c.get_int( "vpart" );
+                    out.picked.cmd = c.get_string( "cmd" );
+                    out.picked.ok = c.get_bool( "ok" );
+                    out.picked.reason = c.get_int( "reason" );
+                    out.picked.text = c.get_string( "text" );
+                    out.picked.time_s = c.get_member( "time_s" ).get_int64();
+                    for( JsonObject l : c.get_array( "lines" ) ) {
+                        l.allow_omitted_members();
+                        w_line line;
+                        line.text = l.get_string( "text" );
+                        line.met = l.get_int( "met" );
+                        out.picked.lines.push_back( line );
+                    }
                 }
             }
             out.valid = true;
@@ -10552,6 +10589,97 @@ static bool run_vehicle_work_checks()
            kept.own_rows == stripped.own_rows,
            "action, the glovebox's old row after it came off: refused", shown( late ) + "; " +
            std::to_string( kept.own_rows ) + " part rows" );
+
+    // Install. The glovebox lies where its removal put it; the square it came off is the one to put it back on.
+    const fp3d::vehicle_part_view was = car.rows[car.box_row];
+    const auto ask_install = [&]( int mx, int my, uint32_t type ) {
+        fp3d::vehicle_work_ask ask;
+        ask.vehicle = car.uid;
+        ask.install = true;
+        ask.mount_x = mx;
+        ask.mount_y = my;
+        ask.vpart = type;
+        return ask;
+    };
+    {
+        fp3d::vehicle_work_ask rowed = ask_install( was.mount_x, was.mount_y, v_box );
+        rowed.part = 0;
+        fp3d::vehicle_work_ask loose;
+        loose.vehicle = car.uid;
+        loose.vpart = v_box;
+        check( fp3d::post_vehicle_work_query( rowed ) == 0 && fp3d::post_vehicle_work_query( loose ) == 0 &&
+               fp3d::post_vehicle_work_query( ask_install( fp3d::max_work_mount + 1, 0, 0 ) ) == 0 &&
+               fp3d::post_vehicle_work_query( ask_install( 0, 0, fp3d::max_work_vpart + 1 ) ) == 0,
+               "install read refused unposted: a row with it, a type alone, out of range", "" );
+    }
+    const auto bits_of = [&]( const parsed & from, uint32_t type ) {
+        int bits = -1;
+        for( const std::pair<int64_t, int> &t : from.types ) {
+            bits = t.first == static_cast<int64_t>( type ) ? t.second : bits;
+        }
+        return bits;
+    };
+    const parsed fit = parse( await( fp3d::post_vehicle_work_query( ask_install( was.mount_x, was.mount_y,
+                              v_box ) ) ) );
+    bool ordered = true;
+    bool lacking = false;
+    size_t at_hand = 0;
+    for( const std::pair<int64_t, int> &t : fit.types ) {
+        const bool has = ( t.second & 1 ) != 0;
+        ordered = ordered && !( has && lacking );
+        lacking = lacking || !has;
+        at_hand += has ? 1 : 0;
+    }
+    check( fit.valid && fit.ok && fit.has_install && !fit.has_selected && fit.inst_reason == 0 &&
+           fit.inst_text.empty() && fit.types.size() > 50 && fit.types_more == 0 && bits_of( fit, v_box ) == 3 &&
+           ordered && at_hand >= 1 && at_hand < fit.types.size() && fit.parts.size() == stripped.own_rows,
+           "install list, the glovebox's old square: every type, those at hand first",
+           std::to_string( fit.types.size() ) + " types, " + std::to_string( at_hand ) + " at hand, the glovebox's bits " +
+           std::to_string( bits_of( fit, v_box ) ) + ", " + std::to_string( fit.parts.size() ) + " parts" +
+           ( fit.valid ? "" : ": " + fit.error ) );
+    check( fit.has_picked && fit.picked.cmd == "i" && fit.picked_vpart == static_cast<int64_t>( v_box ) &&
+           fit.picked.ok && fit.picked.reason == 0 && fit.picked.time_s > 0 && lines_with( &fit.picked, 2 ) == 0 &&
+           lines_with( &fit.picked, 1, "mechanics" ) == 1 && lines_with( &fit.picked, 1 ) >= 3,
+           "install, the glovebox picked: ok, every line met", told( &fit.picked ) );
+    // Six squares to the car's side: CDDA lists the same types, and says why this one can't go there.
+    const parsed aside = parse( await( fp3d::post_vehicle_work_query( ask_install( 0, 6, v_box ) ) ) );
+    check( aside.valid && aside.ok && aside.has_install && aside.has_picked && !aside.picked.ok &&
+           bits_of( aside, v_box ) == 1 && lines_with( &aside.picked, 0, "Cannot install due to" ) == 1 &&
+           lines_with( &aside.picked, 2 ) >= 1,
+           "install away from the car: listed, doesn't fit, CDDA says why",
+           "bits " + std::to_string( bits_of( aside, v_box ) ) + ", reason " + std::to_string( aside.inst_reason ) +
+           " " + aside.inst_text + "; " + told( &aside.picked ) );
+    const parsed strange = parse( await( fp3d::post_vehicle_work_query( ask_install( was.mount_x, was.mount_y,
+                              fp3d::max_work_vpart ) ) ) );
+    check( strange.valid && strange.ok && strange.has_picked && !strange.picked.ok && strange.picked.reason == 1 &&
+           strange.picked.text == "That can't be installed here." && strange.picked.lines.empty(),
+           "install, a type CDDA doesn't list: not ok", told( &strange.picked ) );
+
+    // The action: a row with it isn't queued; where it doesn't fit and a type CDDA doesn't list are refused.
+    fp3d::vehicle_part_view nowhere = was;
+    nowhere.mount_x = 0;
+    nowhere.mount_y = 6;
+    fp3d::vehicle_part_view unknown = was;
+    unknown.vpart = fp3d::max_work_vpart;
+    const outcome misfit = work( car.uid, -1, 'i', false, &nowhere );
+    const outcome unlisted = work( car.uid, -1, 'i', false, &unknown );
+    const car_seen unfitted = car_now();
+    check( bad( car.uid, 0, 'i', 0, v_box, was.mount_x, was.mount_y ) && misfit.queued && misfit.results == 1 &&
+           !misfit.done && misfit.prompts == 0 &&
+           misfit.why == "You don't meet the requirements to install the glovebox." && unlisted.results == 1 &&
+           !unlisted.done && unlisted.why == "That can't be installed here." && unfitted.own_rows == stripped.own_rows,
+           "action, install: a row with it, a misfit, an unlisted type refused", shown( misfit ) + " / " +
+           shown( unlisted ) );
+    // CDDA's own activity puts the glovebox back on its square.
+    const outcome fitted = work( car.uid, -1, 'i', false, &was );
+    const car_seen refitted = car_now();
+    const bool home = refitted.box_row >= 0 && refitted.rows[refitted.box_row].mount_x == was.mount_x &&
+                      refitted.rows[refitted.box_row].mount_y == was.mount_y;
+    check( fitted.queued && fitted.back && fitted.results == 1 && fitted.done && home &&
+           refitted.own_rows == stripped.own_rows + 1,
+           "action, install: started, and the glovebox is back on its square",
+           shown( fitted ) + "; then " + std::to_string( refitted.own_rows ) + " part rows of " +
+           std::to_string( stripped.own_rows ) + ", the glovebox's " + std::to_string( refitted.box_row ) );
 
     // Someone else's car: the read says so, and CDDA asks before any work. Here the answer is no.
     const bool taken = scene( 68 );

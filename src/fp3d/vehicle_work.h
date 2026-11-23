@@ -34,6 +34,7 @@ constexpr size_t max_work_line_columns = 200;
 constexpr int max_work_part_row = 4095;         // the highest part row a query may name
 constexpr uint32_t max_work_vpart = 1U << 20;   // the highest vpart id-table index an action may name
 constexpr int max_work_mount = 1023;            // the furthest mount an action may name, either way
+constexpr size_t max_work_types = 1024;         // part types listed for a square
 
 // Sim side. The vehicle-work read for the vehicle a snapshot gave `vehicle` to, as JSON: its parts, and for the
 // part row `part_row` (-1: none) each command with CDDA's reason, time and requirement lines. An error object
@@ -42,6 +43,11 @@ constexpr int max_work_mount = 1023;            // the furthest mount an action 
 // of its parts. At most about `max_bytes`: part entries go from the end first, then the lines. The read leaves
 // the game's dice as they were.
 std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle, int part_row, size_t max_bytes );
+// The same read with the install list for the square at the mount `mount_x`, `mount_y` in place of a part's
+// commands: every part type CDDA's screen lists there, and for the type `vpart` (the id-table index, 0 none)
+// what installing it there takes.
+std::string run_vehicle_install_query( uint64_t query_id, uint64_t vehicle, int mount_x, int mount_y,
+                                       uint32_t vpart, size_t max_bytes );
 // `vehicle`: the uid the query named, given back so a client can tell which vehicle the error is about; 0 none.
 // `text`: CDDA's sentence for the error when it has one ("mounted", "in shell"), else "".
 std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error, uint64_t vehicle = 0,

@@ -39,6 +39,10 @@ struct recipe_query {
     ui_point pos;
     uint64_t vehicle = 0;                // vehicle_work: the snapshot's vehicle uid
     int part = -1;                       // vehicle_work: a row of its parts, -1 none
+    bool install = false;                // vehicle_work: the install list for a square instead
+    int mount_x = 0;
+    int mount_y = 0;
+    uint32_t vpart = 0;                  // vehicle_work, install: the type picked, 0 none
 };
 
 // A query's result waiting to be taken.
@@ -148,8 +152,10 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
             } scope;
             try {
                 result = q.kind == query_kind::character ? run_character_query( q.id, max_query_result_bytes ) :
-                         q.kind == query_kind::vehicle_work ?
-                         run_vehicle_work_query( q.id, q.vehicle, q.part, max_query_result_bytes ) :
+                         q.kind == query_kind::vehicle_work ? ( q.install ?
+                                 run_vehicle_install_query( q.id, q.vehicle, q.mount_x, q.mount_y, q.vpart,
+                                         max_query_result_bytes ) :
+                                 run_vehicle_work_query( q.id, q.vehicle, q.part, max_query_result_bytes ) ) :
                          run_recipe_query( q.id, q.container, q.pos );
             } catch( const query_prompt & ) {
                 result = failed( "internal" );
@@ -709,10 +715,13 @@ std::optional<stairs_action> take_stairs_action()
 
 bool queue_vehicle_work_action( const vehicle_work_action &a )
 {
-    if( a.vehicle < 1 || a.vehicle > max_item_uid || a.part < 0 || a.part > max_work_part_row ||
+    // Install names a square and a type and no part row; the others name a part by its row.
+    const bool install = a.cmd == 'i';
+    if( a.vehicle < 1 || a.vehicle > max_item_uid ||
+        ( install ? a.part != -1 : a.part < 0 || a.part > max_work_part_row ) ||
         a.vpart < 1 || a.vpart > max_work_vpart || a.mount_x < -max_work_mount || a.mount_x > max_work_mount ||
         a.mount_y < -max_work_mount || a.mount_y > max_work_mount ||
-        ( a.cmd != 'r' && a.cmd != 'o' ) || a.tag > max_item_tag ) {
+        ( a.cmd != 'r' && a.cmd != 'o' && !install ) || a.tag > max_item_tag ) {
         return false;
     }
     channel &c = chan();
@@ -772,7 +781,19 @@ uint64_t post_character_query()
 
 uint64_t post_vehicle_work_query( uint64_t vehicle, int part )
 {
-    if( vehicle < 1 || vehicle > max_item_uid || part < -1 || part > max_work_part_row ) {
+    vehicle_work_ask ask;
+    ask.vehicle = vehicle;
+    ask.part = part;
+    return post_vehicle_work_query( ask );
+}
+
+uint64_t post_vehicle_work_query( const vehicle_work_ask &ask )
+{
+    const bool square = ask.mount_x != 0 || ask.mount_y != 0 || ask.vpart != 0;
+    if( ask.vehicle < 1 || ask.vehicle > max_item_uid || ask.part < -1 || ask.part > max_work_part_row ||
+        ( ask.install ? ask.part != -1 : square ) || ask.vpart > max_work_vpart ||
+        ask.mount_x < -max_work_mount || ask.mount_x > max_work_mount || ask.mount_y < -max_work_mount ||
+        ask.mount_y > max_work_mount ) {
         return 0;
     }
     channel &c = chan();
@@ -787,8 +808,12 @@ uint64_t post_vehicle_work_query( uint64_t vehicle, int part )
     recipe_query q;
     q.id = id;
     q.kind = query_kind::vehicle_work;
-    q.vehicle = vehicle;
-    q.part = part;
+    q.vehicle = ask.vehicle;
+    q.part = ask.part;
+    q.install = ask.install;
+    q.mount_x = ask.mount_x;
+    q.mount_y = ask.mount_y;
+    q.vpart = ask.vpart;
     c.queries.push_back( q );
     c.cv.notify_all();
     return id;
