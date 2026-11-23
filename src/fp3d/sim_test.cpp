@@ -2361,6 +2361,63 @@ void observe()
             here.build_map_cache( p.z() );
             break;
         }
+        case 74: {
+            // Vehicle work: a jumper cable from the car's battery to a battery on a frame put down a few squares
+            // away. To list what removing the cable's part yields, CDDA resets a copy of the cable, and with it the
+            // "linked" mark on the car's battery; the read leaves that mark as it found it. The cable and the frame
+            // are gone again afterwards.
+            int state = 0;
+            const vpart_id battery_type( "battery_car" );
+            const int battery = work_car != nullptr && !work_car->batteries.empty() ?
+                                work_car->batteries.front() : -1;
+            if( battery >= 0 && battery_type.is_valid() ) {
+                const int had = work_car->part_count();
+                const tripoint_bub_ms at = work_car->bub_part_pos( here, work_car->part( battery ) );
+                vehicle *second = nullptr;
+                for( const tripoint_bub_ms &q : closest_points_first( at, 2, 3 ) ) {
+                    if( here.inbounds( q ) && !here.veh_at( q ) && here.passable( q ) && g->is_empty( q ) ) {
+                        second = here.add_vehicle( vehicle_prototype_none, q, 0_degrees, 0, 0 );
+                        break;
+                    }
+                }
+                if( second != nullptr ) {
+                    second->install_part( here, point_rel_ms::zero, vpart_frame );
+                    if( second->can_mount( point_rel_ms::zero, *battery_type ).success() ) {
+                        second->install_part( here, point_rel_ms::zero, battery_type );
+                        state |= 1;
+                    }
+                    here.add_vehicle_to_cache( second );
+                    item cable( itype_id( "jumper_cable" ) );
+                    if( ( state & 1 ) != 0 &&
+                        cable.link_to( *work_car, work_car->part( battery ).mount,
+                                       link_state::vehicle_battery ).success() &&
+                        cable.link_to( *second, point_rel_ms::zero, link_state::vehicle_battery ).success() ) {
+                        state |= 2;
+                    }
+                    int cable_part = -1;
+                    for( const vpart_reference &vpr : work_car->get_any_parts( VPFLAG_POWER_TRANSFER ) ) {
+                        cable_part = static_cast<int>( vpr.part_index() );
+                    }
+                    const std::vector<int> rows = fp3d::vehicle_part_rows( *work_car );
+                    const auto row = std::find( rows.begin(), rows.end(), cable_part );
+                    if( cable_part >= 0 && row != rows.end() ) {
+                        work_car->part( battery ).set_flag( vp_flag::linked_flag );
+                        const std::string read = fp3d::run_vehicle_work_query( 907, work_uid.load(),
+                                                 static_cast<int>( row - rows.begin() ), 64 * 1024 );
+                        state |= read.find( "will yield" ) != std::string::npos ? 4 : 0;
+                        state |= work_car->part( battery ).has_flag( vp_flag::linked_flag ) ? 8 : 0;
+                        work_car->part( battery ).remove_flag( vp_flag::linked_flag );
+                        work_car->remove_part( work_car->part( cable_part ) );
+                        work_car->part_removal_cleanup( here );
+                    }
+                    here.destroy_vehicle( second );
+                }
+                state |= work_car->part_count() == had ? 16 : 0;
+            }
+            work_gate_state = state;
+            here.build_map_cache( p.z() );
+            break;
+        }
         case 66: {
             // Vehicle work, after: the avatar back, the car gone, the skill and the pack as before.
             avatar &u = get_avatar();
@@ -10514,6 +10571,14 @@ static bool run_vehicle_work_checks()
            std::to_string( work_gate_state.load() ) +
            " of 15 (1 a rotor put on, 2 its yield listed, 4 the dice as before, 8 the rotor off again)" +
            ( rolled ? std::string() : stuck() ) );
+
+    // A cable to another vehicle: listing what removing its part yields, CDDA touches the battery at the cable's
+    // far end; the read leaves it as it was.
+    const bool cabled = scene( 74 );
+    check( cabled && work_gate_state.load() == 31, "a cable's part read: its far end as before",
+           std::to_string( work_gate_state.load() ) +
+           " of 31 (1 a second battery, 2 cabled, 4 the yield listed, 8 the far end's mark kept, 16 all gone again)" +
+           ( cabled ? std::string() : stuck() ) );
 
     // CDDA's own gates on the way to its vehicle screen: not from the saddle, not from inside a shell. The avatar
     // could repair the glovebox by now, so only the gate keeps the action from starting.

@@ -498,8 +498,21 @@ struct vehicle_work_access {
                 c.reason = no_target;
                 c.text = _( "No parts here." );
             } else {
+                // To list what removing a cable's part yields, CDDA resets a copy of the cable
+                // (vehicle::part_to_item), and that takes the "linked" mark off the part at the cable's far end.
+                // The marks that vehicle had are put back.
+                vehicle *const far_end = pt.get_base().has_link_data() ? pt.get_base().link().t_veh.get() : nullptr;
+                std::vector<int> marked;
+                for( int i = 0; far_end != nullptr && i < far_end->part_count(); i++ ) {
+                    if( far_end->part( i ).has_flag( vp_flag::linked_flag ) ) {
+                        marked.push_back( i );
+                    }
+                }
                 vi.msg.reset();
                 const bool can = vi.can_remove_part( here, part_index, u );
+                for( const int i : marked ) {
+                    far_end->part( i ).set_flag( vp_flag::linked_flag );
+                }
                 const std::string said = vi.msg.value_or( std::string() );
                 vi.msg.reset();
                 // CDDA either refuses with one sentence, or lists what the removal yields and needs.
