@@ -27,10 +27,11 @@ namespace fp3d
 {
 
 enum class event_kind : uint8_t {
-    sound, message, attack, damage, projectile, explosion, death, anim, turn_end, lightning, item_result, misfire
+    sound, message, attack, damage, projectile, explosion, death, anim, turn_end, lightning, item_result, misfire,
+    work_result
 };
 // How many kinds there are (tables indexed by kind).
-constexpr size_t event_kind_count = static_cast<size_t>( event_kind::misfire ) + 1;
+constexpr size_t event_kind_count = static_cast<size_t>( event_kind::work_result ) + 1;
 
 struct event {
     event_kind kind = event_kind::turn_end;
@@ -129,6 +130,10 @@ void on_item_result( uint64_t item_uid, uint32_t tag, bool done, const std::stri
 // misfire from dirt or water, a malfunction, or a jam it set). `uid` the shooter, `pos` its square, `type` the
 // gun's itype, `detail` 1 a misfire or malfunction, 2 the gun is jammed now. Sent when the player sees the shooter.
 void on_misfire( const Character &shooter, const item &gun );
+// A vehicle-work action that carried a tag (bridge.h vehicle_work_action) has run: `uid` is the vehicle's uid
+// (not a creature), `detail` the tag, `amount` 1 the work was started or 0 refused, `text` why it was refused
+// ("" when started, or when the player said no to CDDA's question).
+void on_work_result( uint64_t vehicle_uid, uint32_t tag, bool done, const std::string &why );
 
 } // namespace fp3d
 

@@ -19,6 +19,7 @@
 #include "fp3d/hands.h"
 #include "fp3d/item_hands.h"
 #include "fp3d/points.h"
+#include "fp3d/vehicle_work.h"
 #include "game.h"
 #include "game_inventory.h"
 #include "handle_liquid.h"
@@ -453,6 +454,7 @@ void register_held_actions( input_context &ctxt )
 {
     ctxt.register_action( hold_action, no_translation( "hold in the off hand" ) );
     ctxt.register_action( stairs_action_name, no_translation( "use the stairs there" ) );
+    ctxt.register_action( vehicle_work_action_name, no_translation( "work on the vehicle there" ) );
     ctxt.register_action( stow_action, no_translation( "put away what the off hand holds" ) );
     for( const std::string &d : hand_dir_names() ) {
         ctxt.register_action( use_prefix + d, no_translation( "use what you hold on what you face" ) );
@@ -463,7 +465,7 @@ void register_held_actions( input_context &ctxt )
 bool is_held_action( const std::string &action )
 {
     return action == hold_action || action == stow_action || starts_with( action, use_prefix ) ||
-           is_item_action( action ) || action == stairs_action_name;
+           is_item_action( action ) || action == stairs_action_name || action == vehicle_work_action_name;
 }
 
 bool held_action( avatar &u, const std::string &action )
@@ -473,6 +475,9 @@ bool held_action( avatar &u, const std::string &action )
     }
     if( action == stairs_action_name ) {
         return use_stairs( u );
+    }
+    if( action == vehicle_work_action_name ) {
+        return run_vehicle_work( u );
     }
     if( action == hold_action ) {
         return hold( u );

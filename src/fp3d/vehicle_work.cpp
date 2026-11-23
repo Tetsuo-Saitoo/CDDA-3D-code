@@ -14,11 +14,17 @@
 #include "coordinates.h"
 #include "cursesdef.h"
 #include "fault.h"
+#include "fp3d/bridge.h"
+#include "fp3d/events.h"
 #include "fp3d/snapshot.h"
 #include "item.h"
 #include "json.h"
 #include "map.h"
+#include "messages.h"
+#include "output.h"
+#include "player_activity.h"
 #include "point.h"
+#include "string_formatter.h"
 #include "translations.h"
 #include "type_id.h"
 #include "veh_interact.h"
@@ -64,6 +70,7 @@ struct work_view {
     uint64_t vehicle = 0;
     std::string name;
     int64_t turn = 0;
+    bool owned = true;               // the avatar's or nobody's: CDDA asks nothing before work on it
     std::vector<part_view> parts;
     size_t parts_more = 0;
     bool has_selected = false;
@@ -163,6 +170,24 @@ bool plain_id( const std::string &s )
     } );
 }
 
+// CDDA's rule for examining a vehicle: a part of it on the avatar's square or one next to it.
+bool within_reach( map &here, const avatar &u, const vehicle &veh )
+{
+    for( const vpart_reference &vp : veh.get_all_parts() ) {
+        const tripoint_bub_ms p = vp.pos_bub( here );
+        if( p.z() == u.posz() && square_dist( p, u.pos_bub() ) <= 1 ) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// CDDA opens another screen for an appliance (game::exam_appliance) and none for a summoned vehicle.
+bool workable( const vehicle &veh )
+{
+    return !veh.is_appliance() && !veh.magic;
+}
+
 part_view part_of( const vehicle_part &pt, int row )
 {
     part_view v;
@@ -199,6 +224,7 @@ std::string write_work( uint64_t query_id, const work_view &w, bool truncated )
     jo.member( "vehicle", static_cast<int64_t>( w.vehicle ) );
     jo.member( "name", w.name );
     jo.member( "turn", w.turn );
+    jo.member( "owned", w.owned );
     jo.member( "parts" );
     jo.start_array();
     for( const part_view &p : w.parts ) {
@@ -269,24 +295,35 @@ std::string write_work( uint64_t query_id, const work_view &w, bool truncated )
 
 // The friend veh_interact names: everything that touches CDDA's vehicle screen is in here.
 struct vehicle_work_access {
+    // The checks fold their text to the message window's width. A wide one, never drawn, keeps each requirement
+    // on its own line.
+    static void widen( veh_interact &vi ) {
+        vi.w_msg = catacurses::newwin( 4, static_cast<int>( max_work_line_columns ) + 4, point::zero );
+    }
+
     // The commands for the part `part_index` of `veh`, and the rows of the parts on its square. `rows`: CDDA's
     // part index of each snapshot part row.
     static void fill_selected( map &here, vehicle &veh, int part_index, const std::vector<int> &rows,
                                work_view &out ) {
-        avatar &u = get_avatar();
-        vehicle_part &pt = veh.part( part_index );
         // CDDA's screen with its cursor on the part's square, never shown: the cursor's offset is minus the mount
         // (veh_interact::move_cursor).
-        veh_interact vi( here, veh, -pt.mount );
-        // The checks fold their text to the message window's width. A wide one, never drawn, keeps each
-        // requirement on its own line.
-        vi.w_msg = catacurses::newwin( 4, static_cast<int>( max_work_line_columns ) + 4, point::zero );
+        veh_interact vi( here, veh, -veh.part( part_index ).mount );
+        widen( vi );
         for( const int index : vi.parts_here ) {
             const auto row = std::find( rows.begin(), rows.end(), index );
             if( row != rows.end() && out.here.size() < max_work_here ) {
                 out.here.push_back( static_cast<int>( row - rows.begin() ) );
             }
         }
+        commands_for( vi, here, veh, part_index, "romf", out.commands );
+    }
+
+    // What CDDA's screen `vi`, its cursor on the part's square, says about each command in `which` (of r, o, m,
+    // f) for the part `part_index`, in that order.
+    static void commands_for( veh_interact &vi, map &here, vehicle &veh, int part_index, const std::string &which,
+                              std::vector<command_view> &out ) {
+        avatar &u = get_avatar();
+        vehicle_part &pt = veh.part( part_index );
         // CDDA works on the parts of the cursor's square; a part it doesn't count there is no target at all.
         const bool there = std::find( vi.parts_here.begin(), vi.parts_here.end(),
                                       part_index ) != vi.parts_here.end();
@@ -299,7 +336,7 @@ struct vehicle_work_access {
             return c;
         };
 
-        {
+        if( which.find( 'r' ) != std::string::npos ) {
             // Repair, or replace when broken: do_repair.
             const task_reason reason = vi.cant_do( here, 'r' );
             command_view c = begin( 'r', reason );
@@ -331,10 +368,10 @@ struct vehicle_work_access {
                 c.time_s = seconds_of( pt.is_broken() ? vp.install_time( u ) :
                                        vp.repair_time( u ) * pt.get_base().repairable_levels(), u );
             }
-            out.commands.push_back( std::move( c ) );
+            out.push_back( std::move( c ) );
         }
 
-        {
+        if( which.find( 'o' ) != std::string::npos ) {
             // Remove: do_remove.
             const task_reason reason = vi.cant_do( here, 'o' );
             command_view c = begin( 'o', reason );
@@ -372,10 +409,10 @@ struct vehicle_work_access {
                 }
                 c.ok = can && reason == task_reason::CAN_DO;
             }
-            out.commands.push_back( std::move( c ) );
+            out.push_back( std::move( c ) );
         }
 
-        {
+        if( which.find( 'm' ) != std::string::npos ) {
             // Mend: do_mend. The fix and what it needs are chosen in CDDA's own menu (Character::mend_item).
             const task_reason reason = vi.cant_do( here, 'm' );
             command_view c = begin( 'm', reason );
@@ -401,10 +438,10 @@ struct vehicle_work_access {
                 c.reason = no_target;
             }
             c.ok = reason == task_reason::CAN_DO && faulty;
-            out.commands.push_back( std::move( c ) );
+            out.push_back( std::move( c ) );
         }
 
-        {
+        if( which.find( 'f' ) != std::string::npos ) {
             // Refill: do_refill. What to refill from is asked when the work is started.
             const task_reason reason = vi.cant_do( here, 'f' );
             command_view c = begin( 'f', reason );
@@ -423,11 +460,72 @@ struct vehicle_work_access {
                 c.reason = no_target;
             }
             c.ok = reason == task_reason::CAN_DO && takes;
-            out.commands.push_back( std::move( c ) );
+            out.push_back( std::move( c ) );
         }
-        for( command_view &c : out.commands ) {
+        for( command_view &c : out ) {
             c.text = line_text( c.text );
         }
+    }
+
+    // Starts repairing ('r') or removing ('o') the part, as CDDA's screen does once the player confirms the
+    // command. False when it isn't started: `why` is CDDA's sentence, or "" when the player said no to its
+    // question.
+    static bool start( map &here, vehicle &veh, int part_index, char cmd, std::string &why ) {
+        avatar &u = get_avatar();
+        // veh_interact::do_main_loop: before any work on someone else's vehicle CDDA asks, and its owners who see
+        // it take it as theft. An ownerless vehicle becomes the worker's.
+        if( !veh.handle_potential_theft( u ) ) {
+            why.clear();
+            return false;
+        }
+        vehicle_part &pt = veh.part( part_index );
+        veh_interact vi( here, veh, -pt.mount );
+        widen( vi );
+        std::vector<command_view> said;
+        commands_for( vi, here, veh, part_index, std::string( 1, cmd ), said );
+        if( said.size() != 1 || !said.front().ok ) {
+            const std::string name = pt.name( false );
+            why = said.size() != 1 ? std::string() :
+                  !said.front().text.empty() ? said.front().text :
+                  said.front().reason == static_cast<int>( task_reason::INVALID_TARGET ) ?
+                  string_format( _( "The %s needs no repair." ), name ) :
+                  cmd == 'r' ? string_format( _( "You don't meet the requirements to repair the %s." ), name ) :
+                  string_format( _( "You don't meet the requirements to remove the %1$s." ), name );
+            return false;
+        }
+        // do_repair and do_remove: work that grounds an aircraft is asked about first.
+        if( cmd == 'r' ? veh.would_repair_prevent_flyable( pt, u ) : veh.would_removal_prevent_flyable( pt, u ) ) {
+            if( !query_yn( cmd == 'r' ?
+                           _( "Repairing this part will mean that this vehicle is no longer flightworthy.  Continue?" ) :
+                           _( "Removing this part will mean that this vehicle is no longer flightworthy.  Continue?" ) ) ) {
+                why.clear();
+                return false;
+            }
+            veh.set_flyable( false );
+            // The question took a while: CDDA looks once more.
+            if( vi.cant_do( here, cmd ) != task_reason::CAN_DO ) {
+                why.clear();
+                return false;
+            }
+        }
+        for( const Character *helper : u.get_crafting_helpers() ) {
+            add_msg( m_info, _( "%s helps with this task…" ), helper->get_name() );
+        }
+        vi.sel_vehicle_part = &pt;
+        vi.sel_vpart_info = &pt.info();
+        vi.sel_cmd = cmd;
+        const player_activity act = vi.serialize_activity( here );
+        if( cmd == 'o' ) {
+            veh.recalculate_enchantment_cache();
+        }
+        if( !act ) {
+            why.clear();
+            return false;
+        }
+        // game::exam_vehicle.
+        u.set_moves( 0 );
+        u.assign_activity( act );
+        return true;
     }
 };
 
@@ -452,16 +550,10 @@ std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int
     if( veh == nullptr ) {
         return vehicle_work_query_error_json( query_id, "no such vehicle" );
     }
-    // CDDA's rule for examining a vehicle: a part of it on the avatar's square or one next to it.
-    bool beside = false;
-    for( const vpart_reference &vp : veh->get_all_parts() ) {
-        const tripoint_bub_ms p = vp.pos_bub( here );
-        if( p.z() == u.posz() && square_dist( p, u.pos_bub() ) <= 1 ) {
-            beside = true;
-            break;
-        }
+    if( !workable( *veh ) ) {
+        return vehicle_work_query_error_json( query_id, "an appliance" );
     }
-    if( !beside ) {
+    if( !within_reach( here, u, *veh ) ) {
         return vehicle_work_query_error_json( query_id, "too far" );
     }
     const std::vector<int> rows = vehicle_part_rows( *veh );
@@ -473,6 +565,9 @@ std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int
     w.vehicle = vehicle_uid;
     w.name = client_text( veh->name, max_work_name_columns, 4 * max_work_name_columns );
     w.turn = to_turns<int64_t>( calendar::turn - calendar::turn_zero );
+    // Looked at only: CDDA's own check (vehicle::handle_potential_theft) also hands an ownerless vehicle to
+    // whoever works on it, which a read must not do.
+    w.owned = !veh->has_owner() || veh->is_owned_by( u );
     for( size_t row = 0; row < rows.size(); row++ ) {
         if( w.parts.size() >= max_work_parts ) {
             w.parts_more++;
@@ -501,6 +596,44 @@ std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int
         out = write_work( query_id, w, true );
     }
     return out;
+}
+
+bool run_vehicle_work( avatar &u )
+{
+    const std::optional<vehicle_work_action> a = take_vehicle_work_action();
+    if( !a ) {
+        return false;
+    }
+    const auto answer = [&]( bool done, const std::string & why ) {
+        if( !done && !why.empty() ) {
+            u.add_msg_if_player( m_info, "%s", why );
+        }
+        if( a->tag != 0 ) {
+            on_work_result( a->vehicle, a->tag, done, why );
+        }
+        return done;
+    };
+    if( a->cmd != 'r' && a->cmd != 'o' ) {
+        return answer( false, _( "That can't be done to a vehicle this way." ) );
+    }
+    map &here = get_map();
+    vehicle *const veh = vehicle_by_uid( here, a->vehicle );
+    if( veh == nullptr ) {
+        return answer( false, _( "There is no such vehicle here." ) );
+    }
+    if( !workable( *veh ) ) {
+        return answer( false, _( "That can't be worked on like a vehicle." ) );
+    }
+    if( !within_reach( here, u, *veh ) ) {
+        return answer( false, _( "That vehicle is too far away." ) );
+    }
+    const std::vector<int> rows = vehicle_part_rows( *veh );
+    if( a->part < 0 || static_cast<size_t>( a->part ) >= rows.size() ) {
+        return answer( false, _( "That vehicle has no such part." ) );
+    }
+    std::string why;
+    const bool started = vehicle_work_access::start( here, *veh, rows[a->part], a->cmd, why );
+    return answer( started, started ? std::string() : why );
 }
 
 } // namespace fp3d

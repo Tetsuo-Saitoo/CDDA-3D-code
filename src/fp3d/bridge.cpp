@@ -27,6 +27,7 @@ struct queued_action {
     std::optional<item_action> item;
     std::optional<stairs_action> stairs;
     std::optional<ui_point> square;      // queue_action_at
+    std::optional<vehicle_work_action> work;
 };
 
 // A query waiting for the sim: a recipe query (L9), a character query (G4) or a vehicle-work query (C6).
@@ -56,6 +57,7 @@ struct channel {
     std::deque<queued_action> actions;   // queued main-loop actions (block B5)
     std::optional<item_action> item_now; // the item action last answered as `fp3d_item`, until the sim takes it
     std::optional<stairs_action> stairs_now; // ... and the stairs action answered as `fp3d_stairs`
+    std::optional<vehicle_work_action> work_now; // ... and the one answered as `fp3d_vehicle_work`
     std::optional<ui_point> square_now;  // the square the action last answered was queued with, until the sim
                                          // takes it or the main loop waits again
     bool save_wanted = false;            // request_save() until the sim takes it
@@ -334,6 +336,7 @@ ui_answer ask( ui_request req )
     c.reply.reset();
     c.item_now.reset();   // only the answer to this request may carry one (a client can't send `fp3d_item` itself)
     c.stairs_now.reset();
+    c.work_now.reset();
     if( timed ) {
         // The main loop waits for input again: what an interrupt or a queued square was meant for has ended.
         interrupt_requested.store( false );
@@ -377,6 +380,7 @@ ui_answer ask( ui_request req )
             queued.action = std::move( c.actions.front().action );
             c.item_now = std::move( c.actions.front().item );
             c.stairs_now = std::move( c.actions.front().stairs );
+            c.work_now = std::move( c.actions.front().work );
             c.square_now = std::move( c.actions.front().square );
             queued.queued = true;
             c.actions.pop_front();
@@ -542,7 +546,8 @@ static bool queue_plain_action( const std::string &action, const std::optional<u
 {
     // The bridge's own answers (a save, cheats) only come from the bridge: checked on exactly what is queued.
     std::string name = sanitize_text( action, 128 );
-    if( name == save_action || name == job_action || name == item_action_name || name == stairs_action_name ) {
+    if( name == save_action || name == job_action || name == item_action_name || name == stairs_action_name ||
+        name == vehicle_work_action_name ) {
         return false;
     }
     channel &c = chan();
@@ -550,7 +555,7 @@ static bool queue_plain_action( const std::string &action, const std::optional<u
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ std::move( name ), std::nullopt, std::nullopt, square } );
+    c.actions.push_back( queued_action{ std::move( name ), std::nullopt, std::nullopt, square, std::nullopt } );
     c.cv.notify_all();
     return true;
 }
@@ -634,7 +639,7 @@ bool queue_item_action( const item_action &a )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ item_action_name, a, std::nullopt, std::nullopt } );
+    c.actions.push_back( queued_action{ item_action_name, a, std::nullopt, std::nullopt, std::nullopt } );
     c.cv.notify_all();
     return true;
 }
@@ -659,7 +664,7 @@ bool queue_stairs_action( const stairs_action &a )
     if( c.shut_down || c.actions.size() >= max_queued_actions ) {
         return false;
     }
-    c.actions.push_back( queued_action{ stairs_action_name, std::nullopt, a, std::nullopt } );
+    c.actions.push_back( queued_action{ stairs_action_name, std::nullopt, a, std::nullopt, std::nullopt } );
     c.cv.notify_all();
     return true;
 }
@@ -670,6 +675,31 @@ std::optional<stairs_action> take_stairs_action()
     std::lock_guard<std::mutex> lk( c.m );
     std::optional<stairs_action> a = std::move( c.stairs_now );
     c.stairs_now.reset();
+    return a;
+}
+
+bool queue_vehicle_work_action( const vehicle_work_action &a )
+{
+    if( a.vehicle < 1 || a.vehicle > max_item_uid || a.part < 0 || a.part > max_work_part_row ||
+        ( a.cmd != 'r' && a.cmd != 'o' ) || a.tag > max_item_tag ) {
+        return false;
+    }
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.actions.size() >= max_queued_actions ) {
+        return false;
+    }
+    c.actions.push_back( queued_action{ vehicle_work_action_name, std::nullopt, std::nullopt, std::nullopt, a } );
+    c.cv.notify_all();
+    return true;
+}
+
+std::optional<vehicle_work_action> take_vehicle_work_action()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    std::optional<vehicle_work_action> a = std::move( c.work_now );
+    c.work_now.reset();
     return a;
 }
 
@@ -922,6 +952,7 @@ void reset_channel()
     c.actions.clear();
     c.item_now.reset();
     c.stairs_now.reset();
+    c.work_now.reset();
     c.square_now.reset();
     c.save_wanted = false;
     c.job_wanted = false;

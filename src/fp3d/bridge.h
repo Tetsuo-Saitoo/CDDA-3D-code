@@ -368,6 +368,20 @@ constexpr const char *stairs_action_name = "fp3d_stairs";
 // Sim side: the stairs action the bridge just answered `fp3d_stairs` with (once), nullopt if none.
 std::optional<stairs_action> take_stairs_action();
 
+// C6: work on a vehicle next to the avatar (fp3d/vehicle_work.h): repair or remove one of its parts, started as
+// CDDA's vehicle screen starts it. Everything is checked again when it runs.
+struct vehicle_work_action {
+    uint64_t vehicle = 0;                // the snapshot's vehicle uid, 1 .. max_item_uid
+    int part = -1;                       // a row of its parts, 0 .. max_work_part_row (vehicle_work.h)
+    char cmd = ' ';                      // 'r' repair (replace when broken), 'o' remove
+    uint32_t tag = 0;                    // the client's number for it, 0 none; answered by a work_result event
+};
+// Client side. False if a field is out of range, the command isn't one of the above, or the queue is full.
+bool queue_vehicle_work_action( const vehicle_work_action &a );
+constexpr const char *vehicle_work_action_name = "fp3d_vehicle_work";
+// Sim side: the action the bridge just answered `fp3d_vehicle_work` with (once), nullopt if none.
+std::optional<vehicle_work_action> take_vehicle_work_action();
+
 // Recipe queries (L9, fp3d/cooking.h): "what can this container's contents become, and how long?" without
 // blocking. The client posts a query and later takes its result (JSON text). The sim runs pending queries at the
 // main loop's request (right after the before-ask hook, and whenever one is posted while it waits there, paused

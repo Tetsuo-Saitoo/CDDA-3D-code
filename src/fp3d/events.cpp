@@ -348,6 +348,17 @@ void on_item_result( uint64_t item_uid, uint32_t tag, bool done, const std::stri
     push( std::move( e ) );
 }
 
+void on_work_result( uint64_t vehicle_uid, uint32_t tag, bool done, const std::string &why )
+{
+    event e;
+    e.kind = event_kind::work_result;
+    e.uid = vehicle_uid;
+    e.detail = tag;
+    e.amount = done ? 1 : 0;
+    e.text = bounded_text( remove_color_tags( why ) );
+    push( std::move( e ) );
+}
+
 void on_misfire( const Character &shooter, const item &gun )
 {
     if( !player_sees( shooter ) ) {

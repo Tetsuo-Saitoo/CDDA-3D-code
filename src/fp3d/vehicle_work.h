@@ -10,10 +10,17 @@
 //
 // The read is a query (fp3d/bridge.h, post_vehicle_work_query): run on the sim thread at the main loop's request,
 // read-only, never a prompt.
+//
+// The action (fp3d/bridge.h, vehicle_work_action) starts the work: CDDA's own question when the vehicle is
+// someone else's, the same check as the read, its question when the work would ground an aircraft, then the
+// activity veh_interact::serialize_activity builds,
+// given to the avatar as game::exam_vehicle does. CDDA's complete_vehicle carries it out when the time is up.
 
 #include <cstddef>
 #include <cstdint>
 #include <string>
+
+class avatar;
 
 namespace fp3d
 {
@@ -32,6 +39,13 @@ constexpr int max_work_part_row = 4095;         // the highest part row a query 
 // or the row isn't one of its parts. At most about `max_bytes`: part entries go from the end first, then the lines.
 std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle, int part_row, size_t max_bytes );
 std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error );
+
+// Sim side, from the main loop (fp3d/held.h held_action): runs the vehicle-work action the bridge just answered
+// with. True when the work was started. Refused with a message, nothing done: no such vehicle in the reality
+// bubble, an appliance, no part of it within a square of the avatar, a row it doesn't have, or CDDA's own check
+// says no (its sentence, or that the requirements aren't met). An action with a tag is answered by one
+// `work_result` event (fp3d/events.h): done when the activity was started, not when the work is finished.
+bool run_vehicle_work( avatar &u );
 
 } // namespace fp3d
 

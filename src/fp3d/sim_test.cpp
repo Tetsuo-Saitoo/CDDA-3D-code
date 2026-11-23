@@ -102,6 +102,7 @@
 #include "uilist.h"
 #include "units.h"
 #include "veh_type.h"
+#include "veh_appliance.h"
 #include "vehicle.h"
 #include "vpart_position.h"
 #include "vpart_range.h"
@@ -364,6 +365,8 @@ std::atomic<int> work_row{ -1 };                 // ... and the glovebox's part 
 std::string work_tiny;                           // scene 64: run_vehicle_work_query within 2500 bytes
 std::atomic<int> work_ms{ 0 };                   // ... and how long it took
 vehicle *work_car = nullptr;                     // sim thread only: scene 63's car, until scene 66
+vehicle *work_machine = nullptr;                 // sim thread only: scene 67's appliance, until scene 66
+std::atomic<int> work_machine_state{ 0 };        // scene 67: 1 the part type exists, 2 placed, 4 found on its square
 std::optional<tripoint_abs_ms> work_from;        // sim thread only: where the avatar stood before scene 63
 int work_skill[2] = { 0, 0 };                    // sim thread only: its mechanics skill and knowledge before
 // The lying-container checks' scene (hand_setup 22).
@@ -2202,6 +2205,39 @@ void observe()
             work_env = env;
             break;
         }
+        case 67: {
+            // Vehicle work: an appliance three squares west of where the avatar stood before scene 63 (the car is
+            // east of there). CDDA has another screen for those.
+            avatar &u = get_avatar();
+            int state = 0;
+            work_machine = nullptr;
+            const vpart_id machine( "ap_air_compressor" );
+            const tripoint_bub_ms machine_at = ( work_from ? here.get_bub( *work_from ) : u.pos_bub() ) +
+                                               tripoint_rel_ms( -3, 0, 0 );
+            state |= machine.is_valid() ? 1 : 0;
+            if( machine.is_valid() && !here.veh_at( machine_at ) &&
+                place_appliance( here, machine_at, machine, u ) ) {
+                state |= 2;
+                if( const optional_vpart_position placed = here.veh_at( machine_at ) ) {
+                    work_machine = &placed->vehicle();
+                    work_machine->name = "fp3d work machine";
+                    state |= 4;
+                }
+            }
+            work_machine_state = state;
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 68: {
+            // Vehicle work: the car belongs to someone else now.
+            const faction_id other( "robofac" );
+            work_machine_state = 0;
+            if( work_car != nullptr && other.is_valid() ) {
+                work_car->set_owner( other );
+                work_machine_state = 1;
+            }
+            break;
+        }
         case 64: {
             // Vehicle work, part 2: mechanics 4, a screwdriver and duct tape in the pack. Also read here, on the sim
             // thread: the glovebox's query within 2500 bytes.
@@ -2239,12 +2275,25 @@ void observe()
                 u.set_knowledge_level( skill_id( "mechanics" ), work_skill[1] );
             }
             u.remove_items_with( []( const item & it ) {
-                return it.has_var( "fp3d_work_test" );
+                return it.has_var( "fp3d_work_test" ) || it.typeId() == itype_id( "fp3d_glovebox" );
             } );
             u.invalidate_crafting_inventory();
             if( work_car != nullptr ) {
                 here.destroy_vehicle( work_car );
                 work_car = nullptr;
+            }
+            if( work_machine != nullptr ) {
+                here.destroy_vehicle( work_machine );
+                work_machine = nullptr;
+            }
+            // What the work left lying (the glovebox taken off).
+            for( int dx = -12; dx <= 12; dx++ ) {
+                for( int dy = -12; dy <= 12; dy++ ) {
+                    const tripoint_bub_ms q = u.pos_bub() + tripoint_rel_ms( dx, dy, 0 );
+                    if( here.inbounds( q ) ) {
+                        here.i_clear( q );
+                    }
+                }
             }
             here.build_map_cache( p.z() );
             break;
@@ -7157,7 +7206,8 @@ static bool run_unstoppable_checks()
     const bool npc_east = l.east == 2;
     m = act( "RIGHT" );
     l = look_now();
-    check( npc_east && l.dx == 0 && l.dy == 0 && l.origin == 0 && l.east == 2,
+    // The bump is CDDA's attack: a critical hit can kill the NPC outright, and then nobody is east any more.
+    check( npc_east && l.dx == 0 && l.dy == 0 && l.origin == 0 && ( l.east == 2 || ( l.east == 0 && has( m, "dies" ) ) ),
            "on: a hostile NPC on a vehicle isn't swapped", describe( l ) + " [" + m + "]" );
 
     // Off again: surrounded and held, the step is CDDA's bump attack and every grab holds.
@@ -9748,6 +9798,7 @@ static bool run_vehicle_work_checks()
         std::string error;
         int64_t vehicle = 0;
         std::string name;
+        bool owned = false;
         std::vector<w_part> parts;
         int parts_more = -1;
         bool has_selected = false;
@@ -9772,6 +9823,7 @@ static bool run_vehicle_work_checks()
             }
             out.vehicle = jo.get_member( "vehicle" ).get_int64();
             out.name = jo.get_string( "name" );
+            out.owned = jo.get_bool( "owned" );
             for( JsonObject p : jo.get_array( "parts" ) ) {
                 p.allow_omitted_members();
                 w_part part;
@@ -9895,13 +9947,116 @@ static bool run_vehicle_work_checks()
         return out;
     };
 
+    // The action: queued with a tag, CDDA's questions on the way answered until the main loop asks again: a menu
+    // with its first choice, a yes/no question with `agree` (CDDA asks that one again when it is cancelled).
+    struct outcome {
+        bool queued = false;
+        bool back = false;
+        int results = 0;
+        bool done = false;
+        std::string why;
+        int prompts = 0;
+        std::string asked;           // what CDDA asked on the way
+    };
+    uint32_t next_tag = 4200;
+    const auto work = [&]( uint64_t uid, int row, char cmd, bool agree = false ) {
+        outcome out;
+        std::vector<fp3d::event> evs;
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return out;
+        }
+        fp3d::drain_events( evs );
+        evs.clear();
+        fp3d::vehicle_work_action a;
+        a.vehicle = uid;
+        a.part = row;
+        a.cmd = cmd;
+        a.tag = ++next_tag;
+        out.queued = fp3d::queue_vehicle_work_action( a );
+        if( !out.queued ) {
+            return out;
+        }
+        const uint64_t before = at->id;
+        const auto t = std::chrono::steady_clock::now();
+        while( ms_since( t ) < 60000 * fp3d::slow_build ) {
+            std::optional<fp3d::ui_request> next = fp3d::wait_request( 200, at->id );
+            if( !next ) {
+                continue;
+            }
+            at = next;
+            if( at->timed ) {
+                if( at->id != before ) {
+                    out.back = true;
+                    break;
+                }
+                continue;
+            }
+            out.prompts++;
+            out.asked += std::string( " [" ) + fp3d::kind_name( at->kind ) + ": " + at->title.substr( 0, 60 ) + " / " +
+                         at->text.substr( 0, 120 ) + "]";
+            fp3d::ui_answer reply;
+            reply.id = at->id;
+            const std::string yes_no = agree ? "YES" : "NO";
+            if( at->kind == fp3d::request_kind::menu && !at->entries.empty() ) {
+                reply.entry = at->entries.front().id;
+            } else if( std::find( at->actions.begin(), at->actions.end(), yes_no ) != at->actions.end() ) {
+                reply.action = yes_no;
+            } else {
+                reply.cancel = true;
+            }
+            fp3d::answer( reply );
+        }
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            if( e.kind == fp3d::event_kind::work_result && e.detail == a.tag ) {
+                out.results++;
+                out.done = e.amount == 1;
+                out.why = e.text;
+            }
+        }
+        return out;
+    };
+    const auto shown = []( const outcome & o ) {
+        return std::string( o.queued ? "" : "not queued " ) + ( o.back ? "" : "not back " ) +
+               std::to_string( o.results ) + " results, " + ( o.done ? "done" : "refused" ) + ", \"" + o.why + "\", " +
+               std::to_string( o.prompts ) + " prompts" + o.asked;
+    };
+    // The scene's appliance in the newest snapshot.
+    const auto machine_uid = []() {
+        uint64_t uid = 0;
+        if( const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot() ) {
+            for( const fp3d::vehicle_view &v : s->vehicles ) {
+                uid = v.name == "fp3d work machine" ? v.uid : uid;
+            }
+        }
+        return uid;
+    };
+
+    // What is asking when a scene doesn't come back to the main loop; the prompt is cancelled so the rest can run.
+    const auto stuck = []() {
+        std::string said;
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 500 );
+        for( int i = 0; i < 10 && at && !at->timed; i++ ) {
+            said += std::string( " [" ) + fp3d::kind_name( at->kind ) + ": " + at->title.substr( 0, 80 ) + " / " +
+                    at->text.substr( 0, 200 ) + "]";
+            fp3d::ui_answer cancel;
+            cancel.id = at->id;
+            cancel.cancel = true;
+            fp3d::answer( cancel );
+            at = fp3d::wait_request( 5000, at->id );
+        }
+        return said.empty() ? std::string( at ? " [the main loop waits]" : " [no request]" ) : said;
+    };
+
     const bool placed = scene( 63 );
     const int env = work_env.load();
     const car_seen car = car_now();
     check( placed && env == 15 && car.named == 1 && car.uid != 0 && car.box_row >= 0 && v_box != 0,
            "scene: a car, its glovebox damaged, the avatar beside it",
            std::to_string( env ) + " of 15 (1 light, 2 morale, 4 damaged, 8 beside it), " +
-           std::to_string( car.rows.size() ) + " part rows, the glovebox's " + std::to_string( car.box_row ) );
+           std::to_string( car.rows.size() ) + " part rows, the glovebox's " + std::to_string( car.box_row ) +
+           ( placed ? std::string() : stuck() ) );
     if( !placed || car.uid == 0 || car.box_row < 0 ) {
         scene( 66 );
         return false;
@@ -9931,7 +10086,7 @@ static bool run_vehicle_work_checks()
     }
     check( id_all != 0 && all.valid && all.ok && all.id == static_cast<int64_t>( id_all ) &&
            all.kind == "vehicle_work" && all.vehicle == static_cast<int64_t>( car.uid ) &&
-           all.name == "fp3d work car" && !all.parts.empty() && all.parts.size() == car.own_rows &&
+           all.name == "fp3d work car" && all.owned && !all.parts.empty() && all.parts.size() == car.own_rows &&
            same == car.own_rows && all.parts_more == 0 && !all.has_selected && !all.truncated,
            "the parts: every part row of the snapshot, none selected",
            std::to_string( all.parts.size() ) + " parts for " + std::to_string( car.own_rows ) + " rows, " +
@@ -9964,6 +10119,36 @@ static bool run_vehicle_work_checks()
            "remove without the skill: not ok, what it yields", told( o0 ) );
     check( m0 && !m0->ok && m0->reason == 1 && m0->lines.empty() && f0 && !f0->ok && f0->reason == 1 &&
            f0->lines.empty(), "mend and refill: nothing here to mend or fill", told( m0 ) + " ; " + told( f0 ) );
+
+    // The action without the skill: refused in CDDA's words, nothing started.
+    const auto bad = []( uint64_t uid, int row, char cmd, uint32_t tag ) {
+        fp3d::vehicle_work_action a;
+        a.vehicle = uid;
+        a.part = row;
+        a.cmd = cmd;
+        a.tag = tag;
+        return !fp3d::queue_vehicle_work_action( a );
+    };
+    check( bad( 0, car.box_row, 'r', 0 ) && bad( car.uid, -1, 'r', 0 ) && bad( car.uid, car.box_row, 'i', 0 ) &&
+           bad( car.uid, fp3d::max_work_part_row + 1, 'o', 0 ) && bad( fp3d::max_item_uid + 1, 0, 'o', 0 ) &&
+           bad( car.uid, car.box_row, 'r', fp3d::max_item_tag + 1 ) &&
+           !fp3d::queue_action( fp3d::vehicle_work_action_name ),
+           "action refused unqueued: bad uid, row, command or tag", "" );
+    const outcome unskilled = work( car.uid, car.box_row, 'r' );
+    check( unskilled.queued && unskilled.back && unskilled.results == 1 && !unskilled.done &&
+           unskilled.why == "You don't meet the requirements to repair the glovebox.",
+           "action, repair without the skill: refused in CDDA's words", shown( unskilled ) );
+    // An appliance: CDDA has another screen for those.
+    const bool machined = scene( 67 );
+    const std::string machine_scene = std::to_string( work_machine_state.load() ) +
+                                      " of 7 (1 a part type, 2 placed, 4 found)" + ( machined ? std::string() : stuck() );
+    const uint64_t machine = machine_uid();
+    const parsed fixed = parse( await( fp3d::post_vehicle_work_query( machine, -1 ) ) );
+    const outcome on_machine = work( machine, 0, 'o' );
+    check( machine != 0 && fixed.valid && !fixed.ok && fixed.error == "an appliance" && on_machine.results == 1 &&
+           !on_machine.done && on_machine.why == "That can't be worked on like a vehicle.",
+           "an appliance: neither read nor worked on this way",
+           machine_scene + "; " + fixed.error + " / " + shown( on_machine ) );
 
     // Skilled, with a screwdriver and duct tape.
     const bool equipped = scene( 64 );
@@ -10034,10 +10219,56 @@ static bool run_vehicle_work_checks()
     check( prompt && prompt->timed && held.valid && held.ok && held.id == static_cast<int64_t>( first ),
            "held during a prompt, then answered", std::to_string( first ) );
 
+    // The action: repair, then remove. CDDA's own activity does the work.
+    const outcome mended = work( car.uid, car.box_row, 'r' );
+    const parsed after_r = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
+    const w_part *box2 = nullptr;
+    for( const w_part &p : after_r.parts ) {
+        if( p.row == car.box_row ) {
+            box2 = &p;
+        }
+    }
+    const w_cmd *r2 = command( after_r, "r" );
+    check( mended.queued && mended.back && mended.results == 1 && mended.done && box && box2 != nullptr &&
+           box2->hp > box->hp && box2->damage < box->damage && ( box2->flags & 3 ) == 0 && r2 && !r2->ok &&
+           r2->reason == 1,
+           "action, repair: started, and CDDA's activity mends it",
+           shown( mended ) + "; then " + ( box2 ? "hp " + std::to_string( box2->hp ) + ", damage " +
+                                           std::to_string( box2->damage ) + ", flags " + std::to_string( box2->flags ) :
+                                           std::string( "not listed" ) ) + "; " + told( r2 ) );
+    const outcome removed = work( car.uid, car.box_row, 'o' );
+    const car_seen stripped = car_now();
+    const parsed after_o = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
+    check( removed.queued && removed.back && removed.results == 1 && removed.done && stripped.box_row == -1 &&
+           stripped.own_rows + 1 == car.own_rows && after_o.valid && !after_o.ok && after_o.error == "no such part",
+           "action, remove: started, and the glovebox comes off",
+           shown( removed ) + "; then " + std::to_string( stripped.own_rows ) + " part rows of " +
+           std::to_string( car.own_rows ) + ", the glovebox's " + std::to_string( stripped.box_row ) + ", " +
+           after_o.error );
+
+    // Someone else's car: the read says so, and CDDA asks before any work. Here the answer is no.
+    const bool taken = scene( 68 );
+    const parsed foreign = parse( await( fp3d::post_vehicle_work_query( car.uid, -1 ) ) );
+    const outcome theft = work( car.uid, 0, 'o' );
+    check( taken && work_machine_state.load() == 1 && foreign.valid && foreign.ok && !foreign.owned &&
+           theft.back && theft.results == 1 && !theft.done && theft.why.empty() && theft.prompts == 1 &&
+           theft.asked.find( "belongs to" ) != std::string::npos,
+           "someone else's car: the read says so, CDDA asks, no means no", shown( theft ) );
+    // Yes: CDDA goes on to its own check of the command.
+    const outcome brazen = work( car.uid, 0, 'o', true );
+    check( brazen.back && brazen.results == 1 && brazen.prompts >= 1 &&
+           brazen.asked.find( "belongs to" ) != std::string::npos && ( brazen.done || !brazen.why.empty() ),
+           "someone else's car: yes, and CDDA's check answers", shown( brazen ) );
+
     // From where the avatar stood before: no part of the car within a square.
     const bool back = scene( 65 );
     const parsed away = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
     check( back && away.valid && !away.ok && away.error == "too far", "from six squares away: too far", away.error );
+    const outcome from_afar = work( car.uid, 0, 'o' );
+    const outcome no_car = work( car.uid + 100000, 0, 'o' );
+    check( from_afar.results == 1 && !from_afar.done && from_afar.why == "That vehicle is too far away." &&
+           no_car.results == 1 && !no_car.done && no_car.why == "There is no such vehicle here.",
+           "action from afar, and for an unknown uid: refused", shown( from_afar ) + " / " + shown( no_car ) );
     check( scene( 66 ), "after: the car gone, skill and pack as before", "" );
     return failed == 0;
 }
