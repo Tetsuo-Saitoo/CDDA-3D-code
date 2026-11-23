@@ -373,6 +373,11 @@ std::optional<stairs_action> take_stairs_action();
 struct vehicle_work_action {
     uint64_t vehicle = 0;                // the snapshot's vehicle uid, 1 .. max_item_uid
     int part = -1;                       // a row of its parts, 0 .. max_work_part_row (vehicle_work.h)
+    // Which part the client means by that row, as the read gave it: rows move up when a part comes off, so a row
+    // from an older read can be another part's by now. The action is refused when they don't fit the row's part.
+    uint32_t vpart = 0;                  // its type, the vpart id-table index, 1 .. max_work_vpart
+    int mount_x = 0;                     // its mount, each -max_work_mount .. max_work_mount
+    int mount_y = 0;
     char cmd = ' ';                      // 'r' repair (replace when broken), 'o' remove
     uint32_t tag = 0;                    // the client's number for it, 0 none; answered by a work_result event
 };

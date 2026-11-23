@@ -32,6 +32,8 @@ constexpr size_t max_work_lines = 64;           // requirement lines a command
 constexpr size_t max_work_name_columns = 60;
 constexpr size_t max_work_line_columns = 200;
 constexpr int max_work_part_row = 4095;         // the highest part row a query may name
+constexpr uint32_t max_work_vpart = 1U << 20;   // the highest vpart id-table index an action may name
+constexpr int max_work_mount = 1023;            // the furthest mount an action may name, either way
 
 // Sim side. The vehicle-work read for the vehicle a snapshot gave `vehicle` to, as JSON: its parts, and for the
 // part row `part_row` (-1: none) each command with CDDA's reason, time and requirement lines. An error object

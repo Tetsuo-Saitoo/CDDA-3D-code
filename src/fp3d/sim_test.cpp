@@ -9974,7 +9974,10 @@ static bool run_vehicle_work_checks()
         std::string asked;           // what CDDA asked on the way
     };
     uint32_t next_tag = 4200;
-    const auto work = [&]( uint64_t uid, int row, char cmd, bool agree = false ) {
+    // The part is named as a client names it: by its row, and by the type and mount the newest snapshot has for
+    // that row (`as`: another row's instead, as a client with an older list would send).
+    const auto work = [&]( uint64_t uid, int row, char cmd, bool agree = false,
+    const fp3d::vehicle_part_view *as = nullptr ) {
         outcome out;
         std::vector<fp3d::event> evs;
         std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
@@ -9986,6 +9989,21 @@ static bool run_vehicle_work_checks()
         fp3d::vehicle_work_action a;
         a.vehicle = uid;
         a.part = row;
+        a.vpart = v_box;
+        if( const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot() ) {
+            for( const fp3d::vehicle_view &v : s->vehicles ) {
+                if( v.uid == uid && row >= 0 && static_cast<size_t>( row ) < v.parts.size() ) {
+                    a.vpart = v.parts[row].vpart;
+                    a.mount_x = v.parts[row].mount_x;
+                    a.mount_y = v.parts[row].mount_y;
+                }
+            }
+        }
+        if( as != nullptr ) {
+            a.vpart = as->vpart;
+            a.mount_x = as->mount_x;
+            a.mount_y = as->mount_y;
+        }
         a.cmd = cmd;
         a.tag = ++next_tag;
         out.queued = fp3d::queue_vehicle_work_action( a );
@@ -10157,19 +10175,26 @@ static bool run_vehicle_work_checks()
            f0->lines.empty(), "mend and refill: nothing here to mend or fill", told( m0 ) + " ; " + told( f0 ) );
 
     // The action without the skill: refused in CDDA's words, nothing started.
-    const auto bad = []( uint64_t uid, int row, char cmd, uint32_t tag ) {
+    const auto bad = []( uint64_t uid, int row, char cmd, uint32_t tag, uint32_t type = 1, int mx = 0,
+    int my = 0 ) {
         fp3d::vehicle_work_action a;
         a.vehicle = uid;
         a.part = row;
+        a.vpart = type;
+        a.mount_x = mx;
+        a.mount_y = my;
         a.cmd = cmd;
         a.tag = tag;
         return !fp3d::queue_vehicle_work_action( a );
     };
     check( bad( 0, car.box_row, 'r', 0 ) && bad( car.uid, -1, 'r', 0 ) && bad( car.uid, car.box_row, 'i', 0 ) &&
            bad( car.uid, fp3d::max_work_part_row + 1, 'o', 0 ) && bad( fp3d::max_item_uid + 1, 0, 'o', 0 ) &&
-           bad( car.uid, car.box_row, 'r', fp3d::max_item_tag + 1 ) &&
+           bad( car.uid, car.box_row, 'r', fp3d::max_item_tag + 1 ) && bad( car.uid, car.box_row, 'r', 0, 0 ) &&
+           bad( car.uid, car.box_row, 'r', 0, fp3d::max_work_vpart + 1 ) &&
+           bad( car.uid, car.box_row, 'r', 0, 1, fp3d::max_work_mount + 1, 0 ) &&
+           bad( car.uid, car.box_row, 'r', 0, 1, 0, -fp3d::max_work_mount - 1 ) &&
            !fp3d::queue_action( fp3d::vehicle_work_action_name ),
-           "action refused unqueued: bad uid, row, command or tag", "" );
+           "action refused unqueued: bad uid, row, type, mount, command or tag", "" );
     const outcome unskilled = work( car.uid, car.box_row, 'r' );
     check( unskilled.queued && unskilled.back && unskilled.results == 1 && !unskilled.done &&
            unskilled.why == "You don't meet the requirements to repair the glovebox.",
@@ -10256,6 +10281,18 @@ static bool run_vehicle_work_checks()
     check( prompt && prompt->timed && held.valid && held.ok && held.id == static_cast<int64_t>( first ),
            "held during a prompt, then answered", std::to_string( first ) );
 
+    // A row from an older list: the type and mount sent with it are another part's. Refused before CDDA is asked
+    // anything, and nothing is touched, though the avatar could do both by now.
+    const int other_row = car.box_row == 0 ? 1 : 0;
+    const bool two = static_cast<size_t>( other_row ) < car.rows.size();
+    const outcome moved = two ? work( car.uid, other_row, 'o', false, &car.rows[car.box_row] ) : outcome();
+    const outcome swapped = two ? work( car.uid, car.box_row, 'r', false, &car.rows[other_row] ) : outcome();
+    const car_seen untouched = car_now();
+    check( moved.queued && moved.back && moved.results == 1 && !moved.done && moved.prompts == 0 &&
+           moved.why == "That part isn't there any more." && swapped.results == 1 && !swapped.done &&
+           swapped.why == moved.why && untouched.own_rows == car.own_rows && untouched.box_row == car.box_row,
+           "action, a row with another part's type and mount: refused", shown( moved ) + " / " + shown( swapped ) );
+
     // The action: repair, then remove. CDDA's own activity does the work.
     const outcome mended = work( car.uid, car.box_row, 'r' );
     const parsed after_r = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
@@ -10282,6 +10319,14 @@ static bool run_vehicle_work_checks()
            shown( removed ) + "; then " + std::to_string( stripped.own_rows ) + " part rows of " +
            std::to_string( car.own_rows ) + ", the glovebox's " + std::to_string( stripped.box_row ) + ", " +
            after_o.error );
+    // A client that hasn't read again still has the glovebox at its old row: whatever has that row now stays on.
+    const outcome late = work( car.uid, car.box_row, 'o', false, &car.rows[car.box_row] );
+    const car_seen kept = car_now();
+    check( late.queued && late.back && late.results == 1 && !late.done && late.prompts == 0 &&
+           ( late.why == "That part isn't there any more." || late.why == "That vehicle has no such part." ) &&
+           kept.own_rows == stripped.own_rows,
+           "action, the glovebox's old row after it came off: refused", shown( late ) + "; " +
+           std::to_string( kept.own_rows ) + " part rows" );
 
     // Someone else's car: the read says so, and CDDA asks before any work. Here the answer is no.
     const bool taken = scene( 68 );

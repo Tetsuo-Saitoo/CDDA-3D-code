@@ -676,6 +676,12 @@ bool run_vehicle_work( avatar &u )
     if( a->part < 0 || static_cast<size_t>( a->part ) >= rows.size() ) {
         return answer( false, _( "That vehicle has no such part." ) );
     }
+    // The row must still hold the part the client meant: rows move up when a part comes off.
+    const vehicle_part &named = veh->part( rows[a->part] );
+    if( named.mount.x() != a->mount_x || named.mount.y() != a->mount_y ||
+        intern_id( id_kind::vpart, named.info().id.str() ) != a->vpart ) {
+        return answer( false, _( "That part isn't there any more." ) );
+    }
     std::string why;
     const bool started = vehicle_work_access::start( here, *veh, rows[a->part], a->cmd, why );
     return answer( started, started ? std::string() : why );

@@ -681,6 +681,8 @@ std::optional<stairs_action> take_stairs_action()
 bool queue_vehicle_work_action( const vehicle_work_action &a )
 {
     if( a.vehicle < 1 || a.vehicle > max_item_uid || a.part < 0 || a.part > max_work_part_row ||
+        a.vpart < 1 || a.vpart > max_work_vpart || a.mount_x < -max_work_mount || a.mount_x > max_work_mount ||
+        a.mount_y < -max_work_mount || a.mount_y > max_work_mount ||
         ( a.cmd != 'r' && a.cmd != 'o' ) || a.tag > max_item_tag ) {
         return false;
     }
