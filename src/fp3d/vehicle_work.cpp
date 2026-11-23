@@ -22,9 +22,12 @@
 #include "json.h"
 #include "map.h"
 #include "messages.h"
+#include "monster.h"
+#include "mtype.h"
 #include "output.h"
 #include "player_activity.h"
 #include "point.h"
+#include "rng.h"
 #include "string_formatter.h"
 #include "translations.h"
 #include "type_id.h"
@@ -36,6 +39,8 @@
 static const ammotype ammo_battery( "battery" );
 
 static const trait_id trait_DEBUG_HS( "DEBUG_HS" );
+static const trait_id trait_SHELL2( "SHELL2" );
+static const trait_id trait_SHELL3( "SHELL3" );
 
 namespace fp3d
 {
@@ -189,6 +194,24 @@ bool within_reach( map &here, const avatar &u, const vehicle &veh )
         }
     }
     return false;
+}
+
+// CDDA's own gates on the way to its vehicle screen: nothing is examined from inside a shell
+// (game::do_regular_action), and a rider gets no vehicle, a mech's aside (game::examine). The read's error name
+// and CDDA's sentence.
+struct gate {
+    const char *error;
+    std::string text;
+};
+std::optional<gate> examine_gate( const Character &u )
+{
+    if( u.has_active_mutation( trait_SHELL2 ) || u.has_active_mutation( trait_SHELL3 ) ) {
+        return gate{ "in shell", _( "You can't examine your surroundings while you're in your shell." ) };
+    }
+    if( u.is_mounted() && !u.mounted_creature->has_flag( mon_flag_RIDEABLE_MECH ) ) {
+        return gate{ "mounted", _( "You cannot interact with a vehicle while mounted." ) };
+    }
+    return std::nullopt;
 }
 
 // CDDA opens another screen for an appliance (game::exam_appliance) and none for a summoned vehicle.
@@ -571,7 +594,8 @@ struct vehicle_work_access {
     }
 };
 
-std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error, uint64_t vehicle )
+std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error, uint64_t vehicle,
+        const std::string &text )
 {
     std::ostringstream os;
     JsonOut jo( os );
@@ -583,14 +607,27 @@ std::string vehicle_work_query_error_json( uint64_t query_id, const std::string 
         jo.member( "vehicle", static_cast<int64_t>( vehicle ) );
     }
     jo.member( "error", error );
+    if( !text.empty() ) {
+        jo.member( "text", client_text( text, max_work_line_columns, 4 * max_work_line_columns ) );
+    }
     jo.end_object();
     return os.str();
 }
 
 std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle_uid, int part_row, size_t max_bytes )
 {
+    // A read leaves the game's dice as they were: CDDA rolls what removing some parts may yield just to list it.
+    struct dice_kept {
+        cata_default_random_engine was = rng_get_engine();
+        ~dice_kept() {
+            rng_get_engine() = was;
+        }
+    } dice;
     map &here = get_map();
     avatar &u = get_avatar();
+    if( const std::optional<gate> shut = examine_gate( u ) ) {
+        return vehicle_work_query_error_json( query_id, shut->error, vehicle_uid, shut->text );
+    }
     vehicle *const veh = vehicle_by_uid( here, vehicle_uid );
     if( veh == nullptr ) {
         return vehicle_work_query_error_json( query_id, "no such vehicle", vehicle_uid );
@@ -660,6 +697,9 @@ bool run_vehicle_work( avatar &u )
     };
     if( a->cmd != 'r' && a->cmd != 'o' ) {
         return answer( false, _( "That can't be done to a vehicle this way." ) );
+    }
+    if( const std::optional<gate> shut = examine_gate( u ) ) {
+        return answer( false, shut->text );
     }
     map &here = get_map();
     vehicle *const veh = vehicle_by_uid( here, a->vehicle );

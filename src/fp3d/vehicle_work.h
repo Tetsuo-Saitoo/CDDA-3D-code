@@ -37,11 +37,15 @@ constexpr int max_work_mount = 1023;            // the furthest mount an action 
 
 // Sim side. The vehicle-work read for the vehicle a snapshot gave `vehicle` to, as JSON: its parts, and for the
 // part row `part_row` (-1: none) each command with CDDA's reason, time and requirement lines. An error object
-// when there is no such vehicle in the reality bubble, no part of it is on the avatar's square or one next to it,
-// or the row isn't one of its parts. At most about `max_bytes`: part entries go from the end first, then the lines.
+// when the avatar is riding or inside its shell (CDDA lets neither reach its vehicle screen), there is no such
+// vehicle in the reality bubble, no part of it is on the avatar's square or one next to it, or the row isn't one
+// of its parts. At most about `max_bytes`: part entries go from the end first, then the lines. The read leaves
+// the game's dice as they were.
 std::string run_vehicle_work_query( uint64_t query_id, uint64_t vehicle, int part_row, size_t max_bytes );
 // `vehicle`: the uid the query named, given back so a client can tell which vehicle the error is about; 0 none.
-std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error, uint64_t vehicle = 0 );
+// `text`: CDDA's sentence for the error when it has one ("mounted", "in shell"), else "".
+std::string vehicle_work_query_error_json( uint64_t query_id, const std::string &error, uint64_t vehicle = 0,
+        const std::string &text = std::string() );
 
 // Sim side, from the main loop (fp3d/held.h held_action): runs the vehicle-work action the bridge just answered
 // with. True when the work was started. Refused with a message, nothing done: no such vehicle in the reality

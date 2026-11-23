@@ -391,7 +391,8 @@ std::optional<vehicle_work_action> take_vehicle_work_action();
 // blocking. The client posts a query and later takes its result (JSON text). The sim runs pending queries at the
 // main loop's request (right after the before-ask hook, and whenever one is posted while it waits there, paused
 // too) and once per turn in pace_turn (during activities); a query posted during another prompt waits for the
-// main loop. Queries are read-only. Results wait until taken; the oldest is dropped beyond max_query_results.
+// main loop. Queries are read-only. Results wait until taken; each kind keeps its own newest ones (recipe 8,
+// character 4, vehicle work 4: max_query_results in all), the oldest of that kind dropped beyond.
 constexpr size_t max_pending_queries = 8;
 constexpr size_t max_query_results = 16;
 constexpr size_t max_query_result_bytes = 64 * 1024;

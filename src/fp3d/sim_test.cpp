@@ -368,6 +368,8 @@ vehicle *work_car = nullptr;                     // sim thread only: scene 63's 
 vehicle *work_machine = nullptr;                 // sim thread only: scene 67's appliance, until scene 66
 std::atomic<int> work_machine_state{ 0 };        // scene 67: 1 the part type exists, 2 placed, 4 found on its square
 std::optional<tripoint_abs_ms> work_from;        // sim thread only: where the avatar stood before scene 63
+std::atomic<int> work_gate_state{ 0 };           // scenes 69 to 73: what each managed, by its own bits
+std::optional<tripoint_abs_ms> work_stood;       // sim thread only: where the avatar stood before scene 70
 int work_skill[2] = { 0, 0 };                    // sim thread only: its mechanics skill and knowledge before
 // The lying-container checks' scene (hand_setup 22).
 std::atomic<uint64_t> lc_pack_uid{ 0 };         // a backpack west holding a rock and 2 empty bottles
@@ -2262,6 +2264,100 @@ void observe()
             if( work_from ) {
                 get_avatar().setpos( here, here.get_bub( *work_from ) );
             }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 69: {
+            // Vehicle work: a rotor on the car for one read. CDDA rolls what smashing one off may yield just to
+            // list it; the read leaves the game's dice as they were. The rotor comes off again here.
+            int state = 0;
+            const vpart_id rotor( "small_civilian_rotors" );
+            if( work_car != nullptr && rotor.is_valid() && work_car->part_count() > 0 &&
+                work_car->can_mount( work_car->part( 0 ).mount, *rotor ).success() ) {
+                const int had = work_car->part_count();
+                const int idx = work_car->install_part( here, work_car->part( 0 ).mount, rotor );
+                if( idx >= 0 ) {
+                    state |= 1;
+                    const std::vector<int> rows = fp3d::vehicle_part_rows( *work_car );
+                    const auto at = std::find( rows.begin(), rows.end(), idx );
+                    if( at != rows.end() ) {
+                        const cata_default_random_engine before = rng_get_engine();
+                        const std::string read = fp3d::run_vehicle_work_query( 906, work_uid.load(),
+                                                 static_cast<int>( at - rows.begin() ), 64 * 1024 );
+                        state |= read.find( "may yield" ) != std::string::npos ? 2 : 0;
+                        state |= rng_get_engine() == before ? 4 : 0;
+                    }
+                    work_car->remove_part( work_car->part( idx ) );
+                    work_car->part_removal_cleanup( here );
+                    state |= work_car->part_count() == had ? 8 : 0;
+                }
+            }
+            work_gate_state = state;
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 70: {
+            // Vehicle work: the avatar on a horse, on a free square next to where it stood.
+            avatar &u = get_avatar();
+            int state = 0;
+            work_stood = u.pos_abs();
+            for( const tripoint_bub_ms &q : closest_points_first( u.pos_bub(), 1, 1 ) ) {
+                if( here.passable( q ) && g->is_empty( q ) && !here.veh_at( q ) ) {
+                    if( monster *horse = g->place_critter_at( mon_horse, q ) ) {
+                        u.mount_creature( *horse );
+                        state |= 1;
+                    }
+                    break;
+                }
+            }
+            state |= u.is_mounted() ? 2 : 0;
+            work_gate_state = state;
+            break;
+        }
+        case 71: {
+            // Vehicle work: off the horse again (as Character::dismount, without its square menu), the horse gone,
+            // the avatar back where it stood.
+            avatar &u = get_avatar();
+            if( u.is_mounted() ) {
+                monster *horse = u.mounted_creature.get();
+                u.remove_effect( efftype_id( "riding" ) );
+                horse->remove_effect( efftype_id( "ridden" ) );
+                horse->mounted_player_id = character_id();
+                horse->mounted_player = nullptr;
+                u.mounted_creature = nullptr;
+                g->remove_zombie( *horse );
+            }
+            if( work_stood ) {
+                u.setpos( here, here.get_bub( *work_stood ) );
+                work_stood.reset();
+            }
+            work_gate_state = u.is_mounted() ? 0 : 1;
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 72: {
+            // Vehicle work: the avatar has a roomy shell and is inside it.
+            avatar &u = get_avatar();
+            const trait_id shell( "SHELL2" );
+            int state = 0;
+            if( shell.is_valid() && !u.has_trait( shell ) ) {
+                u.set_mutation( shell );
+                u.activate_mutation( shell );
+                state |= 1;
+            }
+            state |= u.has_active_mutation( shell ) ? 2 : 0;
+            work_gate_state = state;
+            break;
+        }
+        case 73: {
+            // Vehicle work: out of the shell, the shell gone.
+            avatar &u = get_avatar();
+            const trait_id shell( "SHELL2" );
+            if( u.has_trait( shell ) ) {
+                u.deactivate_mutation( shell );
+                u.unset_mutation( shell );
+            }
+            work_gate_state = u.has_trait( shell ) ? 0 : 1;
             here.build_map_cache( p.z() );
             break;
         }
@@ -9801,6 +9897,7 @@ static bool run_vehicle_work_checks()
         int64_t id = 0;
         std::string kind;
         std::string error;
+        std::string text;            // CDDA's sentence with an error, "" none
         int64_t vehicle = 0;
         std::string name;
         bool owned = false;
@@ -9823,6 +9920,7 @@ static bool run_vehicle_work_checks()
             out.kind = jo.get_string( "kind" );
             if( !out.ok ) {
                 out.error = jo.get_string( "error" );
+                out.text = jo.has_member( "text" ) ? jo.get_string( "text" ) : std::string();
                 out.vehicle = jo.has_member( "vehicle" ) ? jo.get_member( "vehicle" ).get_int64() : 0;
                 out.valid = true;
                 return out;
@@ -10280,6 +10378,133 @@ static bool run_vehicle_work_checks()
     const parsed held = parse( await( first ) );
     check( prompt && prompt->timed && held.valid && held.ok && held.id == static_cast<int64_t>( first ),
            "held during a prompt, then answered", std::to_string( first ) );
+
+    // Reads posted without a break, each the moment the last one starts to run: the main loop still takes its
+    // turns (here: five actions it drops).
+    {
+        std::atomic<bool> stop{ false };
+        std::atomic<int> posted{ 0 };
+        std::vector<uint64_t> left;
+        std::thread flood( [&]() {
+            while( !stop.load() ) {
+                const uint64_t id = fp3d::post_vehicle_work_query( car.uid, car.box_row );
+                if( id != 0 ) {
+                    posted++;
+                    left.push_back( id );
+                }
+                for( size_t i = 0; i < left.size(); ) {
+                    if( fp3d::take_query_result( left[i] ) ) {
+                        left.erase( left.begin() + i );
+                    } else {
+                        i++;
+                    }
+                }
+                std::this_thread::yield();
+            }
+        } );
+        const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        while( posted.load() < 5 && ms_since( began ) < 5000 * fp3d::slow_build ) {
+            std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+        }
+        const std::chrono::steady_clock::time_point asked = std::chrono::steady_clock::now();
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        int turns = 0;
+        for( int i = 0; i < 5 && at && at->timed; i++ ) {
+            fp3d::queue_action( "no_such_action" );
+            const std::optional<fp3d::ui_request> next = fp3d::wait_request( static_cast<int>( 4000 * fp3d::slow_build ),
+                    at->id );
+            if( !next || !next->timed ) {
+                break;
+            }
+            at = next;
+            turns++;
+        }
+        const int took = static_cast<int>( ms_since( asked ) );
+        const int during = posted.load();
+        stop = true;
+        flood.join();
+        // What the reads left: taken, or given up on (a result can have made room for a newer one).
+        const std::chrono::steady_clock::time_point tidy = std::chrono::steady_clock::now();
+        while( ( !left.empty() || fp3d::pending_queries() != 0 ) && ms_since( tidy ) < 3000 * fp3d::slow_build ) {
+            for( size_t i = 0; i < left.size(); ) {
+                if( fp3d::take_query_result( left[i] ) ) {
+                    left.erase( left.begin() + i );
+                } else {
+                    i++;
+                }
+            }
+            std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
+        }
+        check( turns == 5 && during >= 5 && fp3d::pending_queries() == 0,
+               "reads posted without a break: the main loop takes its turns",
+               std::to_string( turns ) + " of 5 turns in " + std::to_string( took ) + " ms, " +
+               std::to_string( during ) + " reads posted by then" );
+    }
+
+    // Results wait by kind: a character result not taken yet is still there after more vehicle reads than the
+    // whole store holds, and of those reads the newest four stay.
+    {
+        const uint64_t sheet = fp3d::post_character_query();
+        std::vector<uint64_t> reads;
+        const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+        while( reads.size() < 18 && ms_since( began ) < 20000 * fp3d::slow_build ) {
+            const uint64_t id = fp3d::post_vehicle_work_query( car.uid, -1 );
+            if( id != 0 ) {
+                reads.push_back( id );
+            } else {
+                std::this_thread::sleep_for( std::chrono::milliseconds( 1 ) );
+            }
+        }
+        const bool all = reads.size() == 18;
+        const parsed newest = parse( all ? await( reads.back() ) : std::string() );
+        const bool old_gone = all && !fp3d::take_query_result( reads[0] ) && !fp3d::take_query_result( reads[13] );
+        int kept = 0;
+        for( size_t i = 14; all && i < 17; i++ ) {
+            kept += fp3d::take_query_result( reads[i] ) ? 1 : 0;
+        }
+        const std::optional<std::string> sheet_text = fp3d::take_query_result( sheet );
+        check( sheet != 0 && all && newest.valid && newest.ok && old_gone && kept == 3 && sheet_text &&
+               !sheet_text->empty(),
+               "results wait by kind: 18 reads later the character's is there",
+               std::to_string( reads.size() ) + " reads, the newest " + ( newest.ok ? "ok" : "not ok" ) + ", " +
+               std::to_string( kept ) + " of 3 older ones kept, the oldest " + ( old_gone ? "gone" : "still there" ) +
+               ", the character's " + ( sheet_text ? std::to_string( sheet_text->size() ) + " bytes" : "gone" ) );
+    }
+
+    // A part CDDA rolls a yield for (a rotor, smashed off): the read lists it and leaves the game's dice alone.
+    const bool rolled = scene( 69 );
+    check( rolled && work_gate_state.load() == 15, "a part whose yield CDDA rolls: the dice as before",
+           std::to_string( work_gate_state.load() ) +
+           " of 15 (1 a rotor put on, 2 its yield listed, 4 the dice as before, 8 the rotor off again)" +
+           ( rolled ? std::string() : stuck() ) );
+
+    // CDDA's own gates on the way to its vehicle screen: not from the saddle, not from inside a shell. The avatar
+    // could repair the glovebox by now, so only the gate keeps the action from starting.
+    const bool riding = scene( 70 );
+    const int ride_state = work_gate_state.load();
+    const parsed from_saddle = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
+    const outcome saddle_work = work( car.uid, car.box_row, 'r' );
+    const bool afoot = scene( 71 ) && work_gate_state.load() == 1;
+    check( riding && ride_state == 3 && from_saddle.valid && !from_saddle.ok && from_saddle.error == "mounted" &&
+           from_saddle.vehicle == static_cast<int64_t>( car.uid ) &&
+           from_saddle.text == "You cannot interact with a vehicle while mounted." && saddle_work.results == 1 &&
+           !saddle_work.done && saddle_work.prompts == 0 && saddle_work.why == from_saddle.text && afoot,
+           "riding: neither read nor worked on, in CDDA's words",
+           std::to_string( ride_state ) + " of 3 (1 a horse, 2 mounted); " + from_saddle.error + " / " +
+           shown( saddle_work ) + ( riding && afoot ? std::string() : stuck() ) );
+    const bool tucked = scene( 72 );
+    const int shell_state = work_gate_state.load();
+    const parsed from_shell = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
+    const outcome shell_work = work( car.uid, car.box_row, 'r' );
+    const bool out_again = scene( 73 ) && work_gate_state.load() == 1;
+    const parsed afterwards = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
+    check( tucked && shell_state == 3 && from_shell.valid && !from_shell.ok && from_shell.error == "in shell" &&
+           from_shell.text == "You can't examine your surroundings while you're in your shell." &&
+           shell_work.results == 1 && !shell_work.done && shell_work.prompts == 0 &&
+           shell_work.why == from_shell.text && out_again && afterwards.valid && afterwards.ok,
+           "in a shell: neither read nor worked on; read again once out",
+           std::to_string( shell_state ) + " of 3 (1 a shell, 2 inside it); " + from_shell.error + " / " +
+           shown( shell_work ) + ( tucked && out_again ? std::string() : stuck() ) );
 
     // A row from an older list: the type and mount sent with it are another part's. Refused before CDDA is asked
     // anything, and nothing is touched, though the avatar could do both by now.

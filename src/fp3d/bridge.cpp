@@ -41,6 +41,21 @@ struct recipe_query {
     int part = -1;                       // vehicle_work: a row of its parts, -1 none
 };
 
+// A query's result waiting to be taken.
+struct query_result {
+    uint64_t id = 0;
+    query_kind kind = query_kind::recipe;
+    std::string text;
+};
+// How many untaken results a kind keeps. Each kind has its own share of max_query_results, so the results of one
+// kind never take the place of another's.
+constexpr size_t kept_results( query_kind kind )
+{
+    return kind == query_kind::recipe ? 8 : 4;
+}
+static_assert( kept_results( query_kind::recipe ) + kept_results( query_kind::character ) +
+               kept_results( query_kind::vehicle_work ) == max_query_results, "the kinds' shares add up" );
+
 // Thrown by ask() when CDDA code run by a query wants to ask the client something (a debug popup): queries
 // never prompt. Not a std::exception, so CDDA's handlers let it unwind to run_queries().
 struct query_prompt {};
@@ -68,7 +83,7 @@ struct channel {
     // Wall time the current game turn started; real time ends it turn_length() later.
     std::chrono::steady_clock::time_point turn_start = std::chrono::steady_clock::now();
     std::deque<recipe_query> queries;    // posted, not run yet (L9)
-    std::deque<std::pair<uint64_t, std::string>> query_results;   // run, not taken yet
+    std::deque<query_result> query_results;   // run, not taken yet
     uint64_t next_query_id = 1;
 };
 
@@ -106,11 +121,13 @@ std::chrono::steady_clock::duration turn_length( double timescale )
                std::chrono::duration<double, std::milli>( 1000.0 / timescale ) );
 }
 
-// Sim side, with `lk` holding c.m: runs the pending queries one by one, the lock released while CDDA code
-// runs. Returns with the lock held; stops early on shutdown (the caller then unwinds).
+// Sim side, with `lk` holding c.m: runs the queries pending now one by one, the lock released while CDDA code
+// runs. One posted meanwhile waits for the next call, so a call runs max_pending_queries at most and the caller
+// looks at everything else it waits for in between. Returns with the lock held; stops early on shutdown (the
+// caller then unwinds).
 void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
 {
-    while( !c.queries.empty() && !c.shut_down ) {
+    for( size_t left = c.queries.size(); left > 0 && !c.queries.empty() && !c.shut_down; left-- ) {
         const recipe_query q = c.queries.front();
         c.queries.pop_front();
         lk.unlock();
@@ -144,10 +161,19 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
             result = failed( "too large" );
         }
         lk.lock();
-        while( c.query_results.size() >= max_query_results ) {
-            c.query_results.pop_front();
+        size_t kept = 0;
+        for( const query_result &r : c.query_results ) {
+            kept += r.kind == q.kind ? 1 : 0;
         }
-        c.query_results.emplace_back( q.id, std::move( result ) );
+        for( auto it = c.query_results.begin(); kept >= kept_results( q.kind ) && it != c.query_results.end(); ) {
+            if( it->kind == q.kind ) {
+                it = c.query_results.erase( it );
+                kept--;
+            } else {
+                ++it;
+            }
+        }
+        c.query_results.push_back( query_result{ q.id, q.kind, std::move( result ) } );
         c.cv.notify_all();
     }
 }
@@ -387,20 +413,23 @@ ui_answer ask( ui_request req )
             c.reply = std::move( queued );
             break;
         }
-        // Recipe queries posted while the main loop waits (paused too); then everything is checked again.
+        // Re-evaluated on every wake-up: the client may switch mode, timescale or pause meanwhile.
+        std::optional<std::chrono::steady_clock::time_point> deadline;
+        if( timed && c.clock.mode == clock_mode::real_time && !c.clock.paused ) {
+            deadline = c.turn_start + turn_length( c.clock.timescale );
+            if( std::chrono::steady_clock::now() >= *deadline ) {
+                expired = true;
+                break;
+            }
+        }
+        // Queries posted while the main loop waits (paused too); then everything is checked again, the turn's
+        // end included.
         if( timed && !c.queries.empty() ) {
             run_queries( c, lk );
             continue;
         }
-        // Re-evaluated on every wake-up: the client may switch mode, timescale or pause meanwhile.
-        if( timed && c.clock.mode == clock_mode::real_time && !c.clock.paused ) {
-            const std::chrono::steady_clock::time_point deadline = c.turn_start + turn_length(
-                        c.clock.timescale );
-            if( std::chrono::steady_clock::now() >= deadline ) {
-                expired = true;
-                break;
-            }
-            c.cv.wait_until( lk, deadline );
+        if( deadline ) {
+            c.cv.wait_until( lk, *deadline );
         } else {
             c.cv.wait( lk );
         }
@@ -770,8 +799,8 @@ std::optional<std::string> take_query_result( uint64_t id )
     channel &c = chan();
     std::lock_guard<std::mutex> lk( c.m );
     for( auto it = c.query_results.begin(); it != c.query_results.end(); ++it ) {
-        if( it->first == id ) {
-            std::string result = std::move( it->second );
+        if( it->id == id ) {
+            std::string result = std::move( it->text );
             c.query_results.erase( it );
             return result;
         }
@@ -863,17 +892,22 @@ void pace_turn( bool fast_forward, bool watched )
     }
     std::unique_lock<std::mutex> lk( c.m );
     std::optional<std::chrono::steady_clock::time_point> paced_until;
+    // Queries also get answered during activities and pauses: those pending now once a turn whatever the clock
+    // says, later ones only while this turn still has to wait.
+    if( !in_query && !c.queries.empty() && !c.shut_down ) {
+        run_queries( c, lk );
+    }
     for( ;; ) {
         if( c.shut_down ) {
             throw shutdown_signal();
         }
-        // Recipe queries also get answered during activities and pauses.
-        if( !in_query && !c.queries.empty() ) {
-            run_queries( c, lk );
-            continue;
-        }
+        const bool asked = !in_query && !c.queries.empty();
         if( c.clock.paused ) {
-            c.cv.wait( lk );
+            if( asked ) {
+                run_queries( c, lk );
+            } else {
+                c.cv.wait( lk );
+            }
             continue;
         }
         if( !watched && ( c.clock.mode == clock_mode::turn_based || fast_forward ) ) {
@@ -885,6 +919,10 @@ void pace_turn( bool fast_forward, bool watched )
         paced_until = deadline;
         if( std::chrono::steady_clock::now() >= deadline ) {
             break;
+        }
+        if( asked ) {
+            run_queries( c, lk );
+            continue;
         }
         c.cv.wait_until( lk, deadline );
     }
