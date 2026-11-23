@@ -14,6 +14,7 @@
 #include "calendar.h"
 #include "fp3d/cooking.h"
 #include "fp3d/snapshot.h"
+#include "fp3d/vehicle_work.h"
 #include "map_scale_constants.h"
 
 namespace fp3d
@@ -28,13 +29,15 @@ struct queued_action {
     std::optional<ui_point> square;      // queue_action_at
 };
 
-// A query waiting for the sim: a recipe query (L9) or a character query (G4).
-enum class query_kind : uint8_t { recipe, character };
+// A query waiting for the sim: a recipe query (L9), a character query (G4) or a vehicle-work query (C6).
+enum class query_kind : uint8_t { recipe, character, vehicle_work };
 struct recipe_query {
     uint64_t id = 0;
     query_kind kind = query_kind::recipe;
     item_ref container;
     ui_point pos;
+    uint64_t vehicle = 0;                // vehicle_work: the snapshot's vehicle uid
+    int part = -1;                       // vehicle_work: a row of its parts, -1 none
 };
 
 // Thrown by ask() when CDDA code run by a query wants to ask the client something (a debug popup): queries
@@ -111,6 +114,7 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
         lk.unlock();
         const auto failed = [&q]( const std::string & error ) {
             return q.kind == query_kind::character ? character_query_error_json( q.id, error ) :
+                   q.kind == query_kind::vehicle_work ? vehicle_work_query_error_json( q.id, error ) :
                    recipe_query_error_json( q.id, q.container.uid, error );
         };
         std::string result;
@@ -125,6 +129,8 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
             } scope;
             try {
                 result = q.kind == query_kind::character ? run_character_query( q.id, max_query_result_bytes ) :
+                         q.kind == query_kind::vehicle_work ?
+                         run_vehicle_work_query( q.id, q.vehicle, q.part, max_query_result_bytes ) :
                          run_recipe_query( q.id, q.container, q.pos );
             } catch( const query_prompt & ) {
                 result = failed( "internal" );
@@ -698,6 +704,30 @@ uint64_t post_character_query()
     recipe_query q;
     q.id = id;
     q.kind = query_kind::character;
+    c.queries.push_back( q );
+    c.cv.notify_all();
+    return id;
+}
+
+uint64_t post_vehicle_work_query( uint64_t vehicle, int part )
+{
+    if( vehicle < 1 || vehicle > max_item_uid || part < -1 || part > max_work_part_row ) {
+        return 0;
+    }
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.queries.size() >= max_pending_queries ||
+        std::any_of( c.queries.begin(), c.queries.end(), []( const recipe_query & q ) {
+        return q.kind == query_kind::vehicle_work;
+    } ) ) {
+        return 0;
+    }
+    const uint64_t id = c.next_query_id++;
+    recipe_query q;
+    q.id = id;
+    q.kind = query_kind::vehicle_work;
+    q.vehicle = vehicle;
+    q.part = part;
     c.queries.push_back( q );
     c.cv.notify_all();
     return id;

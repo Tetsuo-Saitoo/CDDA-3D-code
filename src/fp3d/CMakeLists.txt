@@ -19,6 +19,7 @@ target_sources(cataclysm-tiles-common PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/test_range.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cooking.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/glovebox.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/vehicle_work.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/cheats.cpp)
 
 # Block B1: headless smoke test. Links the same object library as the game, opens no window.

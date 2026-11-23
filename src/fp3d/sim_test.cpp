@@ -56,6 +56,7 @@
 #include "fp3d/cooking.h"
 #include "fp3d/game_access.h"
 #include "fp3d/glovebox.h"
+#include "fp3d/vehicle_work.h"
 #include "fp3d/bullet_paths.h"
 #include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
@@ -355,6 +356,16 @@ std::atomic<int> glove_dy{ 0 };
 std::atomic<uint64_t> glove_bottle_uid{ 0 };
 vehicle *glove_car = nullptr;                    // sim thread only: scene 61's car, until scene 62
 std::optional<tripoint_abs_ms> glove_from;       // sim thread only: where the avatar stood before scene 61
+// The vehicle-work checks' scenes (hand_setup 63 to 66).
+std::atomic<int> work_env{ 0 };                  // scene 63: 1 light to work by, 2 morale to craft, 4 the glovebox
+// damaged and repairable, 8 the avatar beside it
+std::atomic<uint64_t> work_uid{ 0 };             // set by the driver before scene 64: the car's uid in the snapshot
+std::atomic<int> work_row{ -1 };                 // ... and the glovebox's part row
+std::string work_tiny;                           // scene 64: run_vehicle_work_query within 2500 bytes
+std::atomic<int> work_ms{ 0 };                   // ... and how long it took
+vehicle *work_car = nullptr;                     // sim thread only: scene 63's car, until scene 66
+std::optional<tripoint_abs_ms> work_from;        // sim thread only: where the avatar stood before scene 63
+int work_skill[2] = { 0, 0 };                    // sim thread only: its mechanics skill and knowledge before
 // The lying-container checks' scene (hand_setup 22).
 std::atomic<uint64_t> lc_pack_uid{ 0 };         // a backpack west holding a rock and 2 empty bottles
 std::atomic<uint64_t> lc_rock_uid{ 0 };         // the rock
@@ -2120,6 +2131,120 @@ void observe()
             if( glove_car != nullptr ) {
                 here.destroy_vehicle( glove_car );
                 glove_car = nullptr;
+            }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 63: {
+            // Vehicle work: floor 12 squares around, a car fresh from its prototype six squares east, its glovebox
+            // damaged. The avatar stands outside the car, on the free square beside it nearest the glovebox, and
+            // knows no mechanics.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -12; dx <= 12; dx++ ) {
+                for( int dy = -12; dy <= 12; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( !here.inbounds( q ) ) {
+                        continue;
+                    }
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_pavement );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            work_env = 0;
+            work_from = here.get_abs( p );
+            work_skill[0] = u.get_skill_level( skill_id( "mechanics" ) );
+            work_skill[1] = u.get_knowledge_level( skill_id( "mechanics" ) );
+            u.set_skill_level( skill_id( "mechanics" ), 0 );
+            u.set_knowledge_level( skill_id( "mechanics" ), 0 );
+            vehicle *car = here.add_vehicle( vehicle_prototype_car, p + tripoint_rel_ms( 6, 0, 0 ), 0_degrees, 100, 2,
+                                             false, true );
+            work_car = car;
+            int env = 0;
+            if( car != nullptr ) {
+                car->name = "fp3d work car";
+                for( int i = 0; i < car->part_count(); i++ ) {
+                    vehicle_part &box = car->part( i );
+                    if( box.info().id != fp3d::glovebox_part() ) {
+                        continue;
+                    }
+                    car->mod_hp( box, -box.hp() / 2 );
+                    env |= box.is_repairable() && !box.is_broken() ? 4 : 0;
+                    const tripoint_bub_ms at = car->bub_part_pos( here, box );
+                    for( int reach = 1; reach <= 4 && ( env & 8 ) == 0; reach++ ) {
+                        for( const tripoint_bub_ms &q : here.points_in_radius( at, reach ) ) {
+                            if( here.veh_at( q ) || !here.passable( q ) ) {
+                                continue;
+                            }
+                            bool beside_car = false;
+                            for( const tripoint_bub_ms &next : here.points_in_radius( q, 1 ) ) {
+                                const optional_vpart_position there = here.veh_at( next );
+                                beside_car = beside_car || ( there && &there->vehicle() == car );
+                            }
+                            if( beside_car ) {
+                                u.setpos( here, q );
+                                env |= 8;
+                                break;
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+            here.build_map_cache( p.z() );
+            env |= u.fine_detail_vision_mod() <= 4 ? 1 : 0;
+            env |= u.has_morale_to_craft() ? 2 : 0;
+            work_env = env;
+            break;
+        }
+        case 64: {
+            // Vehicle work, part 2: mechanics 4, a screwdriver and duct tape in the pack. Also read here, on the sim
+            // thread: the glovebox's query within 2500 bytes.
+            avatar &u = get_avatar();
+            u.set_skill_level( skill_id( "mechanics" ), 4 );
+            u.set_knowledge_level( skill_id( "mechanics" ), 4 );
+            item driver( itype_id( "screwdriver" ) );
+            driver.set_var( "fp3d_work_test", 1 );
+            u.i_add( driver );
+            item tape( itype_id( "duct_tape" ), calendar::turn, 200 );
+            tape.set_var( "fp3d_work_test", 1 );
+            u.i_add( tape );
+            u.invalidate_crafting_inventory();
+            const std::chrono::steady_clock::time_point began = std::chrono::steady_clock::now();
+            work_tiny = fp3d::run_vehicle_work_query( 905, work_uid.load(), work_row.load(), 2500 );
+            work_ms = static_cast<int>( std::chrono::duration_cast<std::chrono::milliseconds>(
+                                            std::chrono::steady_clock::now() - began ).count() );
+            break;
+        }
+        case 65: {
+            // Vehicle work, part 3: the avatar back where it stood, six squares from the car.
+            if( work_from ) {
+                get_avatar().setpos( here, here.get_bub( *work_from ) );
+            }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 66: {
+            // Vehicle work, after: the avatar back, the car gone, the skill and the pack as before.
+            avatar &u = get_avatar();
+            if( work_from ) {
+                u.setpos( here, here.get_bub( *work_from ) );
+                work_from.reset();
+                u.set_skill_level( skill_id( "mechanics" ), work_skill[0] );
+                u.set_knowledge_level( skill_id( "mechanics" ), work_skill[1] );
+            }
+            u.remove_items_with( []( const item & it ) {
+                return it.has_var( "fp3d_work_test" );
+            } );
+            u.invalidate_crafting_inventory();
+            if( work_car != nullptr ) {
+                here.destroy_vehicle( work_car );
+                work_car = nullptr;
             }
             here.build_map_cache( p.z() );
             break;
@@ -9571,6 +9696,352 @@ static bool run_cargo_checks()
     return failed == 0;
 }
 
+// C6, the vehicle-work read (fp3d/vehicle_work.h, contracts/vehicle_work.md): a car's parts and, for a selected
+// part, what CDDA's vehicle screen would say about repairing, removing, mending and refilling it. The part is the
+// glovebox: its requirements are this fork's own data (mechanics 1; a screwdriver to remove it, tape to repair it).
+static bool run_vehicle_work_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  vehicle work: %-52s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    const auto scene = [&]( int number ) {
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return false;
+        }
+        hand_setup = number;
+        fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+        at = fp3d::wait_request( 20000, at->id );
+        return at && at->timed;
+    };
+    struct w_line {
+        std::string text;
+        int met = -1;
+    };
+    struct w_cmd {
+        std::string cmd;
+        bool ok = false;
+        int reason = -9;
+        std::string text;
+        int64_t time_s = -1;
+        std::vector<w_line> lines;
+    };
+    struct w_part {
+        int row = -1;
+        int mx = 0;
+        int my = 0;
+        int64_t vpart = 0;
+        std::string name;
+        std::string variant;
+        int hp = -1;
+        int damage = -1;
+        int flags = -1;
+        size_t faults = 0;
+    };
+    struct parsed {
+        bool valid = false;
+        bool ok = false;
+        int64_t id = 0;
+        std::string kind;
+        std::string error;
+        int64_t vehicle = 0;
+        std::string name;
+        std::vector<w_part> parts;
+        int parts_more = -1;
+        bool has_selected = false;
+        int sel_row = -1;
+        std::vector<int> here;
+        std::vector<w_cmd> cmds;
+        bool truncated = false;
+    };
+    const auto parse = []( const std::string & text ) {
+        parsed out;
+        try {
+            const JsonValue root = json_loader::from_string( text );
+            JsonObject jo = root.get_object();
+            jo.allow_omitted_members();
+            out.ok = jo.get_bool( "ok" );
+            out.id = jo.get_member( "id" ).get_int64();
+            out.kind = jo.get_string( "kind" );
+            if( !out.ok ) {
+                out.error = jo.get_string( "error" );
+                out.valid = true;
+                return out;
+            }
+            out.vehicle = jo.get_member( "vehicle" ).get_int64();
+            out.name = jo.get_string( "name" );
+            for( JsonObject p : jo.get_array( "parts" ) ) {
+                p.allow_omitted_members();
+                w_part part;
+                part.row = p.get_int( "row" );
+                JsonArray mount = p.get_array( "mount" );
+                part.mx = mount.get_int( 0 );
+                part.my = mount.get_int( 1 );
+                part.vpart = p.get_member( "vpart" ).get_int64();
+                part.name = p.get_string( "name" );
+                part.variant = p.get_string( "variant" );
+                part.hp = p.get_int( "hp" );
+                part.damage = p.get_int( "damage" );
+                part.flags = p.get_int( "flags" );
+                if( p.has_array( "faults" ) ) {
+                    part.faults = p.get_array( "faults" ).size();
+                }
+                out.parts.push_back( part );
+            }
+            out.parts_more = jo.get_int( "parts_more" );
+            out.truncated = jo.get_bool( "truncated" );
+            if( jo.has_object( "selected" ) ) {
+                JsonObject s = jo.get_object( "selected" );
+                s.allow_omitted_members();
+                out.has_selected = true;
+                out.sel_row = s.get_int( "row" );
+                JsonArray rows = s.get_array( "here" );
+                for( size_t i = 0; i < rows.size(); i++ ) {
+                    out.here.push_back( rows.get_int( i ) );
+                }
+                for( JsonObject c : s.get_array( "commands" ) ) {
+                    c.allow_omitted_members();
+                    w_cmd cmd;
+                    cmd.cmd = c.get_string( "cmd" );
+                    cmd.ok = c.get_bool( "ok" );
+                    cmd.reason = c.get_int( "reason" );
+                    cmd.text = c.get_string( "text" );
+                    cmd.time_s = c.get_member( "time_s" ).get_int64();
+                    for( JsonObject l : c.get_array( "lines" ) ) {
+                        l.allow_omitted_members();
+                        w_line line;
+                        line.text = l.get_string( "text" );
+                        line.met = l.get_int( "met" );
+                        cmd.lines.push_back( line );
+                    }
+                    out.cmds.push_back( cmd );
+                }
+            }
+            out.valid = true;
+        } catch( const std::exception & ) {
+            out.valid = false;
+        }
+        return out;
+    };
+    const auto await = []( uint64_t id ) {
+        const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        while( id != 0 && ms_since( t0 ) < 20000 * fp3d::slow_build ) {
+            if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
+                return *res;
+            }
+            std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
+        }
+        return std::string( "timeout" );
+    };
+    const auto command = []( const parsed & from, const std::string & key ) -> const w_cmd * {
+        for( const w_cmd &c : from.cmds ) {
+            if( c.cmd == key ) {
+                return &c;
+            }
+        }
+        return nullptr;
+    };
+    // Lines with this `met`; with `needle`, only those holding it.
+    const auto lines_with = []( const w_cmd * c, int met, const std::string &needle = std::string() ) {
+        int n = 0;
+        for( const w_line &l : c ? c->lines : std::vector<w_line>() ) {
+            n += l.met == met && ( needle.empty() || l.text.find( needle ) != std::string::npos ) ? 1 : 0;
+        }
+        return n;
+    };
+    const auto told = []( const w_cmd * c ) {
+        if( c == nullptr ) {
+            return std::string( "no such command" );
+        }
+        std::string out = c->cmd + ( c->ok ? " ok" : " not ok" ) + ", reason " + std::to_string( c->reason ) + ", " +
+                          std::to_string( c->time_s ) + " s, \"" + c->text + "\"";
+        for( const w_line &l : c->lines ) {
+            out += " | " + std::to_string( l.met ) + " " + l.text.substr( 0, 60 );
+        }
+        return out.substr( 0, 900 );
+    };
+    const uint32_t v_box = fp3d::intern_id( fp3d::id_kind::vpart, "fp3d_glovebox" );
+    // The scene's car in the newest snapshot: its uid, its part rows, the glovebox's row.
+    struct car_seen {
+        size_t named = 0;
+        uint64_t uid = 0;
+        std::vector<fp3d::vehicle_part_view> rows;
+        size_t own_rows = 0;
+        int box_row = -1;
+    };
+    const auto car_now = [&]() {
+        car_seen out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        for( const fp3d::vehicle_view &v : s->vehicles ) {
+            if( v.name != "fp3d work car" ) {
+                continue;
+            }
+            out.named++;
+            out.uid = v.uid;
+            out.rows = v.parts;
+            out.own_rows = 0;
+            for( size_t i = 0; i < v.parts.size(); i++ ) {
+                out.own_rows += ( v.parts[i].state & fp3d::part_gap_filler ) == 0 ? 1 : 0;
+                if( v.parts[i].vpart == v_box ) {
+                    out.box_row = static_cast<int>( i );
+                }
+            }
+        }
+        return out;
+    };
+
+    const bool placed = scene( 63 );
+    const int env = work_env.load();
+    const car_seen car = car_now();
+    check( placed && env == 15 && car.named == 1 && car.uid != 0 && car.box_row >= 0 && v_box != 0,
+           "scene: a car, its glovebox damaged, the avatar beside it",
+           std::to_string( env ) + " of 15 (1 light, 2 morale, 4 damaged, 8 beside it), " +
+           std::to_string( car.rows.size() ) + " part rows, the glovebox's " + std::to_string( car.box_row ) );
+    if( !placed || car.uid == 0 || car.box_row < 0 ) {
+        scene( 66 );
+        return false;
+    }
+    work_uid = car.uid;
+    work_row = car.box_row;
+
+    check( fp3d::post_vehicle_work_query( 0, -1 ) == 0 && fp3d::post_vehicle_work_query( car.uid, -2 ) == 0 &&
+           fp3d::post_vehicle_work_query( car.uid, fp3d::max_work_part_row + 1 ) == 0 &&
+           fp3d::post_vehicle_work_query( fp3d::max_item_uid + 1, -1 ) == 0,
+           "refused unposted: no uid, a part row out of range", "" );
+
+    // The parts alone.
+    const uint64_t id_all = fp3d::post_vehicle_work_query( car.uid, -1 );
+    const std::string all_text = await( id_all );
+    const parsed all = parse( all_text );
+    size_t same = 0;
+    const w_part *box = nullptr;
+    for( const w_part &p : all.parts ) {
+        if( p.row >= 0 && static_cast<size_t>( p.row ) < car.rows.size() ) {
+            const fp3d::vehicle_part_view &row = car.rows[p.row];
+            same += row.mount_x == p.mx && row.mount_y == p.my && row.vpart == static_cast<uint32_t>( p.vpart ) ? 1 : 0;
+        }
+        if( p.row == car.box_row ) {
+            box = &p;
+        }
+    }
+    check( id_all != 0 && all.valid && all.ok && all.id == static_cast<int64_t>( id_all ) &&
+           all.kind == "vehicle_work" && all.vehicle == static_cast<int64_t>( car.uid ) &&
+           all.name == "fp3d work car" && !all.parts.empty() && all.parts.size() == car.own_rows &&
+           same == car.own_rows && all.parts_more == 0 && !all.has_selected && !all.truncated,
+           "the parts: every part row of the snapshot, none selected",
+           std::to_string( all.parts.size() ) + " parts for " + std::to_string( car.own_rows ) + " rows, " +
+           std::to_string( same ) + " with the row's mount and type, " + std::to_string( all_text.size() ) + " bytes" +
+           ( all.valid ? "" : ": " + all_text.substr( 0, 200 ) ) );
+    check( box != nullptr && box->name == "glovebox" && box->hp > 0 && box->hp < 100 && box->damage > 0 &&
+           ( box->flags & 3 ) == 2 && box->faults == 0,
+           "the damaged glovebox: name, health, damage, repairable",
+           box ? box->name + ", hp " + std::to_string( box->hp ) + ", damage " + std::to_string( box->damage ) +
+           ", flags " + std::to_string( box->flags ) + ", variant \"" + box->variant + "\"" : "not listed" );
+
+    // The glovebox selected, with no mechanics skill.
+    const parsed bare = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
+    const bool order = bare.cmds.size() == 4 && bare.cmds[0].cmd == "r" && bare.cmds[1].cmd == "o" &&
+                       bare.cmds[2].cmd == "m" && bare.cmds[3].cmd == "f";
+    check( bare.valid && bare.ok && bare.has_selected && bare.sel_row == car.box_row && order &&
+           bare.here.size() >= 2 && std::count( bare.here.begin(), bare.here.end(), car.box_row ) == 1 &&
+           bare.parts.size() == all.parts.size(),
+           "selected: the rows on its square, and r, o, m, f",
+           std::to_string( bare.here.size() ) + " rows there, " + std::to_string( bare.cmds.size() ) + " commands" );
+    const w_cmd *r0 = command( bare, "r" );
+    const w_cmd *o0 = command( bare, "o" );
+    const w_cmd *m0 = command( bare, "m" );
+    const w_cmd *f0 = command( bare, "f" );
+    check( r0 && !r0->ok && r0->reason == 0 && r0->time_s > 0 && lines_with( r0, 2, "mechanics" ) == 1 &&
+           lines_with( r0, 0, "Skills required:" ) == 1 && lines_with( r0, 0, "Time required:" ) == 1,
+           "repair without the skill: not ok, the skill line not met", told( r0 ) );
+    check( o0 && !o0->ok && o0->reason == 0 && o0->time_s > 0 && o0->time_s <= 300 &&
+           lines_with( o0, 2, "mechanics" ) == 1 && lines_with( o0, 0, "yield" ) == 1,
+           "remove without the skill: not ok, what it yields", told( o0 ) );
+    check( m0 && !m0->ok && m0->reason == 1 && m0->lines.empty() && f0 && !f0->ok && f0->reason == 1 &&
+           f0->lines.empty(), "mend and refill: nothing here to mend or fill", told( m0 ) + " ; " + told( f0 ) );
+
+    // Skilled, with a screwdriver and duct tape.
+    const bool equipped = scene( 64 );
+    const parsed able = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
+    const w_cmd *r1 = command( able, "r" );
+    const w_cmd *o1 = command( able, "o" );
+    check( equipped && r1 && r1->ok && r1->reason == 0 && lines_with( r1, 2 ) == 0 &&
+           lines_with( r1, 1, "mechanics" ) == 1 && lines_with( r1, 1 ) >= 3 && r1->time_s > 0,
+           "repair with the skill and tape: ok, every line met", told( r1 ) );
+    check( o1 && o1->ok && o1->reason == 0 && lines_with( o1, 2 ) == 0 && lines_with( o1, 1, "mechanics" ) == 1 &&
+           lines_with( o1, 1 ) >= 3 && o1->time_s > 0 && o0 && o1->time_s <= o0->time_s,
+           "remove with the skill and a screwdriver: ok, every line met", told( o1 ) );
+    // No line is folded: the off-screen screen is given a wide message window.
+    size_t longest = 0;
+    for( const w_cmd &c : able.cmds ) {
+        for( const w_line &l : c.lines ) {
+            longest = std::max( longest, l.text.size() );
+        }
+    }
+    check( longest > 40 && lines_with( r1, 0, "Description" ) == 1 && lines_with( r1, 0, "compartment" ) == 1,
+           "lines: one requirement a line, the description last", std::to_string( longest ) + " bytes the longest" );
+
+    // The same within 2500 bytes, read on the sim thread in scene 64.
+    const parsed tiny = parse( work_tiny );
+    check( all_text.size() > 2500 && tiny.valid && tiny.ok && tiny.truncated && work_tiny.size() <= 2500 &&
+           tiny.parts.size() < car.own_rows &&
+           tiny.parts.size() + static_cast<size_t>( tiny.parts_more ) == car.own_rows && tiny.has_selected &&
+           tiny.cmds.size() == 4, "in 2500 bytes: part entries go from the end",
+           std::to_string( work_tiny.size() ) + " bytes, " + std::to_string( tiny.parts.size() ) + " parts, " +
+           std::to_string( tiny.parts_more ) + " more; the query took " + std::to_string( work_ms.load() ) +
+           " ms" );
+
+    // Errors.
+    const parsed gone = parse( await( fp3d::post_vehicle_work_query( car.uid + 100000, -1 ) ) );
+    const parsed no_row = parse( await( fp3d::post_vehicle_work_query( car.uid, 4000 ) ) );
+    check( gone.valid && !gone.ok && gone.kind == "vehicle_work" && gone.error == "no such vehicle" &&
+           no_row.valid && !no_row.ok && no_row.error == "no such part",
+           "an unknown uid, a row it doesn't have: errors", gone.error + " / " + no_row.error );
+
+    // One at a time: posted during the wait menu, a second one is refused; the first runs back at the main loop.
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        scene( 66 );
+        return false;
+    }
+    fp3d::ui_answer wait;
+    wait.id = r->id;
+    wait.action = "wait";
+    fp3d::answer( wait );
+    std::optional<fp3d::ui_request> prompt = fp3d::wait_request( 5000, r->id );
+    uint64_t first = 0;
+    uint64_t second = 1;
+    if( prompt && !prompt->timed ) {
+        first = fp3d::post_vehicle_work_query( car.uid, -1 );
+        second = fp3d::post_vehicle_work_query( car.uid, car.box_row );
+    }
+    check( prompt && !prompt->timed && first != 0 && second == 0, "a second pending one refused",
+           prompt ? std::string( fp3d::kind_name( prompt->kind ) ) + " prompt" : "no prompt" );
+    for( int i = 0; i < 10 && prompt && !prompt->timed; i++ ) {
+        fp3d::ui_answer cancel;
+        cancel.id = prompt->id;
+        cancel.cancel = true;
+        fp3d::answer( cancel );
+        prompt = fp3d::wait_request( 5000, prompt->id );
+    }
+    const parsed held = parse( await( first ) );
+    check( prompt && prompt->timed && held.valid && held.ok && held.id == static_cast<int64_t>( first ),
+           "held during a prompt, then answered", std::to_string( first ) );
+
+    // From where the avatar stood before: no part of the car within a square.
+    const bool back = scene( 65 );
+    const parsed away = parse( await( fp3d::post_vehicle_work_query( car.uid, car.box_row ) ) );
+    check( back && away.valid && !away.ok && away.error == "too far", "from six squares away: too far", away.error );
+    check( scene( 66 ), "after: the car gone, skill and pack as before", "" );
+    return failed == 0;
+}
+
 // The off hand lets go of an item that has grown too heavy for one hand (here: filled up); it stays in its pocket
 // (lead-ui, 2026-11-15).
 static bool run_offhand_weight_checks()
@@ -10976,7 +11447,8 @@ int main()
     const bool driving_ok = first_aid_ok && run_driving_checks();
     const bool lean_ok = driving_ok && run_lean_checks();
     const bool cargo_ok = lean_ok && run_cargo_checks();
-    const bool names_ok = cargo_ok && run_name_checks();
+    const bool work_ok = cargo_ok && run_vehicle_work_checks();
+    const bool names_ok = work_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -11043,6 +11515,7 @@ int main()
     std::printf( "driving: %s\n", driving_ok ? "ok" : "BAD" );
     std::printf( "lean: %s\n", lean_ok ? "ok" : "BAD" );
     std::printf( "cargo: %s\n", cargo_ok ? "ok" : "BAD" );
+    std::printf( "vehicle work: %s\n", work_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
     // the game's turns got slower.
@@ -11059,6 +11532,6 @@ int main()
            siphon_ok &&
            shoot_ok && items_ok && cooking_ok && cheats_ok && stairs_ok && guns_ok && combat_ok && range_ok &&
            resume_ok && throw_pour_ok && worlds_ok && boot_ok && data_check_ok && random_start_ok && weather_ok && physics_ok && weather_cheat_ok && interrupt_ok && furniture_ok && consume_ok && offhand_ok && lying_ok && character_ok &&
-           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok && driving_ok && lean_ok && cargo_ok ?
+           peek_ok && number_ok && actions_ok && names_ok && running_ok && gunmods_ok && first_aid_ok && driving_ok && lean_ok && cargo_ok && work_ok ?
            EXIT_SUCCESS : EXIT_FAILURE;
 }

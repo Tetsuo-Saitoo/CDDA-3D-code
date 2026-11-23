@@ -1119,6 +1119,62 @@ bool veh_interact::move_in_list( int &pos, const std::string &action, const int 
     return true;
 }
 
+// FP3D: what repairing `pt` needs (replacing it when it is broken), as do_repair shows it: the text is added to
+// nmsg, true when the requirements are met. These lines stood in do_repair's loop and are unchanged, so that the
+// vehicle-work read (src/fp3d/vehicle_work.cpp) asks the same code.
+bool veh_interact::repair_reqs( map &here, vehicle_part &pt, std::string &nmsg )
+{
+    avatar &player_character = get_avatar();
+    const vpart_info &vp = pt.info();
+
+    // this will always be set, but the gcc thinks that sometimes it won't be
+    bool ok = true;
+    if( pt.is_broken() ) {
+        ok = format_reqs( nmsg, vp.install_requirements(), vp.install_skills,
+                          vp.install_time( player_character ) );
+
+        if( pt.info().has_flag( "NEEDS_JACKING" ) ) {
+
+            nmsg += _( "<color_white>Additional requirements:</color>\n" );
+            std::pair<bool, std::string> res = calc_lift_requirements( here, pt.info() );
+            if( !res.first ) {
+                ok = false;
+            }
+            nmsg += res.second;
+        }
+        if( pt.has_flag( vp_flag::carried_flag ) ) {
+            nmsg += colorize( _( "\nUnracking is required before replacing this part.\n" ),
+                              c_red );
+            ok = false;
+        }
+
+    } else {
+        if( !pt.is_repairable() ) {
+            nmsg += colorize( _( "This part cannot be repaired.\n" ), c_light_red );
+            ok = false;
+        } else if( veh->has_part( "NO_MODIFY_VEHICLE" ) && !vp.has_flag( "SIMPLE_PART" ) ) {
+            nmsg += colorize( _( "This vehicle cannot be repaired.\n" ), c_light_red );
+            ok = false;
+        } else {
+            const int levels = pt.base.repairable_levels();
+            ok = format_reqs( nmsg, vp.repair_requirements() * levels, vp.repair_skills,
+                              vp.repair_time( player_character ) * levels );
+        }
+    }
+
+    bool would_prevent_flying = veh->would_repair_prevent_flyable( pt, player_character );
+    if( would_prevent_flying &&
+        !player_character.has_proficiency( proficiency_prof_aircraft_mechanic ) ) {
+        nmsg += string_format(
+                    _( "\n<color_yellow>You require the \"%s\" proficiency to repair this part safely!</color>\n\n" ),
+                    proficiency_prof_aircraft_mechanic->name() );
+    }
+
+    const nc_color desc_color = pt.is_broken() ? c_dark_gray : c_light_gray;
+    vp.format_description( nmsg, desc_color, getmaxx( w_msg ) - 4 );
+    return ok;
+}
+
 void veh_interact::do_repair( map &here )
 {
     task_reason reason = cant_do( here,  'r' );
@@ -1171,51 +1227,10 @@ void veh_interact::do_repair( map &here )
 
         std::string nmsg;
 
-        // this will always be set, but the gcc thinks that sometimes it won't be
-        bool ok = true;
-        if( pt.is_broken() ) {
-            ok = format_reqs( nmsg, vp.install_requirements(), vp.install_skills,
-                              vp.install_time( player_character ) );
-
-            if( pt.info().has_flag( "NEEDS_JACKING" ) ) {
-
-                nmsg += _( "<color_white>Additional requirements:</color>\n" );
-                std::pair<bool, std::string> res = calc_lift_requirements( here, pt.info() );
-                if( !res.first ) {
-                    ok = false;
-                }
-                nmsg += res.second;
-            }
-            if( pt.has_flag( vp_flag::carried_flag ) ) {
-                nmsg += colorize( _( "\nUnracking is required before replacing this part.\n" ),
-                                  c_red );
-                ok = false;
-            }
-
-        } else {
-            if( !pt.is_repairable() ) {
-                nmsg += colorize( _( "This part cannot be repaired.\n" ), c_light_red );
-                ok = false;
-            } else if( veh->has_part( "NO_MODIFY_VEHICLE" ) && !vp.has_flag( "SIMPLE_PART" ) ) {
-                nmsg += colorize( _( "This vehicle cannot be repaired.\n" ), c_light_red );
-                ok = false;
-            } else {
-                const int levels = pt.base.repairable_levels();
-                ok = format_reqs( nmsg, vp.repair_requirements() * levels, vp.repair_skills,
-                                  vp.repair_time( player_character ) * levels );
-            }
-        }
-
+        // FP3D: the requirements, the flightworthy warning and the description are written by repair_reqs:
+        // the lines that stood here, unchanged, which the vehicle-work read asks too.
+        bool ok = repair_reqs( here, pt, nmsg );
         bool would_prevent_flying = veh->would_repair_prevent_flyable( pt, player_character );
-        if( would_prevent_flying &&
-            !player_character.has_proficiency( proficiency_prof_aircraft_mechanic ) ) {
-            nmsg += string_format(
-                        _( "\n<color_yellow>You require the \"%s\" proficiency to repair this part safely!</color>\n\n" ),
-                        proficiency_prof_aircraft_mechanic->name() );
-        }
-
-        const nc_color desc_color = pt.is_broken() ? c_dark_gray : c_light_gray;
-        vp.format_description( nmsg, desc_color, getmaxx( w_msg ) - 4 );
 
         msg = colorize( nmsg, c_light_gray );
 

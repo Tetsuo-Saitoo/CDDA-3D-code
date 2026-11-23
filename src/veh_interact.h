@@ -49,6 +49,11 @@ class ui_adaptor;
 class vehicle;
 struct vehicle_part;
 
+namespace fp3d // FP3D
+{
+struct vehicle_work_access; // FP3D: the vehicle-work read (src/fp3d/vehicle_work.cpp)
+} // namespace fp3d
+
 // For marking 'leaking' tanks/reactors/batteries
 const std::string leak_marker = "<color_red>*</color>";
 
@@ -67,6 +72,7 @@ class veh_interact
         static void complete_vehicle( map &here, Character &you );
 
     private:
+        friend struct fp3d::vehicle_work_access; // FP3D: asks the checks below with this screen never shown
         explicit veh_interact( map &here, vehicle &veh, const point_rel_ms &p = point_rel_ms::zero );
         ~veh_interact();
 
@@ -263,6 +269,8 @@ class veh_interact
 
         //do_remove supporting operation, writes requirements to ui
         bool can_remove_part( map &here, int idx, const Character &you );
+        // FP3D: what repairing one part needs, as do_repair shows it (see veh_interact.cpp).
+        bool repair_reqs( map &here, vehicle_part &pt, std::string &nmsg );
         //do install support, writes requirements to ui
         bool update_part_requirements( map &here );
 

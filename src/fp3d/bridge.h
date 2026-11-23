@@ -383,6 +383,12 @@ uint64_t post_recipe_query( const item_ref &container, const ui_point &pos );
 // The query's id, or 0 if refused: a character query pending already (one at a time), max_pending_queries pending,
 // or after shutdown.
 uint64_t post_character_query();
+// Vehicle-work queries (C6, fp3d/vehicle_work.h): what can be done to a vehicle next to the avatar, run like
+// recipe queries. Client side. `vehicle`: the snapshot's vehicle uid; `part`: a row of its parts, -1 for none.
+// The query's id, or 0 if refused: a uid of 0 or above max_item_uid, a part below -1 or above
+// max_work_part_row, a vehicle-work query pending already (one at a time), max_pending_queries pending, or
+// after shutdown.
+uint64_t post_vehicle_work_query( uint64_t vehicle, int part );
 // Client side. The result (once), nullopt while it is pending or for an unknown or already taken id.
 std::optional<std::string> take_query_result( uint64_t id );
 size_t pending_queries();

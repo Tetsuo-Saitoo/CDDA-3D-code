@@ -243,6 +243,32 @@ uint64_t next_snapshot_seq()
     return state.seq + 1;
 }
 
+vehicle *vehicle_by_uid( map &here, uint64_t uid )
+{
+    if( uid == 0 ) {
+        return nullptr;
+    }
+    for( const wrapped_vehicle &wv : here.get_vehicles() ) {
+        const auto known = state.vehicles.find( wv.v );
+        if( known != state.vehicles.end() && known->second == uid ) {
+            return wv.v;
+        }
+    }
+    return nullptr;
+}
+
+std::vector<int> vehicle_part_rows( const vehicle &v )
+{
+    std::vector<int> rows;
+    for( const vpart_reference &vp : v.get_all_parts() ) {
+        if( rows.size() >= max_vehicle_parts ) {
+            break;
+        }
+        rows.push_back( static_cast<int>( vp.part_index() ) );
+    }
+    return rows;
+}
+
 namespace
 {
 uint64_t vehicle_uid( const vehicle *v )

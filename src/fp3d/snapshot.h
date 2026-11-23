@@ -19,6 +19,8 @@
 #include "fp3d/bridge.h"
 
 class Creature;
+class map;
+class vehicle;
 
 namespace fp3d
 {
@@ -593,6 +595,13 @@ constexpr size_t max_sheet_id_bytes = 64;
 // lists: effects, proficiencies being learned, known ones, traits, bionics, speed modifiers, skills. Only the
 // fixed fields left can still be over `max_bytes` (a few KB; the bridge then answers "too large").
 std::string run_character_query( uint64_t query_id, size_t max_bytes );
+
+// Sim side. The vehicle in the reality bubble that a snapshot gave `uid` to, nullptr when there is none. Looks
+// up only: a vehicle no snapshot has listed yet has no uid and is never found.
+vehicle *vehicle_by_uid( map &here, uint64_t uid );
+// Sim side. CDDA's part index of each of the vehicle's own part rows, in the order the snapshot lists them
+// (vehicle_view::parts before its gap fillers), so a row number from a client finds its part.
+std::vector<int> vehicle_part_rows( const vehicle &v );
 std::string character_query_error_json( uint64_t query_id, const std::string &error );
 
 } // namespace fp3d
