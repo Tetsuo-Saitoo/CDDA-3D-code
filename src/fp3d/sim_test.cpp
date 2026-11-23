@@ -9853,6 +9853,14 @@ static bool run_cargo_checks()
             return out;
         }
         for( const fp3d::vehicle_view &v : s->vehicles ) {
+            // The car the avatar sits in: a vehicle the map has parked nearby can have a glovebox of its own.
+            bool sat_in = false;
+            for( const fp3d::vehicle_part_view &row : v.parts ) {
+                sat_in = sat_in || ( v.pos.x + row.dx == s->player.pos.x && v.pos.y + row.dy == s->player.pos.y );
+            }
+            if( !sat_in ) {
+                continue;
+            }
             for( const fp3d::vehicle_part_view &row : v.parts ) {
                 out.rows += row.vpart == v_box ? 1 : 0;
             }
@@ -10706,12 +10714,21 @@ static bool run_vehicle_work_checks()
            fit.picked.ok && fit.picked.reason == 0 && fit.picked.time_s > 0 && lines_with( &fit.picked, 2 ) == 0 &&
            lines_with( &fit.picked, 1, "mechanics" ) == 1 && lines_with( &fit.picked, 1 ) >= 3,
            "install, the glovebox picked: ok, every line met", told( &fit.picked ) );
-    // Six squares to the car's side: CDDA lists the same types, and says why this one can't go there.
-    const parsed aside = parse( await( fp3d::post_vehicle_work_query( ask_install( 0, 6, v_box ) ) ) );
+    // The square beside the car's outermost part: CDDA lists the same types, and says why this one can't go there.
+    fp3d::vehicle_part_view rim = was;
+    for( const fp3d::vehicle_part_view &row : stripped.rows ) {
+        if( ( row.state & fp3d::part_gap_filler ) == 0 && row.mount_y >= rim.mount_y ) {
+            rim.mount_x = row.mount_x;
+            rim.mount_y = row.mount_y;
+        }
+    }
+    rim.mount_y += 1;
+    const parsed aside = parse( await( fp3d::post_vehicle_work_query( ask_install( rim.mount_x, rim.mount_y,
+                                v_box ) ) ) );
     check( aside.valid && aside.ok && aside.has_install && aside.has_picked && !aside.picked.ok &&
            bits_of( aside, v_box ) == 1 && lines_with( &aside.picked, 0, "Cannot install due to" ) == 1 &&
            lines_with( &aside.picked, 2 ) >= 1,
-           "install away from the car: listed, doesn't fit, CDDA says why",
+           "install beside the car: listed, doesn't fit, CDDA says why",
            "bits " + std::to_string( bits_of( aside, v_box ) ) + ", reason " + std::to_string( aside.inst_reason ) +
            " " + aside.inst_text + "; " + told( &aside.picked ) );
     const parsed strange = parse( await( fp3d::post_vehicle_work_query( ask_install( was.mount_x, was.mount_y,
@@ -10721,9 +10738,7 @@ static bool run_vehicle_work_checks()
            "install, a type CDDA doesn't list: not ok", told( &strange.picked ) );
 
     // The action: a row with it isn't queued; where it doesn't fit and a type CDDA doesn't list are refused.
-    fp3d::vehicle_part_view nowhere = was;
-    nowhere.mount_x = 0;
-    nowhere.mount_y = 6;
+    const fp3d::vehicle_part_view nowhere = rim;
     fp3d::vehicle_part_view unknown = was;
     unknown.vpart = fp3d::max_work_vpart;
     const outcome misfit = work( car.uid, -1, 'i', false, &nowhere );
@@ -10735,6 +10750,21 @@ static bool run_vehicle_work_checks()
            !unlisted.done && unlisted.why == "That can't be installed here." && unfitted.own_rows == stripped.own_rows,
            "action, install: a row with it, a misfit, an unlisted type refused", shown( misfit ) + " / " +
            shown( unlisted ) );
+    // Forty squares off is no square of the car's nor next to one: CDDA's screen isn't sent looking there, by
+    // the read or by the action.
+    fp3d::vehicle_part_view remote_square = was;
+    remote_square.mount_x = 0;
+    remote_square.mount_y = 40;
+    const parsed remote_read = parse( await( fp3d::post_vehicle_work_query( ask_install( 0, 40, v_box ) ) ) );
+    const outcome remote_work = work( car.uid, -1, 'i', false, &remote_square );
+    check( remote_read.valid && remote_read.ok && remote_read.has_install && remote_read.inst_reason == 1 &&
+           remote_read.inst_text == "Cannot install any part here." && remote_read.types.empty() &&
+           remote_read.types_more == 0 && remote_read.has_picked && !remote_read.picked.ok &&
+           remote_read.picked.reason == 1 && remote_read.picked.lines.empty() && remote_work.results == 1 &&
+           !remote_work.done && remote_work.prompts == 0 && remote_work.why == remote_read.inst_text,
+           "install far from the car: nothing listed, the action refused",
+           std::to_string( remote_read.types.size() ) + " types, \"" + remote_read.inst_text + "\" / " +
+           shown( remote_work ) );
     // CDDA's own activity puts the glovebox back on its square.
     const outcome fitted = work( car.uid, -1, 'i', false, &was );
     const car_seen refitted = car_now();

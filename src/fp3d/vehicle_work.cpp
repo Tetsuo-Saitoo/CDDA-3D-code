@@ -2,6 +2,7 @@
 #include "fp3d/vehicle_work.h"
 
 #include <algorithm>
+#include <cstdlib>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -231,6 +232,19 @@ std::optional<gate> examine_gate( const Character &u )
         return gate{ "mounted", _( "You cannot interact with a vehicle while mounted." ) };
     }
     return std::nullopt;
+}
+
+// Whether the square at `mount` is one of the vehicle's own or next to one. A part can only ever go on such a
+// square (vehicle::can_mount wants a part beside a new one), and CDDA's screen is not sent looking anywhere else.
+bool by_the_vehicle( const vehicle &veh, const point_rel_ms &mount )
+{
+    for( const vpart_reference &vp : veh.get_all_parts() ) {
+        const point_rel_ms at = vp.mount_pos();
+        if( std::abs( at.x() - mount.x() ) <= 1 && std::abs( at.y() - mount.y() ) <= 1 ) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // CDDA opens another screen for an appliance (game::exam_appliance) and none for a summoned vehicle.
@@ -879,7 +893,20 @@ std::string read_work( uint64_t query_id, uint64_t vehicle_uid, int part_row,
         w.has_install = true;
         w.install_x = install->x();
         w.install_y = install->y();
-        vehicle_work_access::fill_install( here, *veh, *install, picked, w );
+        if( by_the_vehicle( *veh, *install ) ) {
+            vehicle_work_access::fill_install( here, *veh, *install, picked, w );
+        } else {
+            // Away from the vehicle: CDDA's answer for a square nothing can go on, without its screen.
+            w.install_reason = static_cast<int>( task_reason::INVALID_TARGET );
+            w.install_text = vehicle_work_access::install_refusal( task_reason::INVALID_TARGET );
+            if( picked != 0 ) {
+                w.has_type = true;
+                w.type_vpart = picked;
+                w.type_command.cmd = 'i';
+                w.type_command.reason = w.install_reason;
+                w.type_command.text = w.install_text;
+            }
+        }
     }
 
     std::string out = write_work( query_id, w, false );
@@ -952,9 +979,12 @@ bool run_vehicle_work( avatar &u )
         return answer( false, _( "That vehicle is too far away." ) );
     }
     if( a->cmd == 'i' ) {
+        const point_rel_ms mount( a->mount_x, a->mount_y );
+        if( !by_the_vehicle( *veh, mount ) ) {
+            return answer( false, vehicle_work_access::install_refusal( task_reason::INVALID_TARGET ) );
+        }
         std::string why;
-        const bool started = vehicle_work_access::start_install( here, *veh, point_rel_ms( a->mount_x, a->mount_y ),
-                             a->vpart, why );
+        const bool started = vehicle_work_access::start_install( here, *veh, mount, a->vpart, why );
         return answer( started, started ? std::string() : why );
     }
     const std::vector<int> rows = vehicle_part_rows( *veh );
