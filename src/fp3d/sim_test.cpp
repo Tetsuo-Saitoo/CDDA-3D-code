@@ -55,6 +55,7 @@
 #include "fp3d/cheats.h"
 #include "fp3d/cooking.h"
 #include "fp3d/game_access.h"
+#include "fp3d/glovebox.h"
 #include "fp3d/bullet_paths.h"
 #include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
@@ -99,6 +100,7 @@
 #include "type_id.h"
 #include "uilist.h"
 #include "units.h"
+#include "veh_type.h"
 #include "vehicle.h"
 #include "vpart_position.h"
 #include "vpart_range.h"
@@ -333,6 +335,26 @@ std::atomic<uint64_t> cg_big_uid{ 0 };
 std::atomic<int> cg_free{ 0 };
 std::atomic<int> cg_free_dx{ 0 };
 std::atomic<int> cg_free_dy{ 0 };
+// Glovebox checks (scenes 61, 62). glove_checked: prototypes looked at, the first glove_checked_with of which get a
+// glovebox and the rest none; glove_kinds has a bit for each that is as expected, glove_protos is how many
+// prototypes have one in all. The scene's fresh car: how many gloveboxes it has, what is around the glovebox (bit 1
+// a windshield on its tile, 2 a seat on the tile behind it, 4 that seat is beside the driver's), where it is from
+// the avatar on the driver's seat, and the bottle put into it.
+const std::array<const char *, 13> glove_checked = { {
+        "car", "pickup", "ambulance", "bus", "semi_truck", "humvee",
+        "bicycle", "motorcycle", "golf_cart", "shopping_cart", "truck_trailer", "2seater2", "tractor_plow"
+    }
+};
+constexpr size_t glove_checked_with = 6;
+std::atomic<int> glove_kinds{ 0 };
+std::atomic<int> glove_protos{ 0 };
+std::atomic<int> glove_count{ 0 };
+std::atomic<int> glove_tile{ 0 };
+std::atomic<int> glove_dx{ 0 };
+std::atomic<int> glove_dy{ 0 };
+std::atomic<uint64_t> glove_bottle_uid{ 0 };
+vehicle *glove_car = nullptr;                    // sim thread only: scene 61's car, until scene 62
+std::optional<tripoint_abs_ms> glove_from;       // sim thread only: where the avatar stood before scene 61
 // The lying-container checks' scene (hand_setup 22).
 std::atomic<uint64_t> lc_pack_uid{ 0 };         // a backpack west holding a rock and 2 empty bottles
 std::atomic<uint64_t> lc_rock_uid{ 0 };         // the rock
@@ -1999,6 +2021,106 @@ void observe()
             cargo_centre.reset();
             cargo_car = nullptr;
             cargo_part = -1;
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 61: {
+            // Glovebox: floor 12 squares around, a car fresh from its prototype six squares east. A plastic bottle
+            // goes into its glovebox and the avatar sits on the driver's seat. Also looked up: which prototypes
+            // have a glovebox.
+            avatar &u = get_avatar();
+            g->clear_zombies();
+            for( int dx = -12; dx <= 12; dx++ ) {
+                for( int dy = -12; dy <= 12; dy++ ) {
+                    const tripoint_bub_ms q = p + tripoint_rel_ms( dx, dy, 0 );
+                    if( !here.inbounds( q ) ) {
+                        continue;
+                    }
+                    if( const optional_vpart_position vp = here.veh_at( q ) ) {
+                        here.destroy_vehicle( &vp->vehicle() );
+                    }
+                    here.ter_set( q, ter_t_pavement );
+                    here.furn_set( q, furn_str_id::NULL_ID() );
+                    here.i_clear( q );
+                    here.clear_fields( q );
+                }
+            }
+            const auto boxes_of = []( const vehicle & veh ) {
+                int n = 0;
+                for( int i = 0; i < veh.part_count(); i++ ) {
+                    n += veh.part( i ).info().id == fp3d::glovebox_part() ? 1 : 0;
+                }
+                return n;
+            };
+            int with = 0;
+            for( const vehicle_prototype &proto : vehicles::get_all_prototypes() ) {
+                with += proto.blueprint && boxes_of( *proto.blueprint ) > 0 ? 1 : 0;
+            }
+            glove_protos = with;
+            int kinds = 0;
+            for( size_t i = 0; i < glove_checked.size(); i++ ) {
+                const vproto_id id( glove_checked[i] );
+                const int n = id.is_valid() && id->blueprint ? boxes_of( *id->blueprint ) : -1;
+                kinds |= n == ( i < glove_checked_with ? 1 : 0 ) ? 1 << i : 0;
+            }
+            glove_kinds = kinds;
+            glove_count = 0;
+            glove_tile = 0;
+            glove_dx = 0;
+            glove_dy = 0;
+            glove_bottle_uid = 0;
+            glove_from = here.get_abs( p );
+            vehicle *car = here.add_vehicle( vehicle_prototype_car, p + tripoint_rel_ms( 6, 0, 0 ), 0_degrees, 100, 2,
+                                             false, true );
+            glove_car = car;
+            if( car != nullptr ) {
+                int box = -1;
+                int controls = -1;
+                for( int i = 0; i < car->part_count(); i++ ) {
+                    const vpart_info &vpi = car->part( i ).info();
+                    if( vpi.id == fp3d::glovebox_part() ) {
+                        box = i;
+                    }
+                    if( controls < 0 && vpi.has_flag( "CONTROLS" ) ) {
+                        controls = i;
+                    }
+                }
+                glove_count = boxes_of( *car );
+                if( box >= 0 && controls >= 0 ) {
+                    vehicle_part &space = car->part( box );
+                    const point_rel_ms behind = space.mount - point::east;
+                    const point_rel_ms driver = car->part( controls ).mount;
+                    int tile = 0;
+                    for( int i = 0; i < car->part_count(); i++ ) {
+                        const vehicle_part &vp = car->part( i );
+                        tile |= vp.mount == space.mount && vp.info().has_flag( "WINDSHIELD" ) ? 1 : 0;
+                        tile |= vp.mount == behind && vp.info().has_flag( "SEAT" ) ? 2 : 0;
+                    }
+                    tile |= behind.x() == driver.x() && std::abs( behind.y() - driver.y() ) == 1 ? 4 : 0;
+                    glove_tile = tile;
+                    const std::optional<vehicle_stack::iterator> in =
+                        car->add_item( here, space, item( itype_bottle_plastic ) );
+                    glove_bottle_uid = in ? fp3d::item_handle( **in ) : 0;
+                    const tripoint_bub_ms seat = car->bub_part_pos( here, car->part( controls ) );
+                    const tripoint_bub_ms at = car->bub_part_pos( here, space );
+                    u.setpos( here, seat );
+                    glove_dx = at.x() - seat.x();
+                    glove_dy = at.y() - seat.y();
+                }
+            }
+            here.build_map_cache( p.z() );
+            break;
+        }
+        case 62: {
+            // Glovebox, after: the avatar back where it stood, the car gone.
+            if( glove_from ) {
+                get_avatar().setpos( here, here.get_bub( *glove_from ) );
+                glove_from.reset();
+            }
+            if( glove_car != nullptr ) {
+                here.destroy_vehicle( glove_car );
+                glove_car = nullptr;
+            }
             here.build_map_cache( p.z() );
             break;
         }
@@ -6532,9 +6654,11 @@ static bool run_combat_checks()
         spear.zx = -2;
         spear.melee = "spear_wood";
         s = swing_run( spear, "fp3d_attack_main_aim_LEFT", aimed_at( "head" ) );
-        check( s.back && at( s, -2, 0 ) && s.swings[0].range == 2 && s.after.moves < s.before.moves,
+        // Time spent: fewer moves, or a turn gone by (a strike that costs exactly a turn's moves leaves as many).
+        check( s.back && at( s, -2, 0 ) && s.swings[0].range == 2 &&
+               ( s.after.turn > s.before.turn || s.after.moves < s.before.moves ),
                "a spear strikes 2 squares off", shown( s ) + ", moves " + std::to_string( s.before.moves ) + " -> " +
-               std::to_string( s.after.moves ) );
+               std::to_string( s.after.moves ) + ", turns +" + std::to_string( s.after.turn - s.before.turn ) );
         scene short_reach = spear;
         short_reach.melee = "bat";
         s = swing_run( short_reach, "fp3d_attack_main_aim_LEFT", aimed_at( "head" ) );
@@ -6545,14 +6669,16 @@ static bool run_combat_checks()
         walled.wx = -1;
         s = swing_run( walled, "fp3d_attack_main_aim_LEFT", aimed_at( "head" ) );
         check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ) && s.after.moves == s.before.moves &&
-               s.after.hp == s.before.hp, "a spear doesn't strike someone unseen behind a wall",
+               s.after.turn == s.before.turn && s.after.hp == s.before.hp,
+               "a spear doesn't strike someone unseen behind a wall",
                shown( s ) + ", moves " + std::to_string( s.before.moves ) + " -> " + std::to_string( s.after.moves ) );
         // A square the client names (queue_action_at): a knight's move off, the main hand only, within reach.
         const auto spent = []( const swung & s ) {
-            return s.after.moves < s.before.moves;
+            return s.after.turn > s.before.turn || s.after.moves < s.before.moves;
         };
         const auto idle = [&]( const swung & s, const char *text ) {
-            return s.back && s.swings.empty() && s.after.moves == s.before.moves && said( s.after, text );
+            return s.back && s.swings.empty() && s.after.moves == s.before.moves && s.after.turn == s.before.turn &&
+                   said( s.after, text );
         };
         scene knight = spear;
         knight.zy = -1;
@@ -6563,8 +6689,8 @@ static bool run_combat_checks()
         check( s.back && s.swings.empty() && spent( s ), "... unaimed: CDDA's reach attack, no swing request",
                shown( s ) );
         s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -1, 0, 0 } );
-        check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ) && s.after.moves == s.before.moves,
-               "... a named square with nobody there strikes nothing", shown( s ) );
+        check( s.back && s.swings.empty() && said( s.after, "Nothing there to hit" ) && s.after.moves == s.before.moves &&
+               s.after.turn == s.before.turn, "... a named square with nobody there strikes nothing", shown( s ) );
         scene knight_far = knight;
         knight_far.zx = -3;
         s = swing_run( knight_far, "fp3d_attack_main_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -3, -1, 0 } );
@@ -6580,7 +6706,8 @@ static bool run_combat_checks()
         s = swing_run( knight, "fp3d_attack_main_aim_at", aimed_at( "head" ) );
         const bool unnamed = idle( s, "Nothing there to hit" );
         s = swing_run( knight, "fp3d_attack_off_aim_at", aimed_at( "head" ), "", std::array<int, 3> { -2, -1, 0 } );
-        const bool off = s.back && s.swings.empty() && s.after.moves == s.before.moves && s.after.hp == s.before.hp;
+        const bool off = s.back && s.swings.empty() && s.after.moves == s.before.moves &&
+                         s.after.turn == s.before.turn && s.after.hp == s.before.hp;
         check( own && up && unnamed && off, "... refused: your own square, another level, no square, the off hand",
                std::string( own ? "" : "own " ) + ( up ? "" : "up " ) + ( unnamed ? "" : "unnamed " ) +
                ( off ? "" : "off" ) );
@@ -9364,6 +9491,83 @@ static bool run_cargo_checks()
     const seen off = look( 0, 0 );
     check( stepped && off.spaces == 0 && !off.in_json, "away from the car: no cargo listed", told( off ) );
     check( scene( 58 ), "after: the car gone", "" );
+    // ---- the glovebox (fp3d/glovebox.h): a car fresh from its prototype has one, and it is a cargo space ----
+    const bool fresh = scene( 61 );
+    std::string odd_kinds;
+    for( size_t i = 0; i < glove_checked.size(); i++ ) {
+        if( ( glove_kinds.load() & ( 1 << i ) ) == 0 ) {
+            odd_kinds += std::string( " " ) + glove_checked[i];
+        }
+    }
+    check( fresh && odd_kinds.empty() && glove_protos.load() >= 100,
+           "glovebox: cars, trucks and vans yes; bikes, carts no",
+           std::to_string( glove_protos.load() ) + " prototypes have one" +
+           ( odd_kinds.empty() ? std::string() : "; not as expected:" + odd_kinds ) );
+    check( fresh && glove_count.load() == 1 && glove_tile.load() == 7 && glove_bottle_uid.load() != 0,
+           "glovebox: a fresh car: one, ahead of the passenger",
+           std::to_string( glove_count.load() ) + " on the car, around it " + std::to_string( glove_tile.load() ) +
+           " (1 windshield, 2 a seat behind, 4 beside the driver's), at " + std::to_string( glove_dx.load() ) + "," +
+           std::to_string( glove_dy.load() ) + " from the driver's seat" );
+    // In the snapshot: its part row by vpart id, and its cargo row from the driver's seat.
+    const uint32_t v_box = fp3d::intern_id( fp3d::id_kind::vpart, "fp3d_glovebox" );
+    const uint64_t in_box_uid = glove_bottle_uid;
+    const auto box_now = [&]() {
+        struct {
+            int rows = 0;
+            int cargo_rows = 0;
+            int dx = 0;
+            int dy = 0;
+            fp3d::vehicle_cargo_view space;
+            bool has_bottle = false;
+        } out;
+        const std::shared_ptr<const fp3d::snapshot> s = fp3d::latest_snapshot();
+        if( !s ) {
+            return out;
+        }
+        for( const fp3d::vehicle_view &v : s->vehicles ) {
+            for( const fp3d::vehicle_part_view &row : v.parts ) {
+                out.rows += row.vpart == v_box ? 1 : 0;
+            }
+            for( const fp3d::vehicle_cargo_view &c : v.cargo ) {
+                if( c.part < v.parts.size() && v.parts[c.part].vpart == v_box ) {
+                    out.cargo_rows++;
+                    out.space = c;
+                    out.dx = v.pos.x + v.parts[c.part].dx - s->player.pos.x;
+                    out.dy = v.pos.y + v.parts[c.part].dy - s->player.pos.y;
+                }
+            }
+        }
+        for( const fp3d::cargo_item_view &it : out.space.items ) {
+            out.has_bottle = out.has_bottle || ( it.uid == in_box_uid && it.type == t_bottle );
+        }
+        return out;
+    };
+    const auto box_told = []( const auto & b ) {
+        return std::to_string( b.rows ) + " part rows, " + std::to_string( b.cargo_rows ) + " cargo rows, at " +
+               std::to_string( b.dx ) + "," + std::to_string( b.dy ) + ", " + std::to_string( b.space.used_ml ) + " of " +
+               std::to_string( b.space.capacity_ml ) + " ml, " + std::to_string( b.space.items.size() ) + " items" +
+               ( b.has_bottle ? ", the bottle" : "" );
+    };
+    const auto seated = box_now();
+    check( v_box != 0 && seated.rows == 1 && seated.cargo_rows == 1 && seated.dx == glove_dx.load() &&
+           seated.dy == glove_dy.load() && seated.space.capacity_ml == 5000 && seated.space.used_ml > 0 &&
+           seated.space.items.size() == 1 && seated.has_bottle && seated.space.more == 0,
+           "glovebox: from the driver's seat: its row, 5 L, the bottle", box_told( seated ) );
+    // By hand, as any cargo space: the bottle out into the pack and back in.
+    const std::shared_ptr<const fp3d::snapshot> s3 = fp3d::latest_snapshot();
+    const fp3d::ui_point sat = s3 ? s3->player.pos : fp3d::ui_point{};
+    const fp3d::ui_point box_sq{ sat.x + glove_dx.load(), sat.y + glove_dy.load(), sat.z };
+    res = act( fp3d::item_op::take, in_box_uid, t_bottle, box_sq, false, fp3d::item_hand::pack );
+    const auto emptied = box_now();
+    check( res.back && res.answers == 1 && res.done && carried_has( in_box_uid ) && emptied.cargo_rows == 1 &&
+           emptied.space.items.empty() && emptied.space.used_ml == 0, "glovebox: by hand: the bottle out into the pack",
+           show( res ) + "; " + box_told( emptied ) );
+    res = act( fp3d::item_op::drop, in_box_uid, t_bottle, box_sq, true, fp3d::item_hand::pack );
+    const auto refilled = box_now();
+    check( res.back && res.answers == 1 && res.done && !carried_has( in_box_uid ) && refilled.has_bottle &&
+           refilled.space.items.size() == 1, "glovebox: by hand: the bottle back in",
+           show( res ) + "; " + box_told( refilled ) );
+    check( scene( 62 ), "glovebox: after: the car gone", "" );
     return failed == 0;
 }
 

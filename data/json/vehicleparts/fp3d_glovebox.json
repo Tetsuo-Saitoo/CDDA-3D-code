@@ -1,0 +1,39 @@
+[
+  {
+    "//": "FP3D: a glovebox, which CDDA 0.I doesn't have.  src/fp3d/glovebox.h puts one into the prototypes of cars and trucks, so no prototype lists it.",
+    "type": "ITEM",
+    "id": "fp3d_glovebox",
+    "name": { "str": "glovebox", "str_pl": "gloveboxes" },
+    "description": "A small plastic compartment with a hinged lid, made to sit in a vehicle's dashboard in front of the passenger seat.",
+    "weight": "900 g",
+    "color": "light_gray",
+    "symbol": "o",
+    "material": [ "plastic" ],
+    "volume": "6 L",
+    "category": "veh_parts",
+    "price": "20 USD",
+    "price_postapoc": "50 cent",
+    "melee_damage": { "bash": 1 }
+  },
+  {
+    "//": "FP3D: no location, like CDDA's dashboard and controls, so it shares a tile with a windshield.  CDDA allows one cargo part per tile and every seat is one, so it sits on the tile ahead of the seat.",
+    "type": "vehicle_part",
+    "id": "fp3d_glovebox",
+    "name": { "str": "glovebox" },
+    "categories": [ "cargo" ],
+    "broken_color": "dark_gray",
+    "damage_modifier": 60,
+    "durability": 40,
+    "description": "A small lidded compartment in the dashboard.  Holds a few small things out of sight.",
+    "size": "5 L",
+    "item": "fp3d_glovebox",
+    "requirements": {
+      "install": { "skills": [ [ "mechanics", 1 ] ], "time": "5 m", "using": [ [ "vehicle_screw", 1 ] ] },
+      "removal": { "skills": [ [ "mechanics", 1 ] ], "time": "5 m", "using": [ [ "vehicle_screw", 1 ] ] },
+      "repair": { "skills": [ [ "mechanics", 1 ] ], "time": "5 m", "using": [ [ "adhesive", 1 ] ] }
+    },
+    "flags": [ "CARGO", "COVERED" ],
+    "breaks_into": [ { "item": "plastic_chunk", "count": [ 1, 3 ] } ],
+    "variants": [ { "symbols": "o", "symbols_broken": "#" } ]
+  }
+]

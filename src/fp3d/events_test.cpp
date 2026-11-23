@@ -3,6 +3,7 @@
 // leave out (a death the player can't see) and the overflow rule. Exit code 0 = all checks pass.
 //
 // usage: fp3d-events-test   (run from the cdda/ folder)
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -153,10 +154,15 @@ int main()
         sounds::process_sound_markers( &u );
         sounds::reset_sounds();
         std::vector<event> snd = drain( event_kind::sound );
-        check( snd.size() == 1 && snd[0].amount == 40 && snd[0].heard > 0 && snd[0].heard < 40 &&
+        // Heard: less than the volume for ordinary ears, three squares off. The test's character is a random one
+        // (seeded), so its ears may be better: CDDA multiplies by Character::hearing_ability.
+        const float ears = std::max( 1.0f, u.hearing_ability() );
+        check( snd.size() == 1 && snd[0].amount == 40 && snd[0].heard > 0 &&
+               static_cast<float>( snd[0].heard ) < 40.0f * ears &&
                name_of( fp3d::id_kind::sound, snd[0].type ) == "explosion/default" &&
                same( snd[0].pos, abs_of( at + tripoint_rel_ms( 3, 0, 0 ) ) ), "sound: volume, heard, id, place",
-               snd.empty() ? "none" : "heard " + std::to_string( snd[0].heard ) );
+               snd.empty() ? "none" : "heard " + std::to_string( snd[0].heard ) + ", hearing x" +
+               std::to_string( u.hearing_ability() ) );
 
         monster *zed = g->place_critter_at( mon_zombie, at + tripoint_rel_ms( 1, 0, 0 ) );
         refresh_caches();
