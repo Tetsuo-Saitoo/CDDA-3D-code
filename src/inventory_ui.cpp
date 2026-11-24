@@ -3377,11 +3377,12 @@ static std::vector<inventory_entry *> fp3d_selectable_entries( const std::vector
 }
 
 static fp3d::ui_request fp3d_item_request( const std::vector<inventory_entry *> &picks,
-        fp3d::request_kind kind )
+        fp3d::request_kind kind, const std::string &title = std::string() )
 {
     fp3d::ui_request req;
     req.kind = kind;
     req.context = "INVENTORY";
+    req.title = remove_color_tags( title );
     for( size_t i = 0; i < picks.size(); i++ ) {
         const item_location &loc = picks[i]->any_item();
         req.entries.push_back( { static_cast<int>( i ),
@@ -3423,7 +3424,7 @@ item_location inventory_pick_selector::execute()
     // FP3D: headless clients pick from a flat list of selectable entries
     if( fp3d::active() ) {
         const std::vector<inventory_entry *> picks = fp3d_selectable_entries( get_all_columns() );
-        const fp3d::ui_request req = fp3d_item_request( picks, fp3d::request_kind::item_select );
+        const fp3d::ui_request req = fp3d_item_request( picks, fp3d::request_kind::item_select, fp3d_title() );
         while( true ) {
             const fp3d::ui_answer a = fp3d::ask( req );
             if( a.cancel ) {
@@ -3577,7 +3578,7 @@ drop_location ammo_inventory_selector::execute()
     // FP3D: headless clients pick the ammo from a flat list of selectable entries
     if( fp3d::active() ) {
         const std::vector<inventory_entry *> picks = fp3d_selectable_entries( get_all_columns() );
-        const fp3d::ui_request req = fp3d_item_request( picks, fp3d::request_kind::item_select );
+        const fp3d::ui_request req = fp3d_item_request( picks, fp3d::request_kind::item_select, fp3d_title() );
         while( true ) {
             const fp3d::ui_answer a = fp3d::ask( req );
             if( a.cancel ) {

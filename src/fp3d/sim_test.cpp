@@ -2418,6 +2418,34 @@ void observe()
             here.build_map_cache( p.z() );
             break;
         }
+        case 75: {
+            // Vehicle work, mend and refill: the car's fuel tank a third down and a can of gasoline in the pack; an
+            // engine with an expired air filter and a new filter in the pack.
+            avatar &u = get_avatar();
+            int state = 0;
+            const fault_id stale( "fault_engine_filter_air" );
+            for( int i = 0; work_car != nullptr && i < work_car->part_count(); i++ ) {
+                vehicle_part &pt = work_car->part( i );
+                if( ( state & 1 ) == 0 && pt.is_tank() && pt.ammo_remaining() > 0 ) {
+                    work_car->drain( here, i, pt.ammo_remaining() / 3 );
+                    state |= pt.can_reload() ? 1 : 0;
+                }
+                if( ( state & 2 ) == 0 && stale.is_valid() && pt.faults_potential().count( stale ) > 0 ) {
+                    state |= pt.fault_set( stale ) ? 2 : 0;
+                }
+            }
+            item can( itype_id( "jerrycan" ) );
+            can.fill_with( item( itype_id( "gasoline" ), calendar::turn ), 2000 );
+            can.set_var( "fp3d_work_test", 1 );
+            state |= can.is_container_empty() ? 0 : 4;
+            u.i_add( can );
+            item filter( itype_id( "filter_air" ) );
+            filter.set_var( "fp3d_work_test", 1 );
+            u.i_add( filter );
+            u.invalidate_crafting_inventory();
+            work_gate_state = state;
+            break;
+        }
         case 66: {
             // Vehicle work, after: the avatar back, the car gone, the skill and the pack as before.
             avatar &u = get_avatar();
@@ -10174,6 +10202,10 @@ static bool run_vehicle_work_checks()
         std::string asked;           // what CDDA asked on the way
     };
     uint32_t next_tag = 4200;
+    // How the helper answers a list of CDDA's (a menu, an item to pick): the entry whose label has `prefer` if
+    // any, else the first one; with `choose` off the list is cancelled.
+    bool choose = true;
+    std::string prefer;
     // The part is named as a client names it: by its row, and by the type and mount the newest snapshot has for
     // that row (`as`: another row's instead, as a client with an older list would send).
     const auto work = [&]( uint64_t uid, int row, char cmd, bool agree = false,
@@ -10231,8 +10263,18 @@ static bool run_vehicle_work_checks()
             fp3d::ui_answer reply;
             reply.id = at->id;
             const std::string yes_no = agree ? "YES" : "NO";
-            if( at->kind == fp3d::request_kind::menu && !at->entries.empty() ) {
+            const bool listed = at->kind == fp3d::request_kind::menu ||
+                                at->kind == fp3d::request_kind::item_select;
+            if( listed && choose && !at->entries.empty() ) {
                 reply.entry = at->entries.front().id;
+                for( const fp3d::ui_entry &e : at->entries ) {
+                    if( !prefer.empty() && e.label.find( prefer ) != std::string::npos ) {
+                        reply.entry = e.id;
+                        break;
+                    }
+                }
+            } else if( listed ) {
+                reply.cancel = true;
             } else if( std::find( at->actions.begin(), at->actions.end(), yes_no ) != at->actions.end() ) {
                 reply.action = yes_no;
             } else {
@@ -10775,6 +10817,75 @@ static bool run_vehicle_work_checks()
            "action, install: started, and the glovebox is back on its square",
            shown( fitted ) + "; then " + std::to_string( refitted.own_rows ) + " part rows of " +
            std::to_string( stripped.own_rows ) + ", the glovebox's " + std::to_string( refitted.box_row ) );
+
+    // Mend and refill. An engine with an expired air filter, the tank a third down; a filter and a can of gasoline
+    // in the pack.
+    const bool worn = scene( 75 );
+    const int upkeep_state = work_gate_state.load();
+    const parsed upkeep = parse( await( fp3d::post_vehicle_work_query( car.uid, -1 ) ) );
+    int tank_row = -1;
+    int engine_row = -1;
+    int64_t tank_had = -1;
+    for( const w_part &p : upkeep.parts ) {
+        if( tank_row < 0 && p.holds && p.fill_unit == "ml" && p.fill_now > 0 && p.fill_now < p.fill_max &&
+            ( p.flags & 8 ) != 0 ) {
+            tank_row = p.row;
+            tank_had = p.fill_now;
+        }
+        if( engine_row < 0 && ( p.flags & 4 ) != 0 && p.faults >= 1 ) {
+            engine_row = p.row;
+        }
+    }
+    const parsed faulty = parse( await( fp3d::post_vehicle_work_query( car.uid, engine_row ) ) );
+    const parsed thirsty = parse( await( fp3d::post_vehicle_work_query( car.uid, tank_row ) ) );
+    const w_cmd *m1 = command( faulty, "m" );
+    const w_cmd *f1 = command( thirsty, "f" );
+    check( worn && upkeep_state == 7 && tank_row >= 0 && engine_row >= 0 && m1 && m1->ok && f1 && f1->ok,
+           "scene: a faulty engine, a tank with room; the read says mend and refill",
+           std::to_string( upkeep_state ) + " of 7 (1 the tank drained, 2 a fault set, 4 a can filled), tank row " +
+           std::to_string( tank_row ) + ", engine row " + std::to_string( engine_row ) + "; " + told( m1 ) + " ; " +
+           told( f1 ) + ( worn ? std::string() : stuck() ) );
+    // A part with nothing to mend or fill: refused in words, CDDA asks nothing.
+    const outcome no_fault = work( car.uid, refitted.box_row, 'm' );
+    const outcome no_tank = work( car.uid, refitted.box_row, 'f' );
+    check( bad( car.uid, -1, 'm', 0 ) && bad( car.uid, -1, 'f', 0 ) && no_fault.results == 1 && !no_fault.done &&
+           no_fault.prompts == 0 && no_fault.why == "The glovebox doesn't have any faults to mend." &&
+           no_tank.results == 1 && !no_tank.done && no_tank.prompts == 0 &&
+           no_tank.why == "The glovebox can't be refilled.",
+           "action, mend and refill on the glovebox: refused", shown( no_fault ) + " / " + shown( no_tank ) );
+    // Mend: CDDA's menu of fixes. Backing out starts nothing; the fix picked, CDDA's activity mends it.
+    choose = false;
+    const outcome mend_left = work( car.uid, engine_row, 'm' );
+    choose = true;
+    prefer = "Replace expired air filter";
+    const outcome mend_done = work( car.uid, engine_row, 'm' );
+    prefer.clear();
+    const parsed sound = parse( await( fp3d::post_vehicle_work_query( car.uid, -1 ) ) );
+    int still_faulty = -1;
+    for( const w_part &p : sound.parts ) {
+        still_faulty = p.row == engine_row ? ( p.flags & 4 ) : still_faulty;
+    }
+    check( mend_left.results == 1 && !mend_left.done && mend_left.why.empty() && mend_left.prompts == 1 &&
+           mend_left.asked.find( "Mend which fault?" ) != std::string::npos && mend_done.results == 1 &&
+           mend_done.done && mend_done.asked.find( "Mend which fault?" ) != std::string::npos && still_faulty == 0,
+           "action, mend: CDDA's menu; backed out nothing, picked it mends",
+           shown( mend_left ) + " / " + shown( mend_done ) + "; faulty after: " + std::to_string( still_faulty ) );
+    // Refill: CDDA asks what from. Nothing picked starts nothing; the can picked, the tank is fuller.
+    choose = false;
+    const outcome fill_left = work( car.uid, tank_row, 'f' );
+    choose = true;
+    const outcome fill_done = work( car.uid, tank_row, 'f' );
+    const parsed fuller = parse( await( fp3d::post_vehicle_work_query( car.uid, -1 ) ) );
+    int64_t tank_has = -1;
+    for( const w_part &p : fuller.parts ) {
+        tank_has = p.row == tank_row ? p.fill_now : tank_has;
+    }
+    check( fill_left.results == 1 && !fill_left.done && fill_left.why.empty() && fill_left.prompts >= 1 &&
+           fill_left.asked.find( "Refill" ) != std::string::npos && fill_done.results == 1 && fill_done.done &&
+           fill_done.asked.find( "item_select" ) != std::string::npos && tank_has > tank_had,
+           "action, refill: CDDA asks what from; none nothing, the can fills it",
+           shown( fill_left ) + " / " + shown( fill_done ) + "; " + std::to_string( tank_had ) + " -> " +
+           std::to_string( tank_has ) + " ml" );
 
     // Someone else's car: the read says so, and CDDA asks before any work. Here the answer is no.
     const bool taken = scene( 68 );

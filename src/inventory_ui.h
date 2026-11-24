@@ -658,6 +658,10 @@ class inventory_selector
         void set_title( const std::string &title ) {
             this->title = title;
         }
+        // FP3D: that title, for the request a headless client gets in place of the menu (inventory_ui.cpp).
+        const std::string &fp3d_title() const {
+            return title;
+        }
         /** Assigns a hint. */
         void set_hint( const std::string &hint ) {
             this->hint = hint;

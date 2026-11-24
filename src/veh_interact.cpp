@@ -1314,6 +1314,26 @@ void veh_interact::do_mend( map &here )
     overview( here, sel, act );
 }
 
+// FP3D: whether `obj` can refill `pt`. These lines stood in do_refill's source filter and are unchanged, so that
+// the vehicle-work action (src/fp3d/vehicle_work.cpp) asks the same code.
+bool veh_interact::refill_fits( const vehicle_part &pt, const item &obj )
+{
+    if( pt.is_tank() ) {
+        if( obj.is_watertight_container() && obj.num_item_stacks() == 1 ) {
+            // we are assuming only one pocket here, and it's a liquid so only one item
+            return pt.can_reload( obj.only_item() );
+        }
+    } else if( pt.is_fuel_store() ) {
+        bool can_reload = pt.can_reload( obj );
+        //check base item for fuel_stores that can take multiple types of ammunition (like the fuel_bunker)
+        if( pt.get_base().can_reload_with( obj, true ) ) {
+            return true;
+        }
+        return can_reload;
+    }
+    return false;
+}
+
 void veh_interact::do_refill( map &here )
 {
     switch( cant_do( here, 'f' ) ) {
@@ -1333,21 +1353,9 @@ void veh_interact::do_refill( map &here )
     title = _( "Select part to refill:" );
 
     auto act = [&]( const map &, const vehicle_part & pt ) {
+        // FP3D: the test itself is refill_fits() above.
         auto validate = [&]( const item & obj ) {
-            if( pt.is_tank() ) {
-                if( obj.is_watertight_container() && obj.num_item_stacks() == 1 ) {
-                    // we are assuming only one pocket here, and it's a liquid so only one item
-                    return pt.can_reload( obj.only_item() );
-                }
-            } else if( pt.is_fuel_store() ) {
-                bool can_reload = pt.can_reload( obj );
-                //check base item for fuel_stores that can take multiple types of ammunition (like the fuel_bunker)
-                if( pt.get_base().can_reload_with( obj, true ) ) {
-                    return true;
-                }
-                return can_reload;
-            }
-            return false;
+            return refill_fits( pt, obj );
         };
 
         refill_target = g->inv_map_splice( validate, string_format( _( "Refill %s" ), pt.name() ), 1 );

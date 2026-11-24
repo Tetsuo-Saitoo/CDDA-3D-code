@@ -379,7 +379,8 @@ struct vehicle_work_action {
     uint32_t vpart = 0;                  // its type, the vpart id-table index, 1 .. max_work_vpart
     int mount_x = 0;                     // its mount, each -max_work_mount .. max_work_mount
     int mount_y = 0;
-    char cmd = ' ';                      // 'r' repair (replace when broken), 'o' remove, 'i' install
+    char cmd = ' ';                      // 'r' repair (replace when broken), 'o' remove, 'i' install,
+                                         // 'm' mend a fault, 'f' refill
     uint32_t tag = 0;                    // the client's number for it, 0 none; answered by a work_result event
 };
 // Client side. False if a field is out of range, the command isn't one of the above, or the queue is full.

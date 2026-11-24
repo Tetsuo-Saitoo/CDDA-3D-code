@@ -721,7 +721,8 @@ bool queue_vehicle_work_action( const vehicle_work_action &a )
         ( install ? a.part != -1 : a.part < 0 || a.part > max_work_part_row ) ||
         a.vpart < 1 || a.vpart > max_work_vpart || a.mount_x < -max_work_mount || a.mount_x > max_work_mount ||
         a.mount_y < -max_work_mount || a.mount_y > max_work_mount ||
-        ( a.cmd != 'r' && a.cmd != 'o' && !install ) || a.tag > max_item_tag ) {
+        ( a.cmd != 'r' && a.cmd != 'o' && a.cmd != 'm' && a.cmd != 'f' && !install ) ||
+        a.tag > max_item_tag ) {
         return false;
     }
     channel &c = chan();

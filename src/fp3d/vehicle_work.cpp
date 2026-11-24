@@ -18,7 +18,9 @@
 #include "fp3d/bridge.h"
 #include "fp3d/events.h"
 #include "fp3d/snapshot.h"
+#include "game.h"
 #include "item.h"
+#include "item_location.h"
 #include "itype.h"
 #include "json.h"
 #include "map.h"
@@ -36,6 +38,8 @@
 #include "veh_type.h"
 #include "vehicle.h"
 #include "vpart_position.h"
+
+static const activity_id ACT_MEND_ITEM( "ACT_MEND_ITEM" );
 
 static const ammotype ammo_battery( "battery" );
 
@@ -674,6 +678,55 @@ struct vehicle_work_access {
         return true;
     }
 
+    // Starts mending a fault of the part ('m') or refilling it ('f'), as CDDA's screen does: its question when the
+    // vehicle is someone else's, the same check as the read, then do_mend or do_refill. CDDA asks the rest itself:
+    // which fault to mend and how (Character::mend_item's menu), or what to refill from (an item at hand). False
+    // when nothing is started: `why` as for start().
+    static bool start_upkeep( map &here, vehicle &veh, int part_index, char cmd, std::string &why ) {
+        avatar &u = get_avatar();
+        if( !veh.handle_potential_theft( u ) ) {
+            why.clear();
+            return false;
+        }
+        vehicle_part &pt = veh.part( part_index );
+        veh_interact vi( here, veh, -pt.mount );
+        widen( vi );
+        std::vector<command_view> said;
+        commands_for( vi, here, veh, part_index, std::string( 1, cmd ), said );
+        if( said.size() != 1 || !said.front().ok ) {
+            const std::string name = pt.name( false );
+            why = said.size() != 1 ? std::string() :
+                  !said.front().text.empty() ? said.front().text :
+                  cmd == 'm' ? string_format( _( "The %s doesn't have any faults to mend." ), name ) :
+                  string_format( _( "The %s can't be refilled." ), name );
+            return false;
+        }
+        why.clear();
+        if( cmd == 'm' ) {
+            // do_mend: CDDA's menu of fixes; a fix picked there starts its own activity.
+            u.mend_item( veh.part_base( part_index ) );
+            return u.activity.id() == ACT_MEND_ITEM;
+        }
+        // do_refill: the source is picked from what is at hand, then the vehicle activity does the filling.
+        vi.refill_target = g->inv_map_splice( [&pt]( const item & obj ) {
+            return veh_interact::refill_fits( pt, obj );
+        }, string_format( _( "Refill %s" ), pt.name( false ) ), 1 );
+        if( !vi.refill_target ) {
+            return false;
+        }
+        vi.sel_vehicle_part = &pt;
+        vi.sel_vpart_info = &pt.info();
+        vi.sel_cmd = 'f';
+        const player_activity act = vi.serialize_activity( here );
+        if( !act ) {
+            return false;
+        }
+        // game::exam_vehicle.
+        u.set_moves( 0 );
+        u.assign_activity( act );
+        return true;
+    }
+
     // CDDA's sentence when nothing is installed whatever the type: do_install.
     static std::string install_refusal( task_reason reason ) {
         switch( reason ) {
@@ -961,7 +1014,7 @@ bool run_vehicle_work( avatar &u )
         }
         return done;
     };
-    if( a->cmd != 'r' && a->cmd != 'o' && a->cmd != 'i' ) {
+    if( a->cmd != 'r' && a->cmd != 'o' && a->cmd != 'i' && a->cmd != 'm' && a->cmd != 'f' ) {
         return answer( false, _( "That can't be done to a vehicle this way." ) );
     }
     if( const std::optional<gate> shut = examine_gate( u ) ) {
@@ -998,7 +1051,9 @@ bool run_vehicle_work( avatar &u )
         return answer( false, _( "That part isn't there any more." ) );
     }
     std::string why;
-    const bool started = vehicle_work_access::start( here, *veh, rows[a->part], a->cmd, why );
+    const bool started = a->cmd == 'm' || a->cmd == 'f' ?
+                         vehicle_work_access::start_upkeep( here, *veh, rows[a->part], a->cmd, why ) :
+                         vehicle_work_access::start( here, *veh, rows[a->part], a->cmd, why );
     return answer( started, started ? std::string() : why );
 }
 

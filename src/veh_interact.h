@@ -271,6 +271,8 @@ class veh_interact
         bool can_remove_part( map &here, int idx, const Character &you );
         // FP3D: what repairing one part needs, as do_repair shows it (see veh_interact.cpp).
         bool repair_reqs( map &here, vehicle_part &pt, std::string &nmsg );
+        // FP3D: whether an item can refill a part, as do_refill's source list has it (see veh_interact.cpp).
+        static bool refill_fits( const vehicle_part &pt, const item &obj );
         //do install support, writes requirements to ui
         bool update_part_requirements( map &here );
 
