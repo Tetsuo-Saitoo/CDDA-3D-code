@@ -356,6 +356,11 @@ void build_id_tables()
             }
         }
     }
+    // A part type names the item it is made from by that item's index in `items`.
+    std::unordered_map<std::string, uint32_t> item_index;
+    for( size_t i = 1; i < item_names.size() && i < t->items.size(); i++ ) {
+        item_index.emplace( item_names[i], static_cast<uint32_t>( i ) );
+    }
     const std::vector<std::string> vp_names = id_names( id_kind::vpart );
     t->vparts.resize( vp_names.size() );
     for( size_t i = 1; i < vp_names.size(); i++ ) {
@@ -370,6 +375,8 @@ void build_id_tables()
         d.color = color_name( vp.color );
         d.looks_like = vp.looks_like;
         d.location = vp.location;
+        const auto made_of = item_index.find( vp.base_item.str() );
+        d.item = made_of != item_index.end() ? made_of->second : 0;
         d.flags.assign( vp.get_flags().begin(), vp.get_flags().end() );
     }
 
@@ -505,6 +512,7 @@ void write_id_tables_json( std::ostream &out, const id_tables &t )
         jo.member( "color", d.color );
         jo.member( "looks_like", d.looks_like );
         jo.member( "location", d.location );
+        jo.member( "item", static_cast<int64_t>( d.item ) );
         write_strings( jo, "flags", d.flags );
         jo.end_object();
     }

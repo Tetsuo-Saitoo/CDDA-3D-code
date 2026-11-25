@@ -26,6 +26,7 @@
 #include "rng.h"
 #include "trap.h"
 #include "type_id.h"
+#include "veh_type.h"
 
 namespace
 {
@@ -92,6 +93,33 @@ int main()
         check( apple < t->items.size() && t->items[apple].id == "apple" && t->items[apple].volume_ml > 0 &&
                zombie < t->monsters.size() && t->monsters[zombie].hp > 0 && t->monsters[zombie].speed > 0 &&
                t->vparts.size() > 100 && !t->vparts[1].id.empty(), "apple, mon_zombie, vehicle parts defined" );
+        // A vehicle part type names the item it is made from by its index in the item table. It is CDDA's base item
+        // for the type, and several types can share one.
+        size_t named = 0;
+        size_t unnamed = 0;
+        std::map<uint32_t, int> uses;
+        for( size_t i = 1; i < t->vparts.size(); i++ ) {
+            const fp3d::vpart_def &d = t->vparts[i];
+            const vpart_id vid( d.id );
+            if( d.id.empty() || !vid.is_valid() ) {
+                continue;
+            }
+            const bool right = d.item > 0 && d.item < t->items.size() &&
+                               t->items[d.item].id == vid->base_item.str();
+            named += right ? 1 : 0;
+            unnamed += right ? 0 : 1;
+            uses[d.item]++;
+        }
+        int shared = 0;
+        for( const std::pair<const uint32_t, int> &u : uses ) {
+            shared += u.second > 1 ? 1 : 0;
+        }
+        const uint32_t v_frame = fp3d::intern_id( fp3d::id_kind::vpart, "frame" );
+        check( named > 100 && unnamed == 0 && shared >= 5 && t->vparts[0].item == 0 && v_frame < t->vparts.size() &&
+               t->vparts[v_frame].item < t->items.size() && t->items[t->vparts[v_frame].item].id == "frame",
+               "vehicle part types name their item; some items serve several",
+               std::to_string( named ) + " types, " + std::to_string( unnamed ) + " without, " +
+               std::to_string( shared ) + " items shared" );
         // The examine action's id goes with terrain and furniture: a fireplace's, none for a floor, an actor's type.
         const auto examine_of = []( const std::vector<fp3d::terrain_def> &defs, const std::string & id ) {
             for( const fp3d::terrain_def &d : defs ) {

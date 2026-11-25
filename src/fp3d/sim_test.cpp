@@ -60,6 +60,7 @@
 #include "fp3d/bullet_paths.h"
 #include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
+#include "fp3d/id_tables.h"
 #include "fp3d/item_hands.h"
 #include "fp3d/points.h"
 #include "fp3d/shot.h"
@@ -10756,6 +10757,23 @@ static bool run_vehicle_work_checks()
            fit.picked.ok && fit.picked.reason == 0 && fit.picked.time_s > 0 && lines_with( &fit.picked, 2 ) == 0 &&
            lines_with( &fit.picked, 1, "mechanics" ) == 1 && lines_with( &fit.picked, 1 ) >= 3,
            "install, the glovebox picked: ok, every line met", told( &fit.picked ) );
+    // The id tables say which item each part type is made from (what a client goes by that offers to install the
+    // item in the player's hand): every listed type names one, the glovebox type the glovebox.
+    const std::shared_ptr<const fp3d::id_tables> tables_now = fp3d::latest_id_tables();
+    const uint32_t glove_item = fp3d::intern_id( fp3d::id_kind::itype, "fp3d_glovebox" );
+    size_t with_item = 0;
+    for( const std::pair<int64_t, int> &t : fit.types ) {
+        const size_t type = static_cast<size_t>( t.first );
+        with_item += tables_now && type < tables_now->vparts.size() && tables_now->vparts[type].item > 0 &&
+                     tables_now->vparts[type].item < tables_now->items.size() ? 1 : 0;
+    }
+    check( tables_now && glove_item != 0 && glove_item < tables_now->items.size() &&
+           v_box < tables_now->vparts.size() && tables_now->vparts[v_box].item == glove_item &&
+           tables_now->items[glove_item].id == "fp3d_glovebox" && with_item == fit.types.size() &&
+           !fit.types.empty(),
+           "id tables: each listed type names its item; the glovebox's is the glovebox",
+           std::to_string( with_item ) + " of " + std::to_string( fit.types.size() ) + " types, the glovebox item " +
+           std::to_string( glove_item ) );
     // The square beside the car's outermost part: CDDA lists the same types, and says why this one can't go there.
     fp3d::vehicle_part_view rim = was;
     for( const fp3d::vehicle_part_view &row : stripped.rows ) {

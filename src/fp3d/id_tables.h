@@ -131,6 +131,8 @@ struct vpart_def {
     std::string color;
     std::string looks_like;
     std::string location;          // e.g. "structure", "engine_block", "on_roof"
+    uint32_t item = 0;             // the item it is made from, as its index in `items`: installing the part uses
+                                   // one up, removing it yields one. 0 none. Several part types can share an item.
     std::vector<std::string> flags;
 };
 
