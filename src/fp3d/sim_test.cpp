@@ -37,6 +37,7 @@
 #include "cached_options.h"
 #include "calendar.h"
 #include "character_martial_arts.h"
+#include "color.h"
 #include "coordinates.h"
 #include "creature_tracker.h"
 #include "cuboid_rectangle.h"
@@ -61,6 +62,7 @@
 #include "fp3d/gun_faults.h"
 #include "fp3d/held.h"
 #include "fp3d/id_tables.h"
+#include "fp3d/overmap_read.h"
 #include "fp3d/item_hands.h"
 #include "fp3d/points.h"
 #include "fp3d/shot.h"
@@ -88,7 +90,9 @@
 #include "npc.h"
 #include "options.h"
 #include "output.h"
+#include "omdata.h"
 #include "overmap.h"
+#include "overmap_ui.h"
 #include "overmapbuffer.h"
 #include "path_info.h"
 #include "player_activity.h"
@@ -364,6 +368,23 @@ std::atomic<int> work_env{ 0 };                  // scene 63: 1 light to work by
 std::atomic<uint64_t> work_uid{ 0 };             // set by the driver before scene 64: the car's uid in the snapshot
 std::atomic<int> work_row{ -1 };                 // ... and the glovebox's part row
 std::string work_tiny;                           // scene 64: run_vehicle_work_query within 2500 bytes
+
+// The map checks' scenes (76, 77). Written on the sim thread while a scene runs, read by the driver after it.
+std::atomic<int> map_state{ 0 };                 // what each scene managed, by its own bits
+int map_at[3] = { 0, 0, 0 };                     // the avatar's overmap cell
+int map_vague_at[2] = { 0, 0 };                  // the cell made vague,
+int map_unseen_at[2] = { 0, 0 };                 // the one made unseen,
+int map_note_at[2] = { 0, 0 };                   // the one with the note
+int map_far_at[2] = { 0, 0 };                    // a page origin with no overmap under it
+std::string map_here[3];                         // what CDDA draws on the avatar's cell: name, symbol, colour
+std::string map_vague[3];                        // ... and on the vague cell at vague vision
+std::string map_full_name;                       // that cell's name at full vision
+std::string map_note_sym;                        // the note's symbol and colour as CDDA parses them
+std::string map_note_color;
+std::string map_whole;                           // the avatar's page with its path, and the same in fewer bytes
+std::string map_tiny;
+int map_was[2] = { 0, 0 };                       // sim thread only: the vision the two cells had
+bool map_marked = false;                         // sim thread only: scene 76 set the explored mark
 std::atomic<int> work_ms{ 0 };                   // ... and how long it took
 vehicle *work_car = nullptr;                     // sim thread only: scene 63's car, until scene 66
 vehicle *work_machine = nullptr;                 // sim thread only: scene 67's appliance, until scene 66
@@ -2445,6 +2466,121 @@ void observe()
             u.i_add( filter );
             u.invalidate_crafting_inventory();
             work_gate_state = state;
+            break;
+        }
+        case 76: {
+            // The map: near the avatar's overmap cell, one cell made vague and one unseen, a note with a symbol, a
+            // colour and a danger radius on an explored cell, and a travel path of five cells north. Also read
+            // here, on the sim thread: the avatar's page whole and in fewer bytes.
+            avatar &u = get_avatar();
+            int state = 0;
+            const tripoint_abs_omt at = u.pos_abs_omt();
+            map_at[0] = at.x();
+            map_at[1] = at.y();
+            map_at[2] = at.z();
+            const auto drawn = []( const tripoint_abs_omt & c, om_vision_level v, std::string * out ) {
+                const oter_id &ter = overmap_buffer.ter_existing( c );
+                out[0] = ter->get_name( v );
+                out[1] = ter->get_symbol( v );
+                out[2] = get_all_colors().get_name( ter->get_color( v ) );
+            };
+            drawn( at, overmap_buffer.seen( at ), map_here );
+            // Two cells out of the avatar's sight (CDDA sees what is in sight anew before the next request), on
+            // ground that has an overmap and that the player hasn't seen: one to be made vague, one to stay
+            // unseen. A cell that looks different when seen vaguely is taken for the first if there is one.
+            tripoint_abs_omt vague = at;
+            tripoint_abs_omt unseen = at;
+            for( const point &dir : { point( 40, 0 ), point( -40, 0 ), point( 0, 40 ), point( 0, -40 ) } ) {
+                for( int dy = -4; dy <= 4; dy++ ) {
+                    for( int dx = -4; dx <= 4; dx++ ) {
+                        const tripoint_abs_omt c = at + tripoint_rel_omt( dir.x + dx, dir.y + dy, 0 );
+                        if( overmap_buffer.get_existing( project_to<coords::om>( c ).xy() ) == nullptr ||
+                            overmap_buffer.seen( c ) != om_vision_level::unseen ) {
+                            continue;
+                        }
+                        const oter_id &ter = overmap_buffer.ter_existing( c );
+                        if( ( state & 1 ) == 0 &&
+                            ter->get_name( om_vision_level::vague ) != ter->get_name( om_vision_level::full ) ) {
+                            vague = c;
+                            state |= 1;
+                        } else if( unseen == at ) {
+                            unseen = c;
+                        } else if( vague == at ) {
+                            vague = c;
+                        }
+                    }
+                }
+            }
+            state |= vague != at && unseen != at ? 8 : 0;
+            tripoint_abs_omt noted = at;
+            for( const point &d : { point( 1, 1 ), point( -1, -1 ), point( 1, -1 ), point( -1, 1 ) } ) {
+                const tripoint_abs_omt c = at + tripoint_rel_omt( d.x, d.y, 0 );
+                if( noted == at && c != vague && c != unseen ) {
+                    noted = c;
+                }
+            }
+            map_vague_at[0] = vague.x();
+            map_vague_at[1] = vague.y();
+            map_unseen_at[0] = unseen.x();
+            map_unseen_at[1] = unseen.y();
+            map_note_at[0] = noted.x();
+            map_note_at[1] = noted.y();
+            map_was[0] = static_cast<int>( overmap_buffer.seen( vague ) );
+            map_was[1] = static_cast<int>( overmap_buffer.seen( unseen ) );
+            map_full_name = overmap_buffer.ter_existing( vague )->get_name( om_vision_level::full );
+            overmap_buffer.set_seen( vague, om_vision_level::vague );
+            overmap_buffer.set_seen( unseen, om_vision_level::unseen );
+            drawn( vague, om_vision_level::vague, map_vague );
+            const std::string text = "!:R;fp3d map note";
+            overmap_buffer.add_note( noted, text );
+            overmap_buffer.mark_note_dangerous( noted, 3, true );
+            const std::tuple<char, nc_color, size_t> shown = overmap_ui::get_note_display_info( text );
+            map_note_sym = std::string( 1, std::get<0>( shown ) );
+            map_note_color = get_all_colors().get_name( std::get<1>( shown ) );
+            map_marked = !overmap_buffer.is_explored( noted );
+            if( map_marked ) {
+                overmap_buffer.toggle_explored( noted );
+            }
+            state |= overmap_buffer.has_note( noted ) && overmap_buffer.is_explored( noted ) ? 2 : 0;
+            u.omt_path.clear();
+            for( int i = 5; i >= 1; i-- ) {
+                u.omt_path.push_back( at + tripoint_rel_omt( 0, -i, 0 ) );
+            }
+            const int ox = at.x() - ( ( at.x() % 32 ) + 32 ) % 32;
+            const int oy = at.y() - ( ( at.y() % 32 ) + 32 ) % 32;
+            map_far_at[0] = ox + 32 * 3000;
+            map_far_at[1] = oy;
+            const point_abs_om far_om = project_to<coords::om>( tripoint_abs_omt( map_far_at[0], map_far_at[1],
+                                        at.z() ) ).xy();
+            state |= overmap_buffer.has( far_om ) ? 0 : 4;
+            map_whole = fp3d::run_overmap_query( 908, ox, oy, at.z(), true, 64 * 1024 );
+            map_tiny = fp3d::run_overmap_query( 909, ox, oy, at.z(), true,
+                                                map_whole.size() > 40 ? map_whole.size() - 40 : 0 );
+            map_state = state;
+            break;
+        }
+        case 77: {
+            // The map, after: the two cells' vision, the note, the mark and the path as they were. No overmap has
+            // appeared under the far page.
+            avatar &u = get_avatar();
+            int state = 0;
+            const int z = map_at[2];
+            overmap_buffer.set_seen( tripoint_abs_omt( map_vague_at[0], map_vague_at[1], z ),
+                                     static_cast<om_vision_level>( map_was[0] ) );
+            overmap_buffer.set_seen( tripoint_abs_omt( map_unseen_at[0], map_unseen_at[1], z ),
+                                     static_cast<om_vision_level>( map_was[1] ) );
+            const tripoint_abs_omt noted( map_note_at[0], map_note_at[1], z );
+            overmap_buffer.delete_note( noted );
+            if( map_marked && overmap_buffer.is_explored( noted ) ) {
+                overmap_buffer.toggle_explored( noted );
+            }
+            map_marked = false;
+            u.omt_path.clear();
+            const point_abs_om far_om = project_to<coords::om>( tripoint_abs_omt( map_far_at[0], map_far_at[1],
+                                        z ) ).xy();
+            state |= overmap_buffer.has( far_om ) ? 0 : 1;
+            state |= overmap_buffer.has_note( noted ) ? 0 : 2;
+            map_state = state;
             break;
         }
         case 66: {
@@ -10932,6 +11068,264 @@ static bool run_vehicle_work_checks()
     return failed == 0;
 }
 
+// G5, the map: a page of the overmap as the player knows it (fp3d/overmap_read.h). Cells are told by what CDDA's
+// own map screen draws at the vision level the player has of them; a page over ground with no overmap yet reads
+// as unseen and creates none.
+static bool run_overmap_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  map: %-52s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    const auto scene = [&]( int number ) {
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return false;
+        }
+        hand_setup = number;
+        fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+        at = fp3d::wait_request( 20000, at->id );
+        return at && at->timed;
+    };
+    struct m_look {
+        std::string name;
+        std::string sym;
+        std::string color;
+    };
+    struct m_note {
+        int x = 0;
+        int y = 0;
+        std::string sym;
+        std::string color;
+        std::string text;
+        bool danger = false;
+        int radius = -1;
+    };
+    struct m_page {
+        bool valid = false;
+        bool ok = false;
+        int64_t id = 0;
+        std::string kind;
+        std::string error;
+        int origin[3] = { 0, 0, 0 };
+        std::vector<m_look> looks;
+        std::vector<int> look;
+        std::vector<int> vision;
+        std::vector<int> flags;
+        std::vector<m_note> notes;
+        int notes_more = -1;
+        bool has_path = false;
+        int to[3] = { 0, 0, 0 };
+        std::vector<int> cells;
+        int path_more = -1;
+        bool truncated = false;
+    };
+    const auto parse = []( const std::string & text ) {
+        m_page out;
+        try {
+            const JsonValue root = json_loader::from_string( text );
+            JsonObject jo = root.get_object();
+            jo.allow_omitted_members();
+            out.ok = jo.get_bool( "ok" );
+            out.id = jo.get_member( "id" ).get_int64();
+            out.kind = jo.get_string( "kind" );
+            if( !out.ok ) {
+                out.error = jo.get_string( "error" );
+                out.valid = true;
+                return out;
+            }
+            const auto ints = [&jo]( const char *name, std::vector<int> &into ) {
+                JsonArray a = jo.get_array( name );
+                for( size_t i = 0; i < a.size(); i++ ) {
+                    into.push_back( a.get_int( i ) );
+                }
+            };
+            std::vector<int> origin;
+            ints( "origin", origin );
+            for( size_t i = 0; i < 3 && i < origin.size(); i++ ) {
+                out.origin[i] = origin[i];
+            }
+            for( JsonObject l : jo.get_array( "looks" ) ) {
+                l.allow_omitted_members();
+                out.looks.push_back( m_look{ l.get_string( "name" ), l.get_string( "sym" ), l.get_string( "color" ) } );
+            }
+            ints( "look", out.look );
+            ints( "vision", out.vision );
+            ints( "flags", out.flags );
+            for( JsonObject n : jo.get_array( "notes" ) ) {
+                n.allow_omitted_members();
+                m_note note;
+                JsonArray at = n.get_array( "at" );
+                note.x = at.get_int( 0 );
+                note.y = at.get_int( 1 );
+                note.sym = n.get_string( "sym" );
+                note.color = n.get_string( "color" );
+                note.text = n.get_string( "text" );
+                note.danger = n.get_bool( "danger" );
+                note.radius = n.get_int( "radius" );
+                out.notes.push_back( note );
+            }
+            out.notes_more = jo.get_int( "notes_more" );
+            if( jo.has_object( "path" ) ) {
+                JsonObject p = jo.get_object( "path" );
+                p.allow_omitted_members();
+                out.has_path = true;
+                JsonArray to = p.get_array( "to" );
+                for( size_t i = 0; i < 3 && i < to.size(); i++ ) {
+                    out.to[i] = to.get_int( i );
+                }
+                JsonArray c = p.get_array( "cells" );
+                for( size_t i = 0; i < c.size(); i++ ) {
+                    out.cells.push_back( c.get_int( i ) );
+                }
+                out.path_more = p.get_int( "more" );
+            }
+            out.truncated = jo.get_bool( "truncated" );
+            out.valid = true;
+        } catch( const std::exception & ) {
+            out.valid = false;
+        }
+        return out;
+    };
+    const auto await = []( uint64_t id ) {
+        const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        while( id != 0 && ms_since( t0 ) < 20000 * fp3d::slow_build ) {
+            if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
+                return *res;
+            }
+            std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
+        }
+        return std::string( "timeout" );
+    };
+    // The page a cell is on starts at the multiple of 32 at or below it.
+    const auto origin_of = []( int v ) {
+        return v - ( ( v % 32 ) + 32 ) % 32;
+    };
+    const auto index_of = [&]( int x, int y ) {
+        return static_cast<size_t>( ( y - origin_of( y ) ) * 32 + ( x - origin_of( x ) ) );
+    };
+    const auto read = [&]( int x, int y, int z, bool path ) {
+        return parse( await( fp3d::post_overmap_query( fp3d::ui_point{ origin_of( x ), origin_of( y ), z }, path ) ) );
+    };
+    const auto whole_page = []( const m_page & p ) {
+        return p.valid && p.ok && p.look.size() == 1024 && p.vision.size() == 1024 && p.flags.size() == 1024;
+    };
+    struct m_cell {
+        bool ok = false;
+        int vision = -1;
+        int look = -1;
+        int flags = -1;
+        m_look drawn;
+    };
+    const auto cell_at = [&]( int x, int y, int z ) {
+        m_cell out;
+        const m_page page = read( x, y, z, false );
+        const size_t i = index_of( x, y );
+        if( whole_page( page ) && page.look[i] >= 0 && static_cast<size_t>( page.look[i] ) < page.looks.size() ) {
+            out.ok = true;
+            out.vision = page.vision[i];
+            out.look = page.look[i];
+            out.flags = page.flags[i];
+            out.drawn = page.looks[page.look[i]];
+        }
+        return out;
+    };
+
+    std::optional<fp3d::ui_request> r = fp3d::wait_request( 5000 );
+    if( !r || !r->timed ) {
+        check( false, "main loop waiting", "" );
+        return false;
+    }
+    check( fp3d::post_overmap_query( fp3d::ui_point{ 1, 0, 0 }, false ) == 0 &&
+           fp3d::post_overmap_query( fp3d::ui_point{ 0, 33, 0 }, false ) == 0 &&
+           fp3d::post_overmap_query( fp3d::ui_point{ 0, 0, fp3d::max_overmap_z + 1 }, false ) == 0 &&
+           fp3d::post_overmap_query( fp3d::ui_point{ fp3d::max_overmap_xy + 32, 0, 0 }, false ) == 0 &&
+           !fp3d::overmap_origin_ok( -31, 0, 0 ) && fp3d::overmap_origin_ok( -64, 32, -10 ),
+           "refused unposted: an origin off the grid or out of range", "" );
+
+    const bool set_up = scene( 76 );
+    const int state = map_state.load();
+    const int ax = map_at[0];
+    const int ay = map_at[1];
+    const int az = map_at[2];
+    const m_page mine = read( ax, ay, az, false );
+    bool indexed = whole_page( mine ) && mine.looks.size() >= 2 && mine.looks.size() <= fp3d::max_overmap_looks;
+    for( const int l : mine.look ) {
+        indexed = indexed && l >= 0 && static_cast<size_t>( l ) < mine.looks.size();
+    }
+    const size_t here_i = index_of( ax, ay );
+    const bool blank_first = indexed && mine.looks[0].name.empty() && mine.looks[0].sym.empty() &&
+                             mine.looks[0].color.empty();
+    const bool here_ok = indexed && mine.vision[here_i] >= 1 && mine.looks[mine.look[here_i]].name == map_here[0] &&
+                         mine.looks[mine.look[here_i]].sym == map_here[1] &&
+                         mine.looks[mine.look[here_i]].color == map_here[2];
+    check( set_up && ( state & 14 ) == 14 && indexed && mine.kind == "overmap" && mine.origin[0] == origin_of( ax ) &&
+           mine.origin[1] == origin_of( ay ) && mine.origin[2] == az && blank_first && here_ok && !mine.has_path &&
+           !mine.truncated,
+           "the avatar's page: 1024 cells; its own cell as CDDA draws it",
+           std::to_string( state ) + " (1 a cell that looks different when vague, 2 a note on an explored cell, " +
+           "4 no overmap under the far page, 8 two unseen cells out of sight), " +
+           std::to_string( mine.looks.size() ) + " looks, here \"" +
+           map_here[0] + "\" " + map_here[1] + " " + map_here[2] + ( mine.valid ? "" : ": not valid" ) );
+
+    const m_cell vague = cell_at( map_vague_at[0], map_vague_at[1], az );
+    const bool differs = ( state & 1 ) != 0;
+    check( vague.ok && vague.vision == 1 && vague.drawn.name == map_vague[0] && vague.drawn.sym == map_vague[1] &&
+           vague.drawn.color == map_vague[2] && ( !differs || vague.drawn.name != map_full_name ),
+           "a vaguely seen cell: its vague look only",
+           "\"" + vague.drawn.name + "\" " + vague.drawn.sym + " " + vague.drawn.color +
+           ( differs ? ", in full \"" + map_full_name + "\"" : " (no cell near looks different when vague)" ) );
+    const m_cell unseen = cell_at( map_unseen_at[0], map_unseen_at[1], az );
+    check( unseen.ok && unseen.vision == 0 && unseen.look == 0 && unseen.drawn.name.empty() &&
+           unseen.drawn.sym.empty(), "an unseen cell: unseen, and nothing drawn",
+           "vision " + std::to_string( unseen.vision ) + ", look " + std::to_string( unseen.look ) );
+
+    const m_page noted = read( map_note_at[0], map_note_at[1], az, false );
+    const m_note *n = nullptr;
+    for( const m_note &c : noted.notes ) {
+        if( c.x == map_note_at[0] && c.y == map_note_at[1] ) {
+            n = &c;
+        }
+    }
+    check( whole_page( noted ) && n != nullptr && n->text == "fp3d map note" && n->sym == map_note_sym &&
+           n->color == map_note_color && n->danger && n->radius == 3 && noted.notes_more == 0 &&
+           ( noted.flags[index_of( map_note_at[0], map_note_at[1] )] & fp3d::overmap_explored ) != 0,
+           "a note: CDDA's symbol and colour, its text, its danger; the mark",
+           n ? "\"" + n->text + "\" " + n->sym + " " + n->color + ", radius " + std::to_string( n->radius ) :
+           std::string( "not on the page, " ) + std::to_string( noted.notes.size() ) + " notes" );
+
+    const m_page routed = read( ax, ay, az, true );
+    const bool path_ok = routed.has_path && routed.to[0] == ax && routed.to[1] == ay - 5 && routed.to[2] == az &&
+                         routed.cells.size() == 15 && routed.cells[0] == ax && routed.cells[1] == ay - 1 &&
+                         routed.cells[2] == az && routed.cells[12] == ax && routed.cells[13] == ay - 5 &&
+                         routed.path_more == 0;
+    check( whole_page( routed ) && path_ok && !routed.truncated,
+           "the travel path when asked for: next cell first, the end last",
+           std::to_string( routed.cells.size() / 3 ) + " cells, " + std::to_string( routed.path_more ) + " more" );
+    const m_page whole = parse( map_whole );
+    const m_page tiny = parse( map_tiny );
+    check( whole_page( whole ) && whole.cells.size() == 15 && whole_page( tiny ) && tiny.truncated && tiny.has_path &&
+           tiny.path_more >= 1 && tiny.cells.size() + 3 * static_cast<size_t>( tiny.path_more ) == 15 &&
+           tiny.to[1] == ay - 5 && map_tiny.size() + 40 <= map_whole.size(),
+           "in fewer bytes: the path's far cells go first",
+           std::to_string( map_whole.size() ) + " -> " + std::to_string( map_tiny.size() ) + " bytes, " +
+           std::to_string( tiny.cells.size() / 3 ) + " cells, " + std::to_string( tiny.path_more ) + " more" );
+
+    const m_page remote = read( map_far_at[0], map_far_at[1], az, false );
+    bool blank = whole_page( remote );
+    for( size_t i = 0; blank && i < 1024; i++ ) {
+        blank = remote.look[i] == 0 && remote.vision[i] == 0 && remote.flags[i] == 0;
+    }
+    check( blank && remote.looks.size() == 1 && remote.notes.empty() && ( state & 4 ) != 0,
+           "a page over ground with no overmap: every cell unseen",
+           std::to_string( remote.looks.size() ) + " looks, " + std::to_string( remote.notes.size() ) + " notes" );
+    const bool undone = scene( 77 );
+    check( undone && map_state.load() == 3, "after: as before, and no overmap has appeared there",
+           std::to_string( map_state.load() ) + " of 3 (1 still no overmap under the far page, 2 the note gone)" );
+    return failed == 0;
+}
+
 // The off hand lets go of an item that has grown too heavy for one hand (here: filled up); it stays in its pocket
 // (lead-ui, 2026-11-15).
 static bool run_offhand_weight_checks()
@@ -12338,7 +12732,8 @@ int main()
     const bool lean_ok = driving_ok && run_lean_checks();
     const bool cargo_ok = lean_ok && run_cargo_checks();
     const bool work_ok = cargo_ok && run_vehicle_work_checks();
-    const bool names_ok = work_ok && run_name_checks();
+    const bool map_ok = work_ok && run_overmap_checks();
+    const bool names_ok = map_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -12406,6 +12801,7 @@ int main()
     std::printf( "lean: %s\n", lean_ok ? "ok" : "BAD" );
     std::printf( "cargo: %s\n", cargo_ok ? "ok" : "BAD" );
     std::printf( "vehicle work: %s\n", work_ok ? "ok" : "BAD" );
+    std::printf( "map: %s\n", map_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
     // the game's turns got slower.

@@ -394,9 +394,9 @@ std::optional<vehicle_work_action> take_vehicle_work_action();
 // main loop's request (right after the before-ask hook, and whenever one is posted while it waits there, paused
 // too) and once per turn in pace_turn (during activities); a query posted during another prompt waits for the
 // main loop. Queries are read-only. Results wait until taken; each kind keeps its own newest ones (recipe 8,
-// character 4, vehicle work 4: max_query_results in all), the oldest of that kind dropped beyond.
+// character 4, vehicle work 4, overmap 4: max_query_results in all), the oldest of that kind dropped beyond.
 constexpr size_t max_pending_queries = 8;
-constexpr size_t max_query_results = 16;
+constexpr size_t max_query_results = 20;
 constexpr size_t max_query_result_bytes = 64 * 1024;
 // Client side. The query's id (from 1 up), or 0 if refused: a malformed ref (uid 0 or above max_item_uid, type
 // 0), a position out of range, max_pending_queries pending already, or after shutdown.
@@ -424,6 +424,11 @@ struct vehicle_work_ask {
     uint32_t vpart = 0;
 };
 uint64_t post_vehicle_work_query( const vehicle_work_ask &ask );
+// Overmap queries (G5, fp3d/overmap_read.h): one page of the map as the player knows it, run like recipe
+// queries. Client side. `origin`: the page's north-west cell in absolute overmap terrains; `with_path`: also the
+// avatar's travel path. The query's id, or 0 if refused: an origin overmap_origin_ok() refuses, an overmap
+// query pending already (one at a time), max_pending_queries pending, or after shutdown.
+uint64_t post_overmap_query( const ui_point &origin, bool with_path );
 // Client side. The result (once), nullopt while it is pending or for an unknown or already taken id.
 std::optional<std::string> take_query_result( uint64_t id );
 size_t pending_queries();

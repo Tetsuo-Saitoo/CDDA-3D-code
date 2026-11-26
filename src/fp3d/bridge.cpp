@@ -13,6 +13,7 @@
 
 #include "calendar.h"
 #include "fp3d/cooking.h"
+#include "fp3d/overmap_read.h"
 #include "fp3d/snapshot.h"
 #include "fp3d/vehicle_work.h"
 #include "map_scale_constants.h"
@@ -30,8 +31,9 @@ struct queued_action {
     std::optional<vehicle_work_action> work;
 };
 
-// A query waiting for the sim: a recipe query (L9), a character query (G4) or a vehicle-work query (C6).
-enum class query_kind : uint8_t { recipe, character, vehicle_work };
+// A query waiting for the sim: a recipe query (L9), a character query (G4), a vehicle-work query (C6) or an
+// overmap query (G5).
+enum class query_kind : uint8_t { recipe, character, vehicle_work, overmap };
 struct recipe_query {
     uint64_t id = 0;
     query_kind kind = query_kind::recipe;
@@ -43,6 +45,7 @@ struct recipe_query {
     int mount_x = 0;
     int mount_y = 0;
     uint32_t vpart = 0;                  // vehicle_work, install: the type picked, 0 none
+    bool path = false;                   // overmap: also the avatar's travel path (the page's origin is `pos`)
 };
 
 // A query's result waiting to be taken.
@@ -58,7 +61,8 @@ constexpr size_t kept_results( query_kind kind )
     return kind == query_kind::recipe ? 8 : 4;
 }
 static_assert( kept_results( query_kind::recipe ) + kept_results( query_kind::character ) +
-               kept_results( query_kind::vehicle_work ) == max_query_results, "the kinds' shares add up" );
+               kept_results( query_kind::vehicle_work ) + kept_results( query_kind::overmap ) ==
+               max_query_results, "the kinds' shares add up" );
 
 // Thrown by ask() when CDDA code run by a query wants to ask the client something (a debug popup): queries
 // never prompt. Not a std::exception, so CDDA's handlers let it unwind to run_queries().
@@ -136,7 +140,8 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
         c.queries.pop_front();
         lk.unlock();
         const auto failed = [&q]( const std::string & error ) {
-            return q.kind == query_kind::character ? character_query_error_json( q.id, error ) :
+            return q.kind == query_kind::overmap ? overmap_query_error_json( q.id, error ) :
+                   q.kind == query_kind::character ? character_query_error_json( q.id, error ) :
                    q.kind == query_kind::vehicle_work ? vehicle_work_query_error_json( q.id, error, q.vehicle ) :
                    recipe_query_error_json( q.id, q.container.uid, error );
         };
@@ -151,7 +156,9 @@ void run_queries( channel &c, std::unique_lock<std::mutex> &lk )
                 }
             } scope;
             try {
-                result = q.kind == query_kind::character ? run_character_query( q.id, max_query_result_bytes ) :
+                result = q.kind == query_kind::overmap ?
+                         run_overmap_query( q.id, q.pos.x, q.pos.y, q.pos.z, q.path, max_query_result_bytes ) :
+                         q.kind == query_kind::character ? run_character_query( q.id, max_query_result_bytes ) :
                          q.kind == query_kind::vehicle_work ? ( q.install ?
                                  run_vehicle_install_query( q.id, q.vehicle, q.mount_x, q.mount_y, q.vpart,
                                          max_query_result_bytes ) :
@@ -815,6 +822,30 @@ uint64_t post_vehicle_work_query( const vehicle_work_ask &ask )
     q.mount_x = ask.mount_x;
     q.mount_y = ask.mount_y;
     q.vpart = ask.vpart;
+    c.queries.push_back( q );
+    c.cv.notify_all();
+    return id;
+}
+
+uint64_t post_overmap_query( const ui_point &origin, bool with_path )
+{
+    if( !overmap_origin_ok( origin.x, origin.y, origin.z ) ) {
+        return 0;
+    }
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.queries.size() >= max_pending_queries ||
+        std::any_of( c.queries.begin(), c.queries.end(), []( const recipe_query & q ) {
+        return q.kind == query_kind::overmap;
+    } ) ) {
+        return 0;
+    }
+    const uint64_t id = c.next_query_id++;
+    recipe_query q;
+    q.id = id;
+    q.kind = query_kind::overmap;
+    q.pos = origin;
+    q.path = with_path;
     c.queries.push_back( q );
     c.cv.notify_all();
     return id;
