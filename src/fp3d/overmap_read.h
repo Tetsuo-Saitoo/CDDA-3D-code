@@ -27,6 +27,7 @@ constexpr size_t max_overmap_notes = 256;           // notes a page
 constexpr size_t max_overmap_path = 2048;           // cells of the avatar's path
 constexpr size_t max_overmap_name_columns = 60;
 constexpr size_t max_overmap_note_columns = 450;    // CDDA's own width for a note
+constexpr int max_overmap_danger_radius = 180;      // a note's danger radius as told: an overmap's side
 
 // A cell's flags.
 constexpr int overmap_explored = 1;                 // the player's explored mark
@@ -39,7 +40,8 @@ bool overmap_origin_ok( int x, int y, int z );
 
 // Sim side. The page whose north-west cell is the absolute overmap terrain (x, y) on level z, as JSON: each
 // cell's look, vision level and flags, the looks, the notes on the page and, with `with_path`, the avatar's
-// travel path. At most about `max_bytes`: the path's far cells go first, then notes from the end.
+// travel path. At most about `max_bytes`: the path's far cells go first, then notes from the end, then looks
+// from the end (their cells are then drawn as look 0).
 std::string run_overmap_query( uint64_t query_id, int x, int y, int z, bool with_path, size_t max_bytes );
 std::string overmap_query_error_json( uint64_t query_id, const std::string &error );
 

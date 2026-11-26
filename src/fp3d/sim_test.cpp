@@ -385,6 +385,13 @@ std::string map_whole;                           // the avatar's page with its p
 std::string map_tiny;
 int map_was[2] = { 0, 0 };                       // sim thread only: the vision the two cells had
 bool map_marked = false;                         // sim thread only: scene 76 set the explored mark
+bool map_unseen_marked = false;                  // sim thread only: ... and the one on the unseen cell
+int map_blend_at[2] = { 0, 0 };                  // a campsite among forest, all seen vaguely
+std::string map_blend[3];                        // what CDDA draws on it there: name, symbol, colour
+std::string map_woods_name;                      // a forest's name when seen vaguely
+std::vector<oter_id> map_blend_was;              // sim thread only: what the nine cells were
+std::string map_plain;                           // the avatar's page without its path, and the same with fewer looks
+std::string map_fewer;
 std::atomic<int> work_ms{ 0 };                   // ... and how long it took
 vehicle *work_car = nullptr;                     // sim thread only: scene 63's car, until scene 66
 vehicle *work_machine = nullptr;                 // sim thread only: scene 67's appliance, until scene 66
@@ -2480,6 +2487,13 @@ void observe()
             map_at[2] = at.z();
             const auto drawn = []( const tripoint_abs_omt & c, om_vision_level v, std::string * out ) {
                 const oter_id &ter = overmap_buffer.ter_existing( c );
+                if( ter->blends_adjacent( v ) ) {
+                    const oter_vision::blended_omt as = oter_vision::get_blended_omt_info( c, v );
+                    out[0] = as.name;
+                    out[1] = as.sym;
+                    out[2] = get_all_colors().get_name( as.color );
+                    return;
+                }
                 out[0] = ter->get_name( v );
                 out[1] = ter->get_symbol( v );
                 out[2] = get_all_colors().get_name( ter->get_color( v ) );
@@ -2499,7 +2513,7 @@ void observe()
                             continue;
                         }
                         const oter_id &ter = overmap_buffer.ter_existing( c );
-                        if( ( state & 1 ) == 0 &&
+                        if( ( state & 1 ) == 0 && !ter->blends_adjacent( om_vision_level::vague ) &&
                             ter->get_name( om_vision_level::vague ) != ter->get_name( om_vision_level::full ) ) {
                             vague = c;
                             state |= 1;
@@ -2512,6 +2526,49 @@ void observe()
                 }
             }
             state |= vague != at && unseen != at ? 8 : 0;
+            // The unseen cell gets the explored mark: a mark on a cell the player hasn't seen isn't told.
+            map_unseen_marked = unseen != at && !overmap_buffer.is_explored( unseen );
+            if( map_unseen_marked ) {
+                overmap_buffer.toggle_explored( unseen );
+            }
+            state |= unseen != at && overmap_buffer.is_explored( unseen ) ? 32 : 0;
+            // A cell CDDA blends into its surroundings while it is seen only vaguely: a campsite among forest,
+            // further out of sight still. All nine cells are seen vaguely.
+            const oter_type_str_id camp_type( "campsite" );
+            const oter_id camp = camp_type.is_valid() ? camp_type->get_first() : oter_id();
+            const oter_str_id woods( "forest" );
+            map_blend_was.clear();
+            for( const point &dir : { point( 56, 0 ), point( -56, 0 ), point( 0, 56 ), point( 0, -56 ) } ) {
+                const tripoint_abs_omt middle = at + tripoint_rel_omt( dir.x, dir.y, 0 );
+                bool usable = camp_type.is_valid() && woods.is_valid() && map_blend_was.empty();
+                for( int dy = -1; dy <= 1; dy++ ) {
+                    for( int dx = -1; dx <= 1; dx++ ) {
+                        const tripoint_abs_omt c = middle + tripoint_rel_omt( dx, dy, 0 );
+                        usable = usable && overmap_buffer.get_existing( project_to<coords::om>( c ).xy() ) != nullptr &&
+                                 overmap_buffer.seen( c ) == om_vision_level::unseen && c != vague && c != unseen;
+                    }
+                }
+                if( !usable ) {
+                    continue;
+                }
+                for( int dy = -1; dy <= 1; dy++ ) {
+                    for( int dx = -1; dx <= 1; dx++ ) {
+                        const tripoint_abs_omt c = middle + tripoint_rel_omt( dx, dy, 0 );
+                        map_blend_was.push_back( overmap_buffer.ter_existing( c ) );
+                        overmap_buffer.ter_set( c, dx == 0 && dy == 0 ? camp : woods.id() );
+                        overmap_buffer.set_seen( c, om_vision_level::vague );
+                    }
+                }
+                map_blend_at[0] = middle.x();
+                map_blend_at[1] = middle.y();
+                const oter_vision::blended_omt as = oter_vision::get_blended_omt_info( middle,
+                                                    om_vision_level::vague );
+                map_blend[0] = as.name;
+                map_blend[1] = as.sym;
+                map_blend[2] = get_all_colors().get_name( as.color );
+                map_woods_name = woods->get_name( om_vision_level::vague );
+                state |= camp->blends_adjacent( om_vision_level::vague ) ? 16 : 0;
+            }
             tripoint_abs_omt noted = at;
             for( const point &d : { point( 1, 1 ), point( -1, -1 ), point( 1, -1 ), point( -1, 1 ) } ) {
                 const tripoint_abs_omt c = at + tripoint_rel_omt( d.x, d.y, 0 );
@@ -2556,6 +2613,9 @@ void observe()
             map_whole = fp3d::run_overmap_query( 908, ox, oy, at.z(), true, 64 * 1024 );
             map_tiny = fp3d::run_overmap_query( 909, ox, oy, at.z(), true,
                                                 map_whole.size() > 40 ? map_whole.size() - 40 : 0 );
+            map_plain = fp3d::run_overmap_query( 910, ox, oy, at.z(), false, 64 * 1024 );
+            map_fewer = fp3d::run_overmap_query( 911, ox, oy, at.z(), false,
+                                                 map_plain.size() > 200 ? map_plain.size() - 200 : 0 );
             map_state = state;
             break;
         }
@@ -2575,6 +2635,19 @@ void observe()
                 overmap_buffer.toggle_explored( noted );
             }
             map_marked = false;
+            const tripoint_abs_omt unseen( map_unseen_at[0], map_unseen_at[1], z );
+            if( map_unseen_marked && overmap_buffer.is_explored( unseen ) ) {
+                overmap_buffer.toggle_explored( unseen );
+            }
+            map_unseen_marked = false;
+            // The campsite and its forest: the ground and the vision as they were.
+            for( size_t i = 0; i < map_blend_was.size() && map_blend_was.size() == 9; i++ ) {
+                const tripoint_abs_omt c( map_blend_at[0] + static_cast<int>( i % 3 ) - 1,
+                                          map_blend_at[1] + static_cast<int>( i / 3 ) - 1, z );
+                overmap_buffer.ter_set( c, map_blend_was[i] );
+                overmap_buffer.set_seen( c, om_vision_level::unseen );
+            }
+            map_blend_was.clear();
             u.omt_path.clear();
             const point_abs_om far_om = project_to<coords::om>( tripoint_abs_omt( map_far_at[0], map_far_at[1],
                                         z ) ).xy();
@@ -11278,8 +11351,19 @@ static bool run_overmap_checks()
            ( differs ? ", in full \"" + map_full_name + "\"" : " (no cell near looks different when vague)" ) );
     const m_cell unseen = cell_at( map_unseen_at[0], map_unseen_at[1], az );
     check( unseen.ok && unseen.vision == 0 && unseen.look == 0 && unseen.drawn.name.empty() &&
-           unseen.drawn.sym.empty(), "an unseen cell: unseen, and nothing drawn",
-           "vision " + std::to_string( unseen.vision ) + ", look " + std::to_string( unseen.look ) );
+           unseen.drawn.sym.empty() && ( state & 32 ) != 0 && unseen.flags == 0,
+           "an unseen cell: nothing drawn, its explored mark not told",
+           "vision " + std::to_string( unseen.vision ) + ", look " + std::to_string( unseen.look ) + ", flags " +
+           std::to_string( unseen.flags ) + ( ( state & 32 ) != 0 ? "" : " (the mark wasn't set)" ) );
+    // A campsite among forest, all seen vaguely: CDDA draws the campsite as forest until it is seen better.
+    const m_cell blended = cell_at( map_blend_at[0], map_blend_at[1], az );
+    check( ( state & 16 ) != 0 && blended.ok && blended.vision == 1 && !blended.drawn.name.empty() &&
+           blended.drawn.name == map_blend[0] && blended.drawn.sym == map_blend[1] &&
+           blended.drawn.color == map_blend[2] && blended.drawn.name == map_woods_name,
+           "a cell CDDA blends in when vague: drawn as its neighbours",
+           "\"" + blended.drawn.name + "\" " + blended.drawn.sym + " " + blended.drawn.color + ", CDDA's \"" +
+           map_blend[0] + "\", a forest's \"" + map_woods_name + "\"" +
+           ( ( state & 16 ) != 0 ? "" : " (no campsite placed)" ) );
 
     const m_page noted = read( map_note_at[0], map_note_at[1], az, false );
     const m_note *n = nullptr;
@@ -11311,6 +11395,21 @@ static bool run_overmap_checks()
            "in fewer bytes: the path's far cells go first",
            std::to_string( map_whole.size() ) + " -> " + std::to_string( map_tiny.size() ) + " bytes, " +
            std::to_string( tiny.cells.size() / 3 ) + " cells, " + std::to_string( tiny.path_more ) + " more" );
+
+    // Still too large with the path and the notes gone: looks go from the end, their cells drawn blank.
+    const m_page plain = parse( map_plain );
+    const m_page fewer = parse( map_fewer );
+    bool fewer_ok = whole_page( plain ) && whole_page( fewer ) && fewer.truncated && !fewer.looks.empty() &&
+                    fewer.looks.size() < plain.looks.size() && map_fewer.size() + 200 <= map_plain.size();
+    size_t blanked = 0;
+    for( size_t i = 0; fewer_ok && i < 1024; i++ ) {
+        fewer_ok = fewer.look[i] >= 0 && static_cast<size_t>( fewer.look[i] ) < fewer.looks.size();
+        blanked += fewer.look[i] == 0 && fewer.vision[i] > 0 ? 1 : 0;
+    }
+    check( fewer_ok && blanked > 0, "in fewer bytes still: looks go last, their cells drawn blank",
+           std::to_string( map_plain.size() ) + " -> " + std::to_string( map_fewer.size() ) + " bytes, " +
+           std::to_string( plain.looks.size() ) + " -> " + std::to_string( fewer.looks.size() ) + " looks, " +
+           std::to_string( blanked ) + " seen cells blank" );
 
     const m_page remote = read( map_far_at[0], map_far_at[1], az, false );
     bool blank = whole_page( remote );

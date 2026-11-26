@@ -138,10 +138,21 @@ std::string write_page( uint64_t query_id, const page_view &p )
     return os.str();
 }
 
-// What CDDA's map screen draws for a terrain the player knows this well.
-look_view look_of( const oter_id &ter, om_vision_level vision )
+// What CDDA's map screen draws on the cell `p`, whose terrain the player knows this well.
+look_view look_of( const tripoint_abs_omt &p, const oter_id &ter, om_vision_level vision )
 {
     look_view l;
+    if( ter->blends_adjacent( vision ) ) {
+        // Some terrains blend into their surroundings until they are seen better (a campsite in a forest, from
+        // afar): CDDA draws the commonest of the cell's neighbours instead, or its "unexplored" look when it has
+        // seen none of them. This is its own function for that. It asks for a neighbour's terrain only where the
+        // player has seen that neighbour, so the neighbour's overmap exists and none is created.
+        const oter_vision::blended_omt as = oter_vision::get_blended_omt_info( p, vision );
+        l.name = client_text( as.name, max_overmap_name_columns, 4 * max_overmap_name_columns );
+        l.sym = client_text( as.sym, 2, 8 );
+        l.color = get_all_colors().get_name( as.color );
+        return l;
+    }
     l.name = client_text( ter->get_name( vision ), max_overmap_name_columns, 4 * max_overmap_name_columns );
     l.sym = client_text( ter->get_symbol( vision ), 2, 8 );
     l.color = get_all_colors().get_name( ter->get_color( vision ) );
@@ -162,7 +173,7 @@ note_view note_of( const tripoint_abs_omt &p )
     const size_t from = std::min( std::get<2>( shown ), raw.size() );
     n.text = client_text( raw.substr( from ), max_overmap_note_columns, 4 * max_overmap_note_columns );
     n.danger = overmap_buffer.is_marked_dangerous( p );
-    n.radius = n.danger ? std::max( 0, overmap_buffer.note_danger_radius( p ) ) : 0;
+    n.radius = n.danger ? std::clamp( overmap_buffer.note_danger_radius( p ), 0, max_overmap_danger_radius ) : 0;
     return n;
 }
 
@@ -214,7 +225,7 @@ std::string run_overmap_query( uint64_t query_id, int x, int y, int z, bool with
             const om_vision_level vision = overmap_buffer.seen( p );
             int look = 0;
             if( vision != om_vision_level::unseen ) {
-                const look_view l = look_of( overmap_buffer.ter_existing( p ), vision );
+                const look_view l = look_of( p, overmap_buffer.ter_existing( p ), vision );
                 const std::string key = l.name + '\x1f' + l.sym + '\x1f' + l.color;
                 const auto had = known.find( key );
                 if( had != known.end() ) {
@@ -229,9 +240,12 @@ std::string run_overmap_query( uint64_t query_id, int x, int y, int z, bool with
             }
             page.look.push_back( look );
             page.vision.push_back( static_cast<int>( vision ) );
-            page.flags.push_back( ( overmap_buffer.is_explored( p ) ? overmap_explored : 0 ) |
-                                  ( overmap_buffer.has_vehicle( p ) ? overmap_vehicle : 0 ) |
-                                  ( overmap_buffer.has_camp( p ) ? overmap_camp : 0 ) |
+            // CDDA's map shows the explored mark and a tracked vehicle only on cells the player has seen, and a
+            // camp as its terrain; the mission's target it shows wherever it is.
+            const bool seen = vision != om_vision_level::unseen;
+            page.flags.push_back( ( seen && overmap_buffer.is_explored( p ) ? overmap_explored : 0 ) |
+                                  ( seen && overmap_buffer.has_vehicle( p ) ? overmap_vehicle : 0 ) |
+                                  ( seen && overmap_buffer.has_camp( p ) ? overmap_camp : 0 ) |
                                   ( p == mission ? overmap_mission : 0 ) );
             if( overmap_buffer.has_note( p ) ) {
                 if( page.notes.size() < max_overmap_notes ) {
@@ -267,6 +281,16 @@ std::string run_overmap_query( uint64_t query_id, int x, int y, int z, bool with
         const size_t drop = std::max<size_t>( 1, page.notes.size() / 2 );
         page.notes.resize( page.notes.size() - drop );
         page.notes_more += drop;
+        page.truncated = true;
+        out = write_page( query_id, page );
+    }
+    // Then looks from the end, half of them a round: their cells are drawn as look 0.
+    while( out.size() > max_bytes && page.looks.size() > 1 ) {
+        const size_t keep = std::max<size_t>( 1, page.looks.size() / 2 );
+        page.looks.resize( keep );
+        for( int &look : page.look ) {
+            look = static_cast<size_t>( look ) < keep ? look : 0;
+        }
         page.truncated = true;
         out = write_page( query_id, page );
     }
