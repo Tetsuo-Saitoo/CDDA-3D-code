@@ -19,6 +19,7 @@
 #include "fp3d/hands.h"
 #include "fp3d/item_hands.h"
 #include "fp3d/points.h"
+#include "fp3d/snapshot.h"
 #include "fp3d/vehicle_work.h"
 #include "game.h"
 #include "game_inventory.h"
@@ -389,14 +390,14 @@ hand_view view_of( const item_location &loc )
     // Read only: the snapshot gives handles; an item it hasn't listed yet has none.
     h.uid = read_item_handle( it );
     h.id = capped( it.typeId().str() );
-    h.name = capped( remove_color_tags( item::tname( it.typeId() ) ) );
+    h.name = capped( strip_color_tags( item::tname( it.typeId() ) ) );
     const units::volume capacity = it.get_total_capacity();
     if( capacity > 0_ml ) {
         h.capacity_ml = units::to_milliliter( capacity );
         h.ml = units::to_milliliter( it.get_total_contained_volume() );
         for( const item *c : it.all_items_top() ) {
             if( c->made_of( phase_id::LIQUID ) ) {
-                h.liquid = capped( remove_color_tags( item::tname( c->typeId() ) ) );
+                h.liquid = capped( strip_color_tags( item::tname( c->typeId() ) ) );
                 break;
             }
         }

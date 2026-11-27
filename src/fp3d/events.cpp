@@ -127,7 +127,7 @@ void on_message( const std::string &text, int type )
     event e;
     e.kind = event_kind::message;
     e.detail = static_cast<uint32_t>( type );
-    e.text = bounded_text( remove_color_tags( text ) );
+    e.text = bounded_text( strip_color_tags( text ) );
     push( std::move( e ) );
 }
 
@@ -344,7 +344,7 @@ void on_item_result( uint64_t item_uid, uint32_t tag, bool done, const std::stri
     e.detail = tag;
     e.amount = done ? 1 : 0;
     // Plain text, as the message event's: item names carry color tags.
-    e.text = bounded_text( remove_color_tags( why ) );
+    e.text = bounded_text( strip_color_tags( why ) );
     push( std::move( e ) );
 }
 
@@ -355,7 +355,7 @@ void on_work_result( uint64_t vehicle_uid, uint32_t tag, bool done, const std::s
     e.uid = vehicle_uid;
     e.detail = tag;
     e.amount = done ? 1 : 0;
-    e.text = bounded_text( remove_color_tags( why ) );
+    e.text = bounded_text( strip_color_tags( why ) );
     push( std::move( e ) );
 }
 

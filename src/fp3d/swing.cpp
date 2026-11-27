@@ -277,8 +277,8 @@ int technique_family( const ma_technique &tec )
 
 std::string technique_text( const std::string &name )
 {
-    // Cut first: remove_color_tags repeats the rest of the text once per opener that lies before one '>'.
-    std::string s = sanitize_text( whole_utf8( remove_color_tags( whole_utf8( name, max_technique_source ) ),
+    // Cut first, then the tags out in one pass (strip_color_tags).
+    std::string s = sanitize_text( whole_utf8( strip_color_tags( whole_utf8( name, max_technique_source ) ),
                                    max_technique_name ), max_technique_name );
     // That one pass leaves a tag for an opener inside an opener ("<col<color_red>or_red>"), and a byte dropped
     // after it can put one together ("<co\x01lor_red>"): whatever still reads as a tag is taken out, until none

@@ -219,7 +219,7 @@ std::string cap_utf8( std::string s, size_t max_bytes )
 // Plain text for the client: no colour tags, no control characters, capped.
 std::string plain( const std::string &s, size_t max_bytes )
 {
-    return cap_utf8( sanitize_text( remove_color_tags( s ), max_bytes * 2 ), max_bytes );
+    return cap_utf8( sanitize_text( strip_color_tags( s ), max_bytes * 2 ), max_bytes );
 }
 
 bool is_cookware( const item &it )

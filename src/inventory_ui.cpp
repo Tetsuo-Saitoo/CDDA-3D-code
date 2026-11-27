@@ -63,6 +63,7 @@
 #include "vehicle_selector.h"
 #include "vpart_position.h"
 #include "fp3d/bridge.h" // FP3D:
+#include "fp3d/snapshot.h" // FP3D:
 
 #if defined(__ANDROID__)
 #include <SDL_keyboard.h>
@@ -3382,7 +3383,7 @@ static fp3d::ui_request fp3d_item_request( const std::vector<inventory_entry *> 
     fp3d::ui_request req;
     req.kind = kind;
     req.context = "INVENTORY";
-    req.title = remove_color_tags( title );
+    req.title = fp3d::strip_color_tags( title );
     for( size_t i = 0; i < picks.size(); i++ ) {
         const item_location &loc = picks[i]->any_item();
         req.entries.push_back( { static_cast<int>( i ),
