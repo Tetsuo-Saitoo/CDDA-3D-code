@@ -148,9 +148,36 @@ uint8_t clamp_u8( double v )
 
 } // namespace
 
+std::string strip_color_tags( const std::string &s )
+{
+    static const std::string open = "<color_";
+    static const std::string close = "</color>";
+    std::string out;
+    out.reserve( s.size() );
+    size_t i = 0;
+    while( i < s.size() ) {
+        if( s.compare( i, close.size(), close ) == 0 ) {
+            i += close.size();
+            continue;
+        }
+        if( s.compare( i, open.size(), open ) == 0 ) {
+            const size_t end = s.find( '>', i + open.size() );
+            if( end == std::string::npos ) {
+                out.append( s, i, std::string::npos );
+                break;
+            }
+            i = end + 1;
+            continue;
+        }
+        out.push_back( s[i] );
+        i++;
+    }
+    return out;
+}
+
 std::string client_text( const std::string &raw, size_t max_columns, size_t max_bytes )
 {
-    std::string s = sanitize_text( utf8_truncate( remove_color_tags( raw ), max_columns ), max_bytes );
+    std::string s = sanitize_text( utf8_truncate( strip_color_tags( raw ), max_columns ), max_bytes );
     // The byte cap may have cut a character: drop a last sequence that is not whole.
     size_t lead = s.size();
     while( lead > 0 && s.size() - lead < 3 && ( static_cast<unsigned char>( s[lead - 1] ) & 0xC0 ) == 0x80 ) {

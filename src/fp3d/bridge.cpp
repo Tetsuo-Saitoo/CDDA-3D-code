@@ -81,6 +81,8 @@ struct channel {
     std::optional<item_action> item_now; // the item action last answered as `fp3d_item`, until the sim takes it
     std::optional<stairs_action> stairs_now; // ... and the stairs action answered as `fp3d_stairs`
     std::optional<vehicle_work_action> work_now; // ... and the one answered as `fp3d_vehicle_work`
+    std::deque<map_command> map_commands;    // queued notes (G5), answered like a job
+    std::optional<map_command> map_now;  // ... and the one answered as `fp3d_map`
     std::optional<ui_point> square_now;  // the square the action last answered was queued with, until the sim
                                          // takes it or the main loop waits again
     bool save_wanted = false;            // request_save() until the sim takes it
@@ -376,6 +378,7 @@ ui_answer ask( ui_request req )
     c.item_now.reset();   // only the answer to this request may carry one (a client can't send `fp3d_item` itself)
     c.stairs_now.reset();
     c.work_now.reset();
+    c.map_now.reset();
     if( timed ) {
         // The main loop waits for input again: what an interrupt or a queued square was meant for has ended.
         interrupt_requested.store( false );
@@ -409,6 +412,17 @@ ui_answer ask( ui_request req )
             job.action = job_action;
             job.queued = true;
             c.reply = std::move( job );
+            break;
+        }
+        // The map's notes, like a job: in the main loop, also while paused; one command an answer.
+        if( timed && !c.map_commands.empty() ) {
+            ui_answer map;
+            map.id = id;
+            map.action = map_action_name;
+            map.queued = true;
+            c.map_now = std::move( c.map_commands.front() );
+            c.map_commands.pop_front();
+            c.reply = std::move( map );
             break;
         }
         // Checked under the same lock that posted the request, so a client never sees it as waiting while
@@ -589,7 +603,7 @@ static bool queue_plain_action( const std::string &action, const std::optional<u
     // The bridge's own answers (a save, cheats) only come from the bridge: checked on exactly what is queued.
     std::string name = sanitize_text( action, 128 );
     if( name == save_action || name == job_action || name == item_action_name || name == stairs_action_name ||
-        name == vehicle_work_action_name ) {
+        name == vehicle_work_action_name || name == map_action_name ) {
         return false;
     }
     channel &c = chan();
@@ -749,6 +763,30 @@ std::optional<vehicle_work_action> take_vehicle_work_action()
     std::optional<vehicle_work_action> a = std::move( c.work_now );
     c.work_now.reset();
     return a;
+}
+
+bool queue_map_command( const map_command &m )
+{
+    if( !map_command_ok( m ) ) {
+        return false;
+    }
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    if( c.shut_down || c.map_commands.size() >= max_queued_map_commands ) {
+        return false;
+    }
+    c.map_commands.push_back( m );
+    c.cv.notify_all();
+    return true;
+}
+
+std::optional<map_command> take_map_command()
+{
+    channel &c = chan();
+    std::lock_guard<std::mutex> lk( c.m );
+    std::optional<map_command> m = std::move( c.map_now );
+    c.map_now.reset();
+    return m;
 }
 
 uint64_t post_recipe_query( const item_ref &container, const ui_point &pos )
@@ -1050,6 +1088,8 @@ void reset_channel()
     c.item_now.reset();
     c.stairs_now.reset();
     c.work_now.reset();
+    c.map_commands.clear();
+    c.map_now.reset();
     c.square_now.reset();
     c.save_wanted = false;
     c.job_wanted = false;

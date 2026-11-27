@@ -28,10 +28,10 @@ namespace fp3d
 
 enum class event_kind : uint8_t {
     sound, message, attack, damage, projectile, explosion, death, anim, turn_end, lightning, item_result, misfire,
-    work_result
+    work_result, map_result
 };
 // How many kinds there are (tables indexed by kind).
-constexpr size_t event_kind_count = static_cast<size_t>( event_kind::work_result ) + 1;
+constexpr size_t event_kind_count = static_cast<size_t>( event_kind::map_result ) + 1;
 
 struct event {
     event_kind kind = event_kind::turn_end;
@@ -134,6 +134,9 @@ void on_misfire( const Character &shooter, const item &gun );
 // (not a creature), `detail` the tag, `amount` 1 the work was started or 0 refused, `text` why it was refused
 // ("" when started, or when the player said no to CDDA's question).
 void on_work_result( uint64_t vehicle_uid, uint32_t tag, bool done, const std::string &why );
+// A map command that carried a tag (bridge.h map_command) has run: `pos` is its cell in overmap terrains (not
+// squares), `detail` the tag, `amount` 1 done or 0 refused, `text` why it was refused ("" when done).
+void on_map_result( const ui_point &cell, uint32_t tag, bool done, const std::string &why );
 
 } // namespace fp3d
 

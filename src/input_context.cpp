@@ -40,6 +40,7 @@
 #include "fp3d/bridge.h" // FP3D:
 #include "fp3d/cheats.h" // FP3D:
 #include "fp3d/events.h" // FP3D:
+#include "fp3d/overmap_read.h" // FP3D:
 
 enum class kb_menu_status {
     remove, reset, add, add_global, execute, show, filter
@@ -480,6 +481,11 @@ const std::string &input_context::handle_input( const int timeout )
             // FP3D: cheats and the test kit the client asked for (fp3d/cheats.h), likewise.
             if( a.queued && a.action == fp3d::job_action ) {
                 fp3d::run_jobs();
+                continue;
+            }
+            // FP3D: a note on the map the client asked for (fp3d/overmap_read.h), likewise.
+            if( a.queued && a.action == fp3d::map_action_name ) {
+                fp3d::run_map_command();
                 continue;
             }
             // A timed (main loop) request expired in real time: the player waits out the turn.

@@ -332,6 +332,9 @@ struct effect_view {
 // Text from game data (names from mods, item names) as the client gets it: color tags removed, at most
 // `max_columns` wide, no control characters, at most `max_bytes` long and never cut inside a UTF-8 character.
 std::string client_text( const std::string &raw, size_t max_columns, size_t max_bytes );
+// `s` without CDDA's colour tags (`<color_...>` up to its `>`, and `</color>`), in one pass; never longer than
+// `s`. A `<color_` with no `>` after it is kept as it is.
+std::string strip_color_tags( const std::string &s );
 
 // CDDA's morale screen, for the HUD's mood line.
 constexpr size_t max_mood_entries = 12;

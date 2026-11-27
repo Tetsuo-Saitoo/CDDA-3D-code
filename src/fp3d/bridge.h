@@ -389,6 +389,25 @@ constexpr const char *vehicle_work_action_name = "fp3d_vehicle_work";
 // Sim side: the action the bridge just answered `fp3d_vehicle_work` with (once), nullopt if none.
 std::optional<vehicle_work_action> take_vehicle_work_action();
 
+// G5, the map's notes (fp3d/overmap_read.h): add, change or delete the note on a cell, as CDDA's map screen does.
+// Run in the main loop like a job (below): at its next request, also while paused, one command an answer, and no
+// game time passes; during an activity it waits for the activity to end. Everything is checked again when it runs.
+struct map_command {
+    char cmd = ' ';                      // 'n' note (add, or change the one there), 'u' unnote (delete it)
+    ui_point omt;                        // the cell, absolute overmap terrains (overmap_cell_ok)
+    bool has_text = false;               // 'n': the note's new text; without it the note keeps its text
+    std::string text;                    // at most max_map_note_input_bytes of UTF-8 (map_note_text_ok)
+    int danger = -1;                     // 'n': -1 the danger mark as it is, 0 cleared, 1 set with `radius`
+    int radius = 0;                      // 0 .. max_map_danger_radius, and only with danger 1
+    uint32_t tag = 0;                    // the client's number for it, 0 none; answered by a map_result event
+};
+constexpr size_t max_queued_map_commands = 16;
+// Client side. False if a field is out of range (map_command_ok), or max_queued_map_commands are waiting.
+bool queue_map_command( const map_command &c );
+constexpr const char *map_action_name = "fp3d_map";
+// Sim side: the command the bridge just answered `fp3d_map` with (once), nullopt if none.
+std::optional<map_command> take_map_command();
+
 // Recipe queries (L9, fp3d/cooking.h): "what can this container's contents become, and how long?" without
 // blocking. The client posts a query and later takes its result (JSON text). The sim runs pending queries at the
 // main loop's request (right after the before-ask hook, and whenever one is posted while it waits there, paused

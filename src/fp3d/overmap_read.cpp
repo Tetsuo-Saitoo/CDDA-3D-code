@@ -1,21 +1,25 @@
 #include "fp3d/overmap_read.h"
 
 #include <algorithm>
+#include <optional>
 #include <sstream>
 #include <tuple>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 #include "avatar.h"
 #include "calendar.h"
 #include "color.h"
 #include "coordinates.h"
+#include "fp3d/events.h"
 #include "fp3d/snapshot.h"
 #include "json.h"
 #include "omdata.h"
 #include "overmap.h"
 #include "overmap_ui.h"
 #include "overmapbuffer.h"
+#include "translations.h"
 #include "type_id.h"
 
 namespace fp3d
@@ -179,10 +183,15 @@ note_view note_of( const tripoint_abs_omt &p )
 
 } // namespace
 
-bool overmap_origin_ok( int x, int y, int z )
+bool overmap_cell_ok( int x, int y, int z )
 {
     return x >= -max_overmap_xy && x <= max_overmap_xy && y >= -max_overmap_xy && y <= max_overmap_xy &&
-           z >= -max_overmap_z && z <= max_overmap_z && x % overmap_page == 0 && y % overmap_page == 0;
+           z >= -max_overmap_z && z <= max_overmap_z;
+}
+
+bool overmap_origin_ok( int x, int y, int z )
+{
+    return overmap_cell_ok( x, y, z ) && x % overmap_page == 0 && y % overmap_page == 0;
 }
 
 std::string overmap_query_error_json( uint64_t query_id, const std::string &error )
@@ -295,6 +304,121 @@ std::string run_overmap_query( uint64_t query_id, int x, int y, int z, bool with
         out = write_page( query_id, page );
     }
     return out;
+}
+
+bool map_note_text_ok( const std::string &text )
+{
+    if( text.size() > max_map_note_input_bytes ) {
+        return false;
+    }
+    for( size_t i = 0; i < text.size(); ) {
+        const unsigned char lead = static_cast<unsigned char>( text[i] );
+        const size_t len = lead < 0x80 ? 1 : lead >= 0xC2 && lead <= 0xDF ? 2 : lead >= 0xE0 && lead <= 0xEF ? 3 :
+                           lead >= 0xF0 && lead <= 0xF4 ? 4 : 0;
+        if( len == 0 || len > text.size() - i ) {
+            return false;
+        }
+        uint32_t cp = len == 1 ? lead : len == 2 ? lead & 0x1Fu : len == 3 ? lead & 0x0Fu : lead & 0x07u;
+        for( size_t k = 1; k < len; k++ ) {
+            const unsigned char next = static_cast<unsigned char>( text[i + k] );
+            if( ( next & 0xC0 ) != 0x80 ) {
+                return false;
+            }
+            cp = ( cp << 6 ) | ( next & 0x3Fu );
+        }
+        // Overlong forms, surrogates and code points beyond Unicode are not UTF-8.
+        if( ( len == 3 && ( cp < 0x800 || ( cp >= 0xD800 && cp <= 0xDFFF ) ) ) ||
+            ( len == 4 && ( cp < 0x10000 || cp > 0x10FFFF ) ) ) {
+            return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+bool map_command_ok( const map_command &c )
+{
+    if( ( c.cmd != 'n' && c.cmd != 'u' ) || !overmap_cell_ok( c.omt.x, c.omt.y, c.omt.z ) || c.tag > max_item_tag ||
+        !map_note_text_ok( c.text ) || ( !c.has_text && !c.text.empty() ) ) {
+        return false;
+    }
+    if( c.cmd == 'u' ) {
+        return !c.has_text && c.danger == -1 && c.radius == 0;
+    }
+    return c.danger >= -1 && c.danger <= 1 && c.radius >= 0 && c.radius <= max_map_danger_radius &&
+           ( c.danger == 1 || c.radius == 0 );
+}
+
+std::string map_note_text( const std::string &raw )
+{
+    // Control characters first, so that none can hide a colour tag from the step after.
+    std::string plain;
+    const size_t end = std::min( raw.size(), max_map_note_input_bytes );
+    plain.reserve( end );
+    for( size_t i = 0; i < end; i++ ) {
+        const unsigned char b = static_cast<unsigned char>( raw[i] );
+        const unsigned char next = i + 1 < end ? static_cast<unsigned char>( raw[i + 1] ) : 0;
+        if( b == 0xC2 && next >= 0x80 && next <= 0x9F ) {   // C1, U+0080 .. U+009F
+            i++;
+        } else if( b >= 0x20 && b != 0x7F ) {
+            plain.push_back( raw[i] );
+        }
+    }
+    // Taking a tag out may join two pieces into another one: again until none is left. A round that changes
+    // anything makes the text shorter, so this ends.
+    std::string untagged = strip_color_tags( plain );
+    while( untagged != plain ) {
+        plain = std::move( untagged );
+        untagged = strip_color_tags( plain );
+    }
+    return client_text( plain, max_overmap_note_columns, 4 * max_overmap_note_columns );
+}
+
+namespace
+{
+
+// The note command `c` done as CDDA's map screen does it: "" when it went through, else the sentence why not.
+std::string change_note( const map_command &c )
+{
+    const tripoint_abs_omt p( c.omt.x, c.omt.y, c.omt.z );
+    // CDDA's note calls go through get_om_global, which makes an overmap where there is none: never call them
+    // there.
+    if( !overmap_buffer.has( project_to<coords::om>( p.xy() ) ) ) {
+        return _( "Nothing is known of that place yet." );
+    }
+    const bool had = overmap_buffer.has_note( p );
+    if( c.cmd == 'u' ) {
+        if( !had ) {
+            return _( "There is no note there." );
+        }
+        overmap_buffer.delete_note( p );
+        return std::string();
+    }
+    const std::string text = c.has_text ? map_note_text( c.text ) : std::string();
+    if( c.has_text ? text.empty() : !had ) {
+        return _( "The note has no text." );
+    }
+    if( c.has_text ) {
+        overmap_buffer.add_note( p, text );
+    }
+    if( c.danger >= 0 ) {
+        overmap_buffer.mark_note_dangerous( p, c.danger == 1 ? c.radius : 0, c.danger == 1 );
+    }
+    return std::string();
+}
+
+} // namespace
+
+void run_map_command()
+{
+    const std::optional<map_command> c = take_map_command();
+    if( !c ) {
+        return;
+    }
+    const std::string why = map_command_ok( *c ) ? change_note( *c ) : std::string( _( "That can't be done." ) );
+    if( c->tag != 0 && events_enabled() ) {
+        on_map_result( c->omt, c->tag, why.empty(), why );
+    }
 }
 
 } // namespace fp3d

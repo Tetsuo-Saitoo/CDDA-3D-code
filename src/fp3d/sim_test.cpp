@@ -392,6 +392,13 @@ std::string map_woods_name;                      // a forest's name when seen va
 std::vector<oter_id> map_blend_was;              // sim thread only: what the nine cells were
 std::string map_plain;                           // the avatar's page without its path, and the same with fewer looks
 std::string map_fewer;
+// The map notes' scenes (78 sets up, 79 looks at the note as CDDA keeps it).
+int map_mark_at[2] = { 0, 0 };                   // a cell near the avatar with no note
+std::string map_mark_plain[2];                   // CDDA's symbol and colour for "fp3d mark",
+std::string map_mark_base[2];                    // ... and for "B:g;fp3d base"
+std::string map_mark_raw;                        // scene 79: the note's text as CDDA keeps it
+std::atomic<bool> map_mark_has{ false };         // ... whether there is one
+std::atomic<int> map_mark_radius{ -1 };          // ... and its danger radius, -1 not dangerous
 std::atomic<int> work_ms{ 0 };                   // ... and how long it took
 vehicle *work_car = nullptr;                     // sim thread only: scene 63's car, until scene 66
 vehicle *work_machine = nullptr;                 // sim thread only: scene 67's appliance, until scene 66
@@ -2654,6 +2661,41 @@ void observe()
             state |= overmap_buffer.has( far_om ) ? 0 : 1;
             state |= overmap_buffer.has_note( noted ) ? 0 : 2;
             map_state = state;
+            break;
+        }
+        case 78: {
+            // The map's notes: a cell near the avatar with no note, and how CDDA draws two notes' prefixes.
+            const tripoint_abs_omt at( map_at[0], map_at[1], map_at[2] );
+            int state = 0;
+            for( const point &d : { point( 2, 2 ), point( -2, 2 ), point( 2, -2 ), point( -2, -2 ), point( 3, 0 ) } ) {
+                const tripoint_abs_omt c = at + tripoint_rel_omt( d.x, d.y, 0 );
+                if( ( state & 1 ) == 0 && !overmap_buffer.has_note( c ) ) {
+                    map_mark_at[0] = c.x();
+                    map_mark_at[1] = c.y();
+                    state |= 1;
+                }
+            }
+            const point_abs_om far_om = project_to<coords::om>( tripoint_abs_omt( map_far_at[0], map_far_at[1],
+                                        at.z() ) ).xy();
+            state |= overmap_buffer.has( far_om ) ? 0 : 2;
+            const std::tuple<char, nc_color, size_t> plain = overmap_ui::get_note_display_info( "fp3d mark" );
+            const std::tuple<char, nc_color, size_t> base = overmap_ui::get_note_display_info( "B:g;fp3d base" );
+            map_mark_plain[0] = std::string( 1, std::get<0>( plain ) );
+            map_mark_plain[1] = get_all_colors().get_name( std::get<1>( plain ) );
+            map_mark_base[0] = std::string( 1, std::get<0>( base ) );
+            map_mark_base[1] = get_all_colors().get_name( std::get<1>( base ) );
+            map_state = state;
+            break;
+        }
+        case 79: {
+            // The note on the scene-78 cell as CDDA keeps it; still no overmap under the far page.
+            const tripoint_abs_omt c( map_mark_at[0], map_mark_at[1], map_at[2] );
+            map_mark_has = overmap_buffer.has_note( c );
+            map_mark_raw = overmap_buffer.note( c );
+            map_mark_radius = overmap_buffer.note_danger_radius( c );
+            const point_abs_om far_om = project_to<coords::om>( tripoint_abs_omt( map_far_at[0], map_far_at[1],
+                                        map_at[2] ) ).xy();
+            map_state = overmap_buffer.has( far_om ) ? 0 : 1;
             break;
         }
         case 66: {
@@ -11425,6 +11467,284 @@ static bool run_overmap_checks()
     return failed == 0;
 }
 
+// G5, the map's notes (fp3d/overmap_read.h): a note added, changed and deleted through the map command, as CDDA's
+// map screen does it; its text cleaned and capped; refused on ground with no overmap yet, which it never makes.
+static bool run_map_note_checks()
+{
+    int failed = 0;
+    const auto check = [&]( bool ok, const char *what, const std::string &detail ) {
+        std::printf( "  notes: %-50s %s %s\n", what, ok ? "PASS" : "FAIL", detail.c_str() );
+        failed += ok ? 0 : 1;
+    };
+    const auto scene = [&]( int number ) {
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return false;
+        }
+        hand_setup = number;
+        fp3d::queue_action( "no_such_action" );   // dropped: the scene runs before the request asked again
+        at = fp3d::wait_request( 20000, at->id );
+        return at && at->timed;
+    };
+    const auto cmd = []( char c, int x, int y, int z ) {
+        fp3d::map_command m;
+        m.cmd = c;
+        m.omt = fp3d::ui_point{ x, y, z };
+        return m;
+    };
+    const auto with_text = []( fp3d::map_command m, const std::string & text ) {
+        m.has_text = true;
+        m.text = text;
+        return m;
+    };
+    const auto with_danger = []( fp3d::map_command m, int danger, int radius ) {
+        m.danger = danger;
+        m.radius = radius;
+        return m;
+    };
+
+    // Refused before anything is queued.
+    const fp3d::map_command origin = with_text( cmd( 'n', 0, 0, 0 ), "a" );
+    fp3d::map_command untexted = origin;
+    untexted.has_text = false;
+    fp3d::map_command big_tag = origin;
+    big_tag.tag = fp3d::max_item_tag + 1u;
+    bool refused = !fp3d::queue_action( fp3d::map_action_name );
+    for( const fp3d::map_command &m : {
+             cmd( 'x', 0, 0, 0 ), with_text( cmd( 'n', 0, 0, fp3d::max_overmap_z + 1 ), "a" ),
+             with_text( cmd( 'n', fp3d::max_overmap_xy + 1, 0, 0 ), "a" ), with_danger( origin, 1, 21 ),
+             with_danger( origin, 1, -1 ), with_danger( origin, -1, 3 ), with_danger( origin, 0, 3 ),
+             with_danger( origin, 2, 0 ), with_text( cmd( 'u', 0, 0, 0 ), "a" ),
+             with_danger( cmd( 'u', 0, 0, 0 ), 0, 0 ), untexted, big_tag,
+             with_text( cmd( 'n', 0, 0, 0 ), std::string( fp3d::max_map_note_input_bytes + 1, 'a' ) )
+         } ) {
+        refused = refused && !fp3d::queue_map_command( m );
+    }
+    for( const char *bad : {
+             "\xC0\xAF", "\xED\xA0\x80", "\xF4\x90\x80\x80", "\xE2\x82", "\x80", "a\xFF"
+         } ) {
+        refused = refused && !fp3d::map_note_text_ok( bad ) && !fp3d::queue_map_command( with_text( origin, bad ) );
+    }
+    std::string wide_full;
+    for( int i = 0; i < 4096; i++ ) {
+        wide_full += "\xC3\xA9";
+    }
+    check( refused && fp3d::map_note_text_ok( std::string( fp3d::max_map_note_input_bytes, 'a' ) ) &&
+           fp3d::map_note_text_ok( wide_full ) && fp3d::map_note_text_ok( "\xF0\x9F\x98\x80" ),
+           "refused unqueued: bad fields, sizes and bytes", "" );
+
+    // The text as it is kept: controls first, then tags until none is left, then 450 columns.
+    const std::string controls = std::string( "a\x01" ) + "b\x1f" + "c\x7f" + "d\xC2\x85" +
+                                 "e\nf\tg<color_red>h</color>";
+    std::string e_acute;
+    std::string kanji;
+    for( int i = 0; i < 500; i++ ) {
+        e_acute += "\xC3\xA9";
+        kanji += "\xE6\xBC\xA2";
+    }
+    std::string unclosed;
+    for( int i = 0; i < 1000; i++ ) {
+        unclosed += "<color_";
+    }
+    const std::string capped_wide = fp3d::map_note_text( kanji );
+    check( fp3d::map_note_text( controls ) == "abcdefgh" &&
+           fp3d::map_note_text( "<col<color_x>or_red>red</color>" ) == "red" &&
+           fp3d::map_note_text( "x<color_y" ) == "x<color_y" &&
+           fp3d::map_note_text( "!:R;bandits" ) == "!:R;bandits" &&
+           fp3d::map_note_text( std::string( 600, 'a' ) ) == std::string( 450, 'a' ) &&
+           fp3d::map_note_text( e_acute ) == e_acute.substr( 0, 900 ) && capped_wide == kanji.substr( 0, 675 ) &&
+           fp3d::strip_color_tags( unclosed ) == unclosed && fp3d::client_text( unclosed, 60, 240 ).size() <= 240,
+           "text kept: controls and tags out, 450 columns",
+           std::to_string( capped_wide.size() ) + " bytes of wide characters" );
+
+    struct m_done {
+        bool queued = false;
+        bool back = false;
+        int results = 0;
+        int others = 0;
+        bool done = false;
+        std::string why;
+        fp3d::ui_point cell;
+    };
+    uint32_t next_tag = 5100;
+    std::vector<fp3d::event> evs;
+    const auto mark = [&]( fp3d::map_command m, bool tagged ) {
+        m_done out;
+        std::optional<fp3d::ui_request> at = fp3d::wait_request( 5000 );
+        if( !at || !at->timed ) {
+            return out;
+        }
+        m.tag = tagged ? ++next_tag : 0;
+        out.queued = fp3d::queue_map_command( m );
+        if( !out.queued ) {
+            return out;
+        }
+        at = fp3d::wait_request( 20000, at->id );
+        out.back = at && at->timed;
+        evs.clear();
+        fp3d::drain_events( evs );
+        for( const fp3d::event &e : evs ) {
+            if( e.kind != fp3d::event_kind::map_result ) {
+                continue;
+            }
+            if( tagged && e.detail == m.tag ) {
+                out.results++;
+                out.done = e.amount == 1;
+                out.why = e.text;
+                out.cell = e.pos;
+            } else {
+                out.others++;
+            }
+        }
+        return out;
+    };
+    const auto shown = []( const m_done & o ) {
+        return std::string( o.queued ? "" : "not queued " ) + ( o.back ? "" : "not back " ) +
+               std::to_string( o.results ) + " results, " + ( o.done ? "done" : "refused" ) + " \"" + o.why + "\"";
+    };
+    struct m_kept {
+        bool ok = false;
+        bool has = false;
+        std::string raw;
+        int radius = -1;
+        bool far_missing = false;
+    };
+    const auto peek = [&]() {
+        m_kept k;
+        k.ok = scene( 79 );
+        k.has = map_mark_has.load();
+        k.raw = map_mark_raw;
+        k.radius = map_mark_radius.load();
+        k.far_missing = map_state.load() == 1;
+        return k;
+    };
+    struct m_seen {
+        bool parsed = false;
+        bool found = false;
+        std::string sym;
+        std::string color;
+        std::string text;
+        bool danger = false;
+        int radius = -1;
+    };
+    // The note on cell (x, y) as the map's read gives it.
+    const auto seen_note = []( int x, int y, int z ) {
+        m_seen out;
+        const uint64_t id = fp3d::post_overmap_query( fp3d::ui_point{ x - ( ( x % 32 ) + 32 ) % 32,
+                            y - ( ( y % 32 ) + 32 ) % 32, z }, false );
+        std::string text = "timeout";
+        const std::chrono::steady_clock::time_point t0 = std::chrono::steady_clock::now();
+        while( id != 0 && ms_since( t0 ) < 20000 * fp3d::slow_build ) {
+            if( std::optional<std::string> res = fp3d::take_query_result( id ) ) {
+                text = *res;
+                break;
+            }
+            std::this_thread::sleep_for( std::chrono::milliseconds( 2 ) );
+        }
+        try {
+            const JsonValue root = json_loader::from_string( text );
+            JsonObject jo = root.get_object();
+            jo.allow_omitted_members();
+            for( JsonObject n : jo.get_array( "notes" ) ) {
+                n.allow_omitted_members();
+                JsonArray at = n.get_array( "at" );
+                if( at.get_int( 0 ) == x && at.get_int( 1 ) == y ) {
+                    out.found = true;
+                    out.sym = n.get_string( "sym" );
+                    out.color = n.get_string( "color" );
+                    out.text = n.get_string( "text" );
+                    out.danger = n.get_bool( "danger" );
+                    out.radius = n.get_int( "radius" );
+                }
+            }
+            out.parsed = true;
+        } catch( const std::exception & ) {
+            out.parsed = false;
+        }
+        return out;
+    };
+
+    const bool set_up = scene( 78 );
+    const int state = map_state.load();
+    const int mx = map_mark_at[0];
+    const int my = map_mark_at[1];
+    const int mz = map_at[2];
+    check( set_up && ( state & 3 ) == 3, "set up: a cell with no note; no overmap far away",
+           std::to_string( state ) + " of 3" );
+    const fp3d::map_command here = cmd( 'n', mx, my, mz );
+
+    const m_done added = mark( with_text( here, "fp3d mark" ), true );
+    const m_seen added_seen = seen_note( mx, my, mz );
+    check( added.back && added.results == 1 && added.done && added.why.empty() && added.cell.x == mx &&
+           added.cell.y == my && added.cell.z == mz && added_seen.found && added_seen.text == "fp3d mark" &&
+           added_seen.sym == map_mark_plain[0] && added_seen.color == map_mark_plain[1] && !added_seen.danger,
+           "add: done, and the read has it as CDDA draws it",
+           shown( added ) + "; read \"" + added_seen.text + "\" " + added_seen.sym + " " + added_seen.color );
+
+    const m_done edited = mark( with_danger( with_text( here, "B:g;fp3d base" ), 1, 5 ), true );
+    const m_seen edited_seen = seen_note( mx, my, mz );
+    check( edited.results == 1 && edited.done && edited_seen.text == "fp3d base" &&
+           edited_seen.sym == map_mark_base[0] && edited_seen.color == map_mark_base[1] && edited_seen.danger &&
+           edited_seen.radius == 5,
+           "edit: CDDA's prefix picks symbol and colour; danger 5",
+           shown( edited ) + "; read \"" + edited_seen.text + "\" " + edited_seen.sym + " " + edited_seen.color +
+           ", radius " + std::to_string( edited_seen.radius ) );
+
+    const m_done cleared = mark( with_danger( here, 0, 0 ), true );
+    const m_kept cleared_kept = peek();
+    check( cleared.done && cleared_kept.ok && cleared_kept.has && cleared_kept.raw == "B:g;fp3d base" &&
+           cleared_kept.radius == -1, "danger alone cleared; the text kept",
+           shown( cleared ) + "; \"" + cleared_kept.raw + "\", radius " + std::to_string( cleared_kept.radius ) );
+
+    const m_done widest = mark( with_danger( here, 1, fp3d::max_map_danger_radius ), true );
+    const m_done long_text = mark( with_text( here, std::string( 600, 'a' ) ), true );
+    const m_kept long_kept = peek();
+    check( widest.done && long_text.done && long_kept.raw == std::string( 450, 'a' ) &&
+           long_kept.radius == fp3d::max_map_danger_radius,
+           "overlong text kept to 450 columns; the danger kept",
+           shown( long_text ) + "; " + std::to_string( long_kept.raw.size() ) + " bytes, radius " +
+           std::to_string( long_kept.radius ) );
+
+    const m_done cleaned = mark( with_text( here, controls ), true );
+    const m_kept cleaned_kept = peek();
+    const m_done blank = mark( with_text( here, "\x01\x02" ), true );
+    const m_kept blank_kept = peek();
+    check( cleaned.done && cleaned_kept.raw == "abcdefgh" && blank.results == 1 && !blank.done &&
+           blank.why == "The note has no text." && blank_kept.raw == "abcdefgh",
+           "controls and tags removed; nothing left: refused",
+           "\"" + cleaned_kept.raw + "\"; " + shown( blank ) );
+
+    const m_done quiet = mark( with_text( here, "fp3d quiet" ), false );
+    const m_kept quiet_kept = peek();
+    fp3d::set_paused( true );
+    const m_done paused = mark( with_text( here, "fp3d paused" ), true );
+    fp3d::set_paused( false );
+    const m_kept paused_kept = peek();
+    check( quiet.back && quiet.others == 0 && quiet_kept.raw == "fp3d quiet" && paused.back && paused.done &&
+           paused_kept.raw == "fp3d paused", "without a tag: no event; while paused: runs",
+           shown( quiet ) + " / " + shown( paused ) );
+
+    const m_done gone = mark( cmd( 'u', mx, my, mz ), true );
+    const m_seen gone_seen = seen_note( mx, my, mz );
+    const m_done again = mark( cmd( 'u', mx, my, mz ), true );
+    const m_done bare = mark( with_danger( here, 1, 2 ), true );
+    const m_kept gone_kept = peek();
+    check( gone.done && gone_seen.parsed && !gone_seen.found && gone_kept.ok && !gone_kept.has && !again.done &&
+           again.results == 1 && again.why == "There is no note there." && !bare.done &&
+           bare.why == "The note has no text.",
+           "delete: gone; again, or danger on no note: refused", shown( gone ) + " / " + shown( again ) + " / " +
+           shown( bare ) );
+
+    const m_done far_note = mark( with_text( cmd( 'n', map_far_at[0], map_far_at[1], mz ), "fp3d far" ), true );
+    const m_done far_gone = mark( cmd( 'u', map_far_at[0], map_far_at[1], mz ), true );
+    const m_kept far_kept = peek();
+    check( far_note.results == 1 && !far_note.done && far_note.why == "Nothing is known of that place yet." &&
+           far_gone.results == 1 && !far_gone.done && far_gone.why == far_note.why && far_kept.ok &&
+           far_kept.far_missing, "no overmap there: refused, and none made",
+           shown( far_note ) + " / " + shown( far_gone ) );
+    return failed == 0;
+}
+
 // The off hand lets go of an item that has grown too heavy for one hand (here: filled up); it stays in its pocket
 // (lead-ui, 2026-11-15).
 static bool run_offhand_weight_checks()
@@ -12832,7 +13152,8 @@ int main()
     const bool cargo_ok = lean_ok && run_cargo_checks();
     const bool work_ok = cargo_ok && run_vehicle_work_checks();
     const bool map_ok = work_ok && run_overmap_checks();
-    const bool names_ok = map_ok && run_name_checks();
+    const bool notes_ok = map_ok && run_map_note_checks();
+    const bool names_ok = notes_ok && run_name_checks();
     const bool resume_ok = run_range_resume_checks();
     // While the game thread waits for its next answer (CDDA's log is still open).
     const bool boot_ok = run_boot_progress_checks();
@@ -12901,6 +13222,7 @@ int main()
     std::printf( "cargo: %s\n", cargo_ok ? "ok" : "BAD" );
     std::printf( "vehicle work: %s\n", work_ok ? "ok" : "BAD" );
     std::printf( "map: %s\n", map_ok ? "ok" : "BAD" );
+    std::printf( "map notes: %s\n", notes_ok ? "ok" : "BAD" );
     std::printf( "names: %s\n", names_ok ? "ok" : "BAD" );
     // The real-time turn slot this run settled on (rt_stretch): more than the usual one on a quiet machine means
     // the game's turns got slower.
