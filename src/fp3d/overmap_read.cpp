@@ -176,8 +176,11 @@ note_view note_of( const tripoint_abs_omt &p )
     n.color = get_all_colors().get_name( std::get<1>( shown ) );
     const size_t from = std::min( std::get<2>( shown ), raw.size() );
     n.text = client_text( raw.substr( from ), max_overmap_note_columns, 4 * max_overmap_note_columns );
-    n.danger = overmap_buffer.is_marked_dangerous( p );
-    n.radius = n.danger ? std::clamp( overmap_buffer.note_danger_radius( p ), 0, max_overmap_danger_radius ) : 0;
+    // The note's own danger mark (-1: none). is_marked_dangerous would also say yes for a note that only lies
+    // inside another note's danger radius.
+    const int radius = overmap_buffer.note_danger_radius( p );
+    n.danger = radius != -1;
+    n.radius = n.danger ? std::clamp( radius, 0, max_overmap_danger_radius ) : 0;
     return n;
 }
 

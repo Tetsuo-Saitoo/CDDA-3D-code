@@ -393,7 +393,8 @@ std::vector<oter_id> map_blend_was;              // sim thread only: what the ni
 std::string map_plain;                           // the avatar's page without its path, and the same with fewer looks
 std::string map_fewer;
 // The map notes' scenes (78 sets up, 79 looks at the note as CDDA keeps it).
-int map_mark_at[2] = { 0, 0 };                   // a cell near the avatar with no note
+int map_mark_at[2] = { 0, 0 };                   // a cell near the avatar with no note,
+int map_near_at[2] = { 0, 0 };                   // ... and one next to it with none
 std::string map_mark_plain[2];                   // CDDA's symbol and colour for "fp3d mark",
 std::string map_mark_base[2];                    // ... and for "B:g;fp3d base"
 std::string map_mark_raw;                        // scene 79: the note's text as CDDA keeps it
@@ -2673,6 +2674,16 @@ void observe()
                     map_mark_at[0] = c.x();
                     map_mark_at[1] = c.y();
                     state |= 1;
+                }
+            }
+            // ... and its neighbour with no note, inside the danger radius the first will get.
+            const tripoint_abs_omt marked( map_mark_at[0], map_mark_at[1], at.z() );
+            for( const point &d : { point( 1, 0 ), point( 0, 1 ), point( -1, 0 ), point( 0, -1 ) } ) {
+                const tripoint_abs_omt c = marked + tripoint_rel_omt( d.x, d.y, 0 );
+                if( ( state & 4 ) == 0 && ( state & 1 ) != 0 && !overmap_buffer.has_note( c ) ) {
+                    map_near_at[0] = c.x();
+                    map_near_at[1] = c.y();
+                    state |= 4;
                 }
             }
             const point_abs_om far_om = project_to<coords::om>( tripoint_abs_omt( map_far_at[0], map_far_at[1],
@@ -11669,8 +11680,8 @@ static bool run_map_note_checks()
     const int mx = map_mark_at[0];
     const int my = map_mark_at[1];
     const int mz = map_at[2];
-    check( set_up && ( state & 3 ) == 3, "set up: a cell with no note; no overmap far away",
-           std::to_string( state ) + " of 3" );
+    check( set_up && ( state & 7 ) == 7, "set up: two cells with no note; no overmap far away",
+           std::to_string( state ) + " of 7" );
     const fp3d::map_command here = cmd( 'n', mx, my, mz );
 
     const m_done added = mark( with_text( here, "fp3d mark" ), true );
@@ -11689,6 +11700,19 @@ static bool run_map_note_checks()
            "edit: CDDA's prefix picks symbol and colour; danger 5",
            shown( edited ) + "; read \"" + edited_seen.text + "\" " + edited_seen.sym + " " + edited_seen.color +
            ", radius " + std::to_string( edited_seen.radius ) );
+
+    // A plain note inside that danger radius is not dangerous itself; marked with radius 0, it is.
+    const fp3d::map_command beside = cmd( 'n', map_near_at[0], map_near_at[1], mz );
+    const m_done near_added = mark( with_text( beside, "fp3d near" ), true );
+    const m_seen near_plain = seen_note( map_near_at[0], map_near_at[1], mz );
+    const m_done near_marked = mark( with_danger( beside, 1, 0 ), true );
+    const m_seen near_danger = seen_note( map_near_at[0], map_near_at[1], mz );
+    const m_done near_gone = mark( cmd( 'u', map_near_at[0], map_near_at[1], mz ), true );
+    check( near_added.done && near_plain.found && !near_plain.danger && near_plain.radius == 0 &&
+           near_marked.done && near_danger.found && near_danger.danger && near_danger.radius == 0 &&
+           near_gone.done, "a note in another's danger radius: not dangerous itself",
+           std::string( near_plain.danger ? "plain: dangerous" : "plain: not dangerous" ) + ", radius 0 mark: " +
+           ( near_danger.danger ? "dangerous" : "not dangerous" ) );
 
     const m_done cleared = mark( with_danger( here, 0, 0 ), true );
     const m_kept cleared_kept = peek();
